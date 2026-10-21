@@ -1,0 +1,47 @@
+== human fresh 16:06  up 10 days,  8:32, 2 users, load averages: 98.29 81.52 67.66
+bake first unwrap: 6.81s
+bake ray tree: 2.41s
+bake 4096: simplify 0.18s, unwrap 8.38s, detailed surface 17.37s, raster 0.20s, texels 2.10s, fill 0.70s (726 texels from the field)
+bake 4096 from scratch: 29.0s, 59990 triangles
+bake_human_4k_face: 96 samples, 0 diced triangles, 9.3s
+bake first unwrap: 6.69s
+bake ray tree: 2.41s
+bake 8192: simplify 0.18s, unwrap 11.36s, detailed surface 17.08s, raster 0.39s, texels 7.90s, fill 3.66s (2935 texels from the field)
+bake 8192 from scratch: 40.7s, 59990 triangles
+source: 776572 rest triangles
+bake 4096 from scratch: 29.0s, 59990 triangles
+bake 8192 from scratch: 40.7s, 59990 triangles
+== human cached 16:09  up 10 days,  8:35, 2 users, load averages: 50.77 77.62 69.68
+bake first unwrap: 7.68s
+bake ray tree: 2.07s
+bake 4096: simplify 0.17s, unwrap 9.22s, detailed surface 3.30s, raster 0.20s, texels 2.36s, fill 0.76s (3283 texels from the field)
+bake 4096 from the cached fine mesh: 16.0s, 59992 triangles
+bake_human_4k_face: 96 samples, 0 diced triangles, 9.6s
+bake first unwrap: 7.69s
+bake ray tree: 2.15s
+bake 8192: simplify 0.18s, unwrap 12.54s, detailed surface 3.60s, raster 0.37s, texels 7.83s, fill 3.79s (13664 texels from the field)
+bake 8192 from the cached fine mesh: 28.4s, 59992 triangles
+source: 776572 rest triangles
+fine mesh: 8464999 triangles in 22.5s (built by render_film or fine views; the bake reuses it)
+bake 4096 from the cached fine mesh: 16.0s, 59992 triangles
+bake 8192 from the cached fine mesh: 28.4s, 59992 triangles
+== elf fresh + exact 16:12  up 10 days,  8:38, 2 users, load averages: 19.73 52.19 60.58
+bake ray tree: 0.29s
+bake 4096: simplify 0.39s, unwrap 7.67s, detailed surface 1.84s, raster 0.37s, texels 4.35s, fill 0.68s (43376 texels from the field)
+bake 4096 from scratch: 15.3s, 60000 triangles
+bake ray tree: 0.28s
+bake 8192: simplify 0.31s, unwrap 10.17s, detailed surface 1.80s, raster 0.63s, texels 16.05s, fill 3.34s (178616 texels from the field)
+bake 8192 from scratch: 32.3s, 60000 triangles
+bake 4096: simplify 0.39s, unwrap 7.72s, detailed surface 0.00s, raster 0.42s, texels 64.11s, fill 0.89s (0 texels from the field)
+bake 4096 exact (every texel from the field): 73.5s, 60000 triangles
+source: 1287868 rest triangles
+bake 4096 from scratch: 15.3s, 60000 triangles
+bake 8192 from scratch: 32.3s, 60000 triangles
+bake 4096 exact (every texel from the field): 73.5s, 60000 triangles
+== elf old code 16:15  up 10 days,  8:40, 2 users, load averages: 45.81 49.95 58.34
+warning: constant `OLD_REGULAR` is never used
+68 |     const OLD_REGULAR: u64 = 0;
+warning: constant `OLD_FINE` is never used
+69 |     const OLD_FINE: u64 = 0;
+OLD bake 4096: 440.6s, 60000 triangles, rest 1287868
+== done 16:23  up 10 days,  8:48, 2 users, load averages: 120.93 108.95 85.89

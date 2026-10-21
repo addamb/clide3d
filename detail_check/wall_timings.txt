@@ -1,0 +1,2 @@
+before (detail_displace 0): wall 31064 triangles; film seconds [4.327206, 4.256439]
+after (detail_displace 0.018): wall 31064 triangles; film seconds [10.784023, 10.871653]

@@ -1,0 +1,5 @@
+before: meshes 20494556 triangles in 73.0s; fine mesh errors []
+before film seconds (full, flank, leg): [19.815348, 22.709072, 25.378862]
+after: 7 regions at 0.002 in 0.4s; scales sculpted in 172.4s; 256981 detail bricks
+after: meshes 19771271 triangles in 153.4s; fine mesh errors []
+after film seconds (full, flank, leg): [27.180002, 32.83485, 19.351791]

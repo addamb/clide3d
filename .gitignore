@@ -1,0 +1,38 @@
+/target
+# Generated scene snapshots; visual checks and their source are tracked.
+/shape_check/*.json
+
+# Large reproducible cloth QA snapshots and deliverable binaries.
+/cloth_check/elf_cloth.json
+/cloth_check/*.glb
+/cloth_check/*.fbx
+/cloth_check/elf_cloth_game_*.png
+
+# Reproducible voxel cache scenes and binary exports (fire_checks.rs).
+/fire_check/*.json
+/fire_check/*.glb
+
+# Large reproducible damage QA scene snapshots.
+/damage_check/*.json
+/damage_check/*.glb
+
+# Copied external acceptance scene; keep pictures and render recipes tracked.
+/look_check/mech.json
+/look_check/telephoto_scene.json
+/look_check/*.cache
+
+# Reproducible paint acceptance scene copies and renders' geometry caches.
+/paint_check/mech_before.json
+/paint_check/mech_after.json
+/paint_check/*.cache
+
+/speed_check/*.json
+/speed_check/*.glb
+/speed_check/*.cache
+!/speed_check/measurements.json
+!/speed_check/live_replies.json
+# Copied external close-up scenes and generated geometry cache.
+/closeup_check/mech_before.json
+/closeup_check/mech_after.json
+/closeup_check/*.cache
+/closeup_check/*.glb

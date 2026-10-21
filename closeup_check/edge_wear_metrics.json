@@ -1,0 +1,16 @@
+[
+  {
+    "amount": 0.6499999761581421,
+    "gap_fraction": 0.9625468254089355,
+    "max_connected_width_mm": 6.5,
+    "mean_width_mm": 0.937578022480011,
+    "width_stddev_mm": 1.7627339363098145
+  },
+  {
+    "amount": 1.0,
+    "gap_fraction": 0.9063670635223389,
+    "max_connected_width_mm": 8.0,
+    "mean_width_mm": 2.5980024337768555,
+    "width_stddev_mm": 3.133338689804077
+  }
+]

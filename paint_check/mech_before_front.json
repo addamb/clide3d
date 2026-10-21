@@ -1,0 +1,47 @@
+{
+  "render_film": {
+    "aspect": 0.8999999761581421,
+    "camera": {
+      "fov": 25.0,
+      "position": [
+        3.0,
+        6.300000190734863,
+        24.0
+      ],
+      "target": [
+        0.0,
+        3.4000000953674316,
+        0.0
+      ]
+    },
+    "environment": "overcast",
+    "grain": 0.003,
+    "lights": [
+      {
+        "direction": [
+          0.5,
+          0.8,
+          0.7
+        ],
+        "intensity": 2.0,
+        "size": 4,
+        "type": "sun"
+      }
+    ],
+    "sharpen": 0.15,
+    "size": 990,
+    "tonemap": "agx",
+    "samples": 256,
+    "bounces": 4,
+    "frame": 0,
+    "floor": false,
+    "baked": false,
+    "fine": true,
+    "exposure": 1.0,
+    "denoise": true,
+    "time_limit": 600
+  },
+  "samples": 256,
+  "seconds": 29.221702575683594,
+  "scene": "mech_before.json"
+}

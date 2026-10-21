@@ -1,0 +1,81 @@
+{
+  "camera_position": [
+    9.0,
+    2.0,
+    15.0
+  ],
+  "camera_target": [
+    0.0,
+    3.4000000953674316,
+    0.0
+  ],
+  "fov": 30.0,
+  "height": 540,
+  "render_film": {
+    "aspect": 1.7777777777777777,
+    "background": true,
+    "bounces": 4,
+    "camera": {
+      "fov": 30.0,
+      "position": [
+        9.0,
+        2.0,
+        15.0
+      ],
+      "target": [
+        0.0,
+        3.4000000953674316,
+        0.0
+      ]
+    },
+    "denoise": true,
+    "environment": "night",
+    "exposure": 1.0,
+    "floor": false,
+    "lights": [
+      {
+        "color": [
+          0.25,
+          0.55,
+          0.9
+        ],
+        "direction": [
+          -0.6,
+          0.5,
+          -0.4
+        ],
+        "intensity": 1.5,
+        "size": 2,
+        "type": "sun"
+      }
+    ],
+    "samples": 512,
+    "size": 960,
+    "time_limit": 600
+  },
+  "resolved": {
+    "background": true,
+    "environment": "night",
+    "lights": [
+      {
+        "color": [
+          0.25,
+          0.55,
+          0.9
+        ],
+        "direction": [
+          -0.6,
+          0.5,
+          -0.4
+        ],
+        "intensity": 1.5,
+        "size": 2,
+        "type": "sun"
+      }
+    ]
+  },
+  "samples": 512,
+  "scene": "mech.json",
+  "seconds": 18.894643783569336,
+  "size": 960
+}

@@ -1,0 +1,154 @@
+{
+  "camera_position": [
+    9.0,
+    2.0,
+    15.0
+  ],
+  "camera_target": [
+    0.0,
+    3.4000000953674316,
+    0.0
+  ],
+  "fov": 30.0,
+  "height": 540,
+  "render_film": {
+    "aspect": 1.7777777777777777,
+    "bounces": 4,
+    "camera": {
+      "aperture": null,
+      "fov": 30.0,
+      "position": [
+        9.0,
+        2.0,
+        15.0
+      ],
+      "target": [
+        0.0,
+        3.4000000953674316,
+        0.0
+      ]
+    },
+    "denoise": true,
+    "environment": {
+      "intensity": 0.12,
+      "preset": "storm"
+    },
+    "exposure": 1.0,
+    "floor": false,
+    "fog": false,
+    "grain": 0.006,
+    "lights": [
+      {
+        "color": [
+          1,
+          0.65,
+          0.3
+        ],
+        "direction": [
+          -0.36,
+          0.16,
+          -0.92
+        ],
+        "intensity": 12,
+        "size": 0.35,
+        "type": "sun"
+      },
+      {
+        "color": [
+          0.48,
+          0.65,
+          1
+        ],
+        "direction": [
+          0.4,
+          0.8,
+          0.8
+        ],
+        "intensity": 0.25,
+        "size": 15,
+        "type": "sun"
+      }
+    ],
+    "look": "trailer",
+    "samples": 512,
+    "size": 960,
+    "time_limit": 600
+  },
+  "resolved": {
+    "background": "environment",
+    "bloom": {
+      "dirt": 0.12,
+      "streaks": 0.15,
+      "strength": 0.08,
+      "threshold": 1.5
+    },
+    "camera": {
+      "aperture": null,
+      "dof": {
+        "blades": 7
+      },
+      "focal_length_mm": 45,
+      "fov": 30,
+      "position": [
+        9.0,
+        2.0,
+        15.0
+      ],
+      "target": [
+        0.0,
+        3.4000000953674316,
+        0.0
+      ]
+    },
+    "environment": {
+      "intensity": 0.12,
+      "preset": "storm"
+    },
+    "fog": false,
+    "grade": {
+      "contrast": 1.16,
+      "look": "modern_warfare"
+    },
+    "grain": 0.006,
+    "lights": [
+      {
+        "color": [
+          1,
+          0.65,
+          0.3
+        ],
+        "direction": [
+          -0.36,
+          0.16,
+          -0.92
+        ],
+        "intensity": 12,
+        "size": 0.35,
+        "type": "sun"
+      },
+      {
+        "color": [
+          0.48,
+          0.65,
+          1
+        ],
+        "direction": [
+          0.4,
+          0.8,
+          0.8
+        ],
+        "intensity": 0.25,
+        "size": 15,
+        "type": "sun"
+      }
+    ],
+    "look": "trailer",
+    "sharpen": 0.12,
+    "tonemap": "agx",
+    "vignette": 0.22
+  },
+  "samples": 512,
+  "scene": "mech.json",
+  "seconds": 31.160737991333008,
+  "size": 960
+}

@@ -1,0 +1,172 @@
+{
+  "camera_position": [
+    9.0,
+    2.0,
+    15.0
+  ],
+  "camera_target": [
+    0.0,
+    3.4000000953674316,
+    0.0
+  ],
+  "fov": 30.0,
+  "height": 540,
+  "render_film": {
+    "aspect": 1.7777777777777777,
+    "bounces": 4,
+    "camera": {
+      "chromatic_aberration": 0.001,
+      "distortion": -0.025,
+      "fov": 30.0,
+      "position": [
+        9.0,
+        2.0,
+        15.0
+      ],
+      "target": [
+        0.0,
+        3.4000000953674316,
+        0.0
+      ]
+    },
+    "denoise": true,
+    "environment": {
+      "intensity": 0.65,
+      "preset": "storm"
+    },
+    "exposure": 1.0,
+    "floor": false,
+    "fog": {
+      "anisotropy": 0.45,
+      "density": 0.055,
+      "distance": 40,
+      "falloff": 0.8,
+      "height": 0.1,
+      "noise": 0.85,
+      "noise_scale": 0.45
+    },
+    "lights": [
+      {
+        "color": [
+          1,
+          0.75,
+          0.43
+        ],
+        "direction": [
+          -0.5,
+          0.4,
+          -0.8
+        ],
+        "intensity": 5,
+        "size": 1,
+        "type": "sun"
+      },
+      {
+        "color": [
+          0.48,
+          0.65,
+          1
+        ],
+        "direction": [
+          0.4,
+          0.8,
+          0.8
+        ],
+        "intensity": 0.7,
+        "size": 15,
+        "type": "sun"
+      }
+    ],
+    "look": "trailer",
+    "samples": 512,
+    "size": 960,
+    "time_limit": 600
+  },
+  "resolved": {
+    "background": "environment",
+    "bloom": {
+      "dirt": 0.12,
+      "streaks": 0.15,
+      "strength": 0.08,
+      "threshold": 1.5
+    },
+    "camera": {
+      "aperture": 4,
+      "chromatic_aberration": 0.001,
+      "distortion": -0.025,
+      "dof": {
+        "blades": 7
+      },
+      "focal_length_mm": 45,
+      "fov": 30,
+      "position": [
+        9.0,
+        2.0,
+        15.0
+      ],
+      "target": [
+        0.0,
+        3.4000000953674316,
+        0.0
+      ]
+    },
+    "environment": {
+      "intensity": 0.65,
+      "preset": "storm"
+    },
+    "fog": {
+      "anisotropy": 0.45,
+      "density": 0.055,
+      "distance": 40,
+      "falloff": 0.8,
+      "height": 0.1,
+      "noise": 0.85,
+      "noise_scale": 0.45
+    },
+    "grade": {
+      "contrast": 1.16,
+      "look": "modern_warfare"
+    },
+    "grain": 0.012,
+    "lights": [
+      {
+        "color": [
+          1,
+          0.75,
+          0.43
+        ],
+        "direction": [
+          -0.5,
+          0.4,
+          -0.8
+        ],
+        "intensity": 5,
+        "size": 1,
+        "type": "sun"
+      },
+      {
+        "color": [
+          0.48,
+          0.65,
+          1
+        ],
+        "direction": [
+          0.4,
+          0.8,
+          0.8
+        ],
+        "intensity": 0.7,
+        "size": 15,
+        "type": "sun"
+      }
+    ],
+    "look": "trailer",
+    "sharpen": 0.12,
+    "tonemap": "agx",
+    "vignette": 0.22
+  },
+  "samples": 512,
+  "scene": "mech.json",
+  "seconds": 78.82598876953125,
+  "size": 960
+}

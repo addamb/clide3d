@@ -1,0 +1,4 @@
+before: detail_cell Some(0.0011), regions 0, bricks 25361, sculpt 18.4s, fine mesh 12005900 triangles in 37.0s
+after: detail_cell Some(0.001), regions 3, bricks 126552, sculpt 128.8s, fine mesh 8465131 triangles in 27.9s
+before film seconds (full, face, hand): [18.190708, 25.654484, 23.735374]
+after film seconds (full, face, hand): [14.313883, 37.667854, 34.679916]

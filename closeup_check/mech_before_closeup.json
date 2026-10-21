@@ -1,0 +1,63 @@
+{
+  "fov": 27.0,
+  "height": 1000,
+  "render_film": {
+    "aspect": 1.5,
+    "camera": {
+      "aperture": 2.799999952316284,
+      "dof": {
+        "focus_point": [
+          0.23000000417232513,
+          5.75,
+          0.8999999761581421
+        ]
+      },
+      "focal_length_mm": 49.98360061645508,
+      "fov": 27.0,
+      "position": [
+        0.699999988079071,
+        6.5,
+        3.5
+      ],
+      "sensor_size_mm": [
+        36,
+        24
+      ],
+      "target": [
+        0.23000000417232513,
+        5.75,
+        0.8999999761581421
+      ]
+    },
+    "environment": {
+      "intensity": 0.65,
+      "preset": "overcast"
+    },
+    "floor": false,
+    "grain": 0.002,
+    "lights": [
+      {
+        "color": [
+          1.0,
+          0.93,
+          0.82
+        ],
+        "direction": [
+          -0.65,
+          0.5,
+          0.45
+        ],
+        "intensity": 3.0,
+        "size": 3,
+        "type": "sun"
+      }
+    ],
+    "samples": 192,
+    "sharpen": 0.08,
+    "size": 1500,
+    "tonemap": "agx"
+  },
+  "samples": 192,
+  "seconds": 43.084381103515625,
+  "width": 1500
+}

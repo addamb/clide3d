@@ -1,0 +1,46 @@
+{
+  "render_film": {
+    "aspect": 1.875,
+    "baked": false,
+    "bounces": 4,
+    "camera": {
+      "fov": 30.0,
+      "position": [
+        0.5,
+        2.5,
+        3.5999999046325684
+      ],
+      "target": [
+        0.0,
+        0.25,
+        0.4000000059604645
+      ]
+    },
+    "denoise": true,
+    "environment": "overcast",
+    "exposure": 1.0,
+    "fine": true,
+    "floor": false,
+    "frame": 0,
+    "grain": 0.003,
+    "lights": [
+      {
+        "direction": [
+          0.5,
+          0.8,
+          0.7
+        ],
+        "intensity": 2.0,
+        "size": 4,
+        "type": "sun"
+      }
+    ],
+    "samples": 128,
+    "sharpen": 0.15,
+    "size": 1200,
+    "time_limit": 600,
+    "tonemap": "agx"
+  },
+  "samples": 128,
+  "seconds": 2.2173118591308594
+}

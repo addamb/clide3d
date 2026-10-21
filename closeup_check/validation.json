@@ -1,0 +1,28 @@
+{
+  "date": "2026-10-15",
+  "round": 2,
+  "cargo_build_release": "passed",
+  "cargo_test_release": {
+    "passed": 289,
+    "failed": 0,
+    "ignored": 37
+  },
+  "cargo_clippy_release_all_targets": "passed without warnings",
+  "final_metal_material_checks": {
+    "passed": 2,
+    "failed": 0,
+    "runoff_mean_pixel_difference_255": 0.46
+  },
+  "visual_checks": {
+    "passed": 2,
+    "failed": 0,
+    "individual_renders": 26,
+    "sheets": 2,
+    "samples_per_pixel": 192,
+    "inspected": true,
+    "mech_before_after_identical_cameras_and_lighting": true
+  },
+  "original_scene_sha256": "1f70224c34c979b33bc0215ce42f1b74a01754c711516509622b3330793e0c7e",
+  "original_scene_unchanged": true,
+  "photographic_acceptance": "Improved, but not fully met: regular crater rims, some long wear patches, restrained panel variation and stylized isolated oil remain visibly procedural. See README.md."
+}

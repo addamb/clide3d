@@ -1,0 +1,621 @@
+{
+  "atlas_check_export": {
+    "vertices": 523928,
+    "triangles": 485610,
+    "pose": {
+      "animation": "fire",
+      "fps": 24.0,
+      "frame": 3.0
+    },
+    "bounds": {
+      "max": [
+        2.88798451423645,
+        7.886157512664795,
+        1.926824927330017
+      ],
+      "min": [
+        -4.121829986572266,
+        0.05377116799354553,
+        -2.238736152648926
+      ]
+    },
+    "meshes_count": 786,
+    "materials_count": 45,
+    "textures_count": 3,
+    "skins_count": 2,
+    "images": [
+      {
+        "height": 4096,
+        "index": 0,
+        "width": 4096
+      },
+      {
+        "height": 4096,
+        "index": 1,
+        "width": 4096
+      },
+      {
+        "height": 4096,
+        "index": 2,
+        "width": 4096
+      }
+    ],
+    "animations": [
+      {
+        "name": "fire",
+        "fps": 24.0,
+        "frames": [
+          0.0,
+          24.0
+        ]
+      },
+      {
+        "name": "idle",
+        "fps": 24.0,
+        "frames": [
+          0.0,
+          48.0
+        ]
+      }
+    ],
+    "warnings": {
+      "count": 336,
+      "untextured_vertex_color_primitives": 335,
+      "other": [
+        "skin 0: joints with no weights: [0, 3]"
+      ]
+    }
+  },
+  "atlas_export_bytes": 49635060,
+  "atlas_export_seconds": 1.622849167,
+  "atlas_export_summary": {
+    "animations": [
+      "fire",
+      "idle"
+    ],
+    "atlas_packed_sets": 20,
+    "lights": 0,
+    "lods": {},
+    "materials": [
+      "gunmetal",
+      "tan_paint",
+      "tan_paint",
+      "gunmetal",
+      "lens_glow",
+      "tan_paint",
+      "gunmetal",
+      "track_rubber",
+      "gunmetal",
+      "tan_paint",
+      "marking_paint",
+      "polished_metal",
+      "strap",
+      "mech_steel",
+      "tan_paint",
+      "gunmetal",
+      "gunmetal",
+      "tan_paint",
+      "marking_white",
+      "gunmetal",
+      "tan_paint",
+      "marking_white",
+      "strap",
+      "gunmetal",
+      "tan_paint",
+      "strap",
+      "gunmetal",
+      "tan_paint",
+      "gunmetal",
+      "gunmetal",
+      "tan_paint",
+      "marking_white",
+      "kb_dark",
+      "kb_metal",
+      "kb_marking",
+      "kb_glow",
+      "kb_chrome",
+      "kb_strap",
+      "kb_paint",
+      "gunmetal",
+      "clay",
+      "kb_seam",
+      "kb_glow",
+      "kb_brass",
+      "kb_rubber"
+    ],
+    "meshes": 168,
+    "scatter_copies": 755,
+    "skins": 2,
+    "skipped_hidden": [],
+    "texel_density_target": 512.0,
+    "textures": 3,
+    "triangles": 485610,
+    "vertices": 523928
+  },
+  "atlas_render_samples": 64,
+  "atlas_render_seconds": 13.458473205566406,
+  "bake_seconds": 47.964837167,
+  "baked_parts": 20,
+  "get_scene_reply_bytes": 1304,
+  "initial_mesh_seconds": 217.896048834,
+  "legacy_material_edit_seconds": 323.578820333,
+  "legacy_scene_reply_bytes": 216588,
+  "material_edit_seconds": 1.991081625,
+  "material_geometry_rebuilds": 0,
+  "material_list_reply_bytes": 2883,
+  "material_shading_updates": 19,
+  "object_material_assignment_seconds": 0.005005542,
+  "open_scene_reply_bytes": 1304,
+  "per_part_check_export": {
+    "vertices": 523928,
+    "triangles": 485610,
+    "pose": {
+      "animation": "fire",
+      "fps": 24.0,
+      "frame": 3.0
+    },
+    "bounds": {
+      "max": [
+        2.88798451423645,
+        7.886157512664795,
+        1.926824927330017
+      ],
+      "min": [
+        -4.121829986572266,
+        0.05377116799354553,
+        -2.238736152648926
+      ]
+    },
+    "meshes_count": 786,
+    "materials_count": 71,
+    "textures_count": 60,
+    "skins_count": 2,
+    "images": [
+      {
+        "height": 2048,
+        "index": 0,
+        "width": 2048
+      },
+      {
+        "height": 2048,
+        "index": 1,
+        "width": 2048
+      },
+      {
+        "height": 2048,
+        "index": 2,
+        "width": 2048
+      },
+      {
+        "height": 2048,
+        "index": 3,
+        "width": 2048
+      },
+      {
+        "height": 2048,
+        "index": 4,
+        "width": 2048
+      },
+      {
+        "height": 2048,
+        "index": 5,
+        "width": 2048
+      },
+      {
+        "height": 2048,
+        "index": 6,
+        "width": 2048
+      },
+      {
+        "height": 2048,
+        "index": 7,
+        "width": 2048
+      },
+      {
+        "height": 2048,
+        "index": 8,
+        "width": 2048
+      },
+      {
+        "height": 1024,
+        "index": 9,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 10,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 11,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 12,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 13,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 14,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 15,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 16,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 17,
+        "width": 1024
+      },
+      {
+        "height": 2048,
+        "index": 18,
+        "width": 2048
+      },
+      {
+        "height": 2048,
+        "index": 19,
+        "width": 2048
+      },
+      {
+        "height": 2048,
+        "index": 20,
+        "width": 2048
+      },
+      {
+        "height": 1024,
+        "index": 21,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 22,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 23,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 24,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 25,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 26,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 27,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 28,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 29,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 30,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 31,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 32,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 33,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 34,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 35,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 36,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 37,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 38,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 39,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 40,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 41,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 42,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 43,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 44,
+        "width": 1024
+      },
+      {
+        "height": 2048,
+        "index": 45,
+        "width": 2048
+      },
+      {
+        "height": 2048,
+        "index": 46,
+        "width": 2048
+      },
+      {
+        "height": 2048,
+        "index": 47,
+        "width": 2048
+      },
+      {
+        "height": 1024,
+        "index": 48,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 49,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 50,
+        "width": 1024
+      },
+      {
+        "height": 2048,
+        "index": 51,
+        "width": 2048
+      },
+      {
+        "height": 2048,
+        "index": 52,
+        "width": 2048
+      },
+      {
+        "height": 2048,
+        "index": 53,
+        "width": 2048
+      },
+      {
+        "height": 1024,
+        "index": 54,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 55,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 56,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 57,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 58,
+        "width": 1024
+      },
+      {
+        "height": 1024,
+        "index": 59,
+        "width": 1024
+      }
+    ],
+    "animations": [
+      {
+        "name": "fire",
+        "fps": 24.0,
+        "frames": [
+          0.0,
+          24.0
+        ]
+      },
+      {
+        "name": "idle",
+        "fps": 24.0,
+        "frames": [
+          0.0,
+          48.0
+        ]
+      }
+    ],
+    "warnings": {
+      "count": 336,
+      "untextured_vertex_color_primitives": 335,
+      "other": [
+        "skin 0: joints with no weights: [0, 3]"
+      ]
+    }
+  },
+  "per_part_export_bytes": 133920388,
+  "per_part_export_seconds": 0.955110625,
+  "per_part_export_summary": {
+    "animations": [
+      "fire",
+      "idle"
+    ],
+    "atlas_packed_sets": 0,
+    "lights": 0,
+    "lods": {},
+    "materials": [
+      "gunmetal",
+      "tan_paint",
+      "tan_paint",
+      "gunmetal",
+      "lens_glow",
+      "tan_paint",
+      "gunmetal",
+      "track_rubber",
+      "gunmetal",
+      "tan_paint",
+      "marking_paint",
+      "polished_metal",
+      "tan_paint",
+      "strap",
+      "gunmetal",
+      "gunmetal",
+      "tan_paint",
+      "strap",
+      "mech_steel",
+      "tan_paint",
+      "gunmetal",
+      "gunmetal",
+      "tan_paint",
+      "tan_paint",
+      "gunmetal",
+      "marking_white",
+      "gunmetal",
+      "tan_paint",
+      "marking_white",
+      "strap",
+      "gunmetal",
+      "tan_paint",
+      "strap",
+      "gunmetal",
+      "tan_paint",
+      "gunmetal",
+      "lens_glow",
+      "gunmetal",
+      "tan_paint",
+      "gunmetal",
+      "marking_white",
+      "tan_paint",
+      "lens_glow",
+      "tan_paint",
+      "marking_paint",
+      "gunmetal",
+      "kb_dark",
+      "kb_metal",
+      "kb_marking",
+      "kb_glow",
+      "kb_chrome",
+      "kb_strap",
+      "kb_paint",
+      "tan_paint",
+      "strap",
+      "tan_paint",
+      "gunmetal",
+      "tan_paint",
+      "strap",
+      "gunmetal",
+      "track_rubber",
+      "gunmetal",
+      "tan_paint",
+      "marking_paint",
+      "polished_metal",
+      "gunmetal",
+      "clay",
+      "kb_seam",
+      "kb_glow",
+      "kb_brass",
+      "kb_rubber"
+    ],
+    "meshes": 168,
+    "scatter_copies": 755,
+    "skins": 2,
+    "skipped_hidden": [],
+    "texel_density_target": null,
+    "textures": 60,
+    "triangles": 485610,
+    "vertices": 523928
+  },
+  "per_part_render_samples": 64,
+  "per_part_render_seconds": 28.27818489074707,
+  "render_mean_absolute_channel_difference_255": 0.1662139892578125,
+  "scene_objects": 283,
+  "source": "copied mech3/mech.json",
+  "live_mcp_replies": {
+    "open_scene": {
+      "seconds": 0.029133417061530054,
+      "text_bytes": 1657,
+      "isError": false
+    },
+    "get_scene": {
+      "seconds": 0.7965275410097092,
+      "text_bytes": 1668,
+      "isError": false
+    },
+    "set_material_list": {
+      "seconds": 0.08258266595657915,
+      "text_bytes": 4524,
+      "isError": false
+    },
+    "set_material_edit": {
+      "seconds": 0.012293624924495816,
+      "text_bytes": 111,
+      "isError": false
+    }
+  },
+  "record_format": "Concise acceptance record; rerunning speed_mech_acceptance writes the full independent reader summaries."
+}

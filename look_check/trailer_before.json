@@ -1,0 +1,49 @@
+{
+  "camera_position": [
+    9.0,
+    2.0,
+    15.0
+  ],
+  "camera_target": [
+    0.0,
+    3.4000000953674316,
+    0.0
+  ],
+  "fov": 30.0,
+  "height": 540,
+  "render_film": {
+    "aspect": 1.7777777777777777,
+    "background": true,
+    "bounces": 4,
+    "camera": {
+      "fov": 30.0,
+      "position": [
+        9.0,
+        2.0,
+        15.0
+      ],
+      "target": [
+        0.0,
+        3.4000000953674316,
+        0.0
+      ]
+    },
+    "denoise": true,
+    "environment": "golden_hour",
+    "exposure": 1.0,
+    "floor": false,
+    "lights": "none",
+    "samples": 512,
+    "size": 960,
+    "time_limit": 600
+  },
+  "resolved": {
+    "background": true,
+    "environment": "golden_hour",
+    "lights": "none"
+  },
+  "samples": 512,
+  "scene": "mech.json",
+  "seconds": 23.602807998657227,
+  "size": 960
+}

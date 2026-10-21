@@ -1,0 +1,74 @@
+{
+  "open_scene": {
+    "seconds": 0.029133417061530054,
+    "text_bytes": 1657,
+    "isError": false,
+    "reply": {
+      "id": 1,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "{\n  \"budget\": {\n    \"copies\": 1163,\n    \"lights\": 0,\n    \"triangles_drawn\": 0,\n    \"unique_triangles\": 0\n  },\n  \"camera\": {\n    \"distance\": 12.0,\n    \"look_at\": [\n      0.0,\n      0.0,\n      0.0\n    ],\n    \"pitch\": 25.7831,\n    \"yaw\": 42.9718\n  },\n  \"file\": \"speed_check/mech.json\",\n  \"matched\": 8,\n  \"next_offset\": null,\n  \"object_count\": 283,\n  \"objects\": [\n    {\n      \"children\": 76,\n      \"id\": 1,\n      \"material\": \"gunmetal\",\n      \"mirror_of\": null,\n      \"name\": \"Frame\",\n      \"shape\": \"Clay\"\n    },\n    {\n      \"children\": 137,\n      \"id\": 24,\n      \"material\": null,\n      \"mirror_of\": null,\n      \"name\": \"kitbash_library\",\n      \"shape\": \"Group\"\n    },\n    {\n      \"children\": 0,\n      \"id\": 231,\n      \"material\": null,\n      \"mirror_of\": null,\n      \"name\": \"Desert\",\n      \"shape\": \"Terrain\"\n    },\n    {\n      \"children\": 0,\n      \"id\": 232,\n      \"material\": null,\n      \"mirror_of\": null,\n      \"name\": \"RockA\",\n      \"shape\": \"Kit\"\n    },\n    {\n      \"children\": 0,\n      \"id\": 233,\n      \"material\": null,\n      \"mirror_of\": null,\n      \"name\": \"RockB\",\n      \"shape\": \"Kit\"\n    },\n    {\n      \"children\": 0,\n      \"id\": 234,\n      \"material\": null,\n      \"mirror_of\": null,\n      \"name\": \"RockC\",\n      \"shape\": \"Kit\"\n    },\n    {\n      \"children\": 0,\n      \"id\": 235,\n      \"material\": null,\n      \"mirror_of\": null,\n      \"name\": \"Rocks\",\n      \"shape\": \"Scatter\"\n    },\n    {\n      \"children\": 3,\n      \"id\": 236,\n      \"material\": \"skin\",\n      \"mirror_of\": null,\n      \"name\": \"Soldier\",\n      \"shape\": \"Clay\"\n    }\n  ],\n  \"offset\": 0,\n  \"selection\": [],\n  \"top_level\": true\n}",
+            "type": "text"
+          }
+        ],
+        "isError": false
+      }
+    }
+  },
+  "get_scene": {
+    "seconds": 0.7965275410097092,
+    "text_bytes": 1668,
+    "isError": false,
+    "reply": {
+      "id": 2,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "{\n  \"budget\": {\n    \"copies\": 1163,\n    \"lights\": 0,\n    \"triangles_drawn\": 2289028,\n    \"unique_triangles\": 304396\n  },\n  \"camera\": {\n    \"distance\": 12.0,\n    \"look_at\": [\n      0.0,\n      0.0,\n      0.0\n    ],\n    \"pitch\": 25.7831,\n    \"yaw\": 42.9718\n  },\n  \"file\": \"speed_check/mech.json\",\n  \"matched\": 8,\n  \"next_offset\": null,\n  \"object_count\": 283,\n  \"objects\": [\n    {\n      \"children\": 76,\n      \"id\": 1,\n      \"material\": \"gunmetal\",\n      \"mirror_of\": null,\n      \"name\": \"Frame\",\n      \"shape\": \"Clay\"\n    },\n    {\n      \"children\": 137,\n      \"id\": 24,\n      \"material\": null,\n      \"mirror_of\": null,\n      \"name\": \"kitbash_library\",\n      \"shape\": \"Group\"\n    },\n    {\n      \"children\": 0,\n      \"id\": 231,\n      \"material\": null,\n      \"mirror_of\": null,\n      \"name\": \"Desert\",\n      \"shape\": \"Terrain\"\n    },\n    {\n      \"children\": 0,\n      \"id\": 232,\n      \"material\": null,\n      \"mirror_of\": null,\n      \"name\": \"RockA\",\n      \"shape\": \"Kit\"\n    },\n    {\n      \"children\": 0,\n      \"id\": 233,\n      \"material\": null,\n      \"mirror_of\": null,\n      \"name\": \"RockB\",\n      \"shape\": \"Kit\"\n    },\n    {\n      \"children\": 0,\n      \"id\": 234,\n      \"material\": null,\n      \"mirror_of\": null,\n      \"name\": \"RockC\",\n      \"shape\": \"Kit\"\n    },\n    {\n      \"children\": 0,\n      \"id\": 235,\n      \"material\": null,\n      \"mirror_of\": null,\n      \"name\": \"Rocks\",\n      \"shape\": \"Scatter\"\n    },\n    {\n      \"children\": 3,\n      \"id\": 236,\n      \"material\": \"skin\",\n      \"mirror_of\": null,\n      \"name\": \"Soldier\",\n      \"shape\": \"Clay\"\n    }\n  ],\n  \"offset\": 0,\n  \"selection\": [],\n  \"top_level\": true\n}",
+            "type": "text"
+          }
+        ],
+        "isError": false
+      }
+    }
+  },
+  "set_material_list": {
+    "seconds": 0.08258266595657915,
+    "text_bytes": 4524,
+    "isError": false,
+    "reply": {
+      "id": 3,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "{\n  \"materials\": [\n    {\n      \"name\": \"armor_khaki\",\n      \"scene_material\": true,\n      \"user_count\": 0,\n      \"users\": []\n    },\n    {\n      \"name\": \"battle_worn\",\n      \"scene_material\": false,\n      \"user_count\": 0,\n      \"users\": []\n    },\n    {\n      \"name\": \"blood_splatter\",\n      \"scene_material\": false,\n      \"user_count\": 0,\n      \"users\": []\n    },\n    {\n      \"name\": \"bone\",\n      \"scene_material\": false,\n      \"user_count\": 4,\n      \"users\": [\n        {\n          \"implicit_role\": \"bone\",\n          \"object\": \"Desert\"\n        },\n        {\n          \"implicit_role\": \"bone\",\n          \"object\": \"RockA\"\n        },\n        {\n          \"implicit_role\": \"bone\",\n          \"object\": \"RockB\"\n        },\n        {\n          \"implicit_role\": \"bone\",\n          \"object\": \"RockC\"\n        }\n      ]\n    },\n    {\n      \"name\": \"bronze\",\n      \"scene_material\": false,\n      \"user_count\": 0,\n      \"users\": []\n    },\n    {\n      \"name\": \"burnt_wreck\",\n      \"scene_material\": false,\n      \"user_count\": 0,\n      \"users\": []\n    },\n    {\n      \"name\": \"charred_flesh\",\n      \"scene_material\": false,\n      \"user_count\": 0,\n      \"users\": []\n    },\n    {\n      \"name\": \"clay\",\n      \"scene_material\": false,\n      \"user_count\": 150,\n      \"users\": [\n        {\n          \"object\": \"kb_antenna_whip_1300\"\n        },\n        {\n          \"object\": \"kb_stencil_plate_600\"\n        },\n        {\n          \"object\": \"kb_stencil_plate_300\"\n        },\n        {\n          \"object\": \"kb_stencil_plate_750\"\n        },\n        {\n          \"object\": \"kb_stencil_plate_550\"\n        },\n        {\n          \"object\": \"kb_light_round_130\"\n        },\n        {\n          \"object\": \"kb_light_round_1302\"\n        },\n        {\n          \"object\": \"kb_greeble_canister_320\"\n        }\n      ],\n      \"users_note\": \"First 8 references; use filter with this name and verbose:true for all users.\"\n    },\n    {\n      \"name\": \"cloth\",\n      \"scene_material\": false,\n      \"user_count\": 8,\n      \"users\": [\n        {\n          \"implicit_role\": \"cloth\",\n          \"object\": \"Desert\"\n        },\n        {\n          \"implicit_role\": \"cloth\",\n          \"object\": \"RockA\"\n        },\n        {\n          \"implicit_role\": \"cloth\",\n          \"object\": \"RockB\"\n        },\n        {\n          \"implicit_role\": \"cloth\",\n          \"object\": \"RockC\"\n        },\n        {\n          \"blob\": \"pants_hip\",\n          \"object\": \"Soldier\"\n        },\n        {\n          \"blob\": \"pants_leg\",\n          \"object\": \"Soldier\"\n        },\n        {\n          \"blob\": \"shirt\",\n          \"object\": \"Soldier\"\n        },\n        {\n          \"blob\": \"sleeve\",\n          \"object\": \"Soldier\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cracked_leather\",\n      \"scene_material\": false,\n      \"user_count\": 0,\n      \"users\": []\n    },\n    {\n      \"name\": \"crystal\",\n      \"scene_material\": false,\n      \"user_count\": 0,\n      \"users\": []\n    },\n    {\n      \"name\": \"damage_10_0_tan_paint\",\n      \"scene_material\": true,\n      \"user_count\": 0,\n      \"users\": []\n    },\n    {\n      \"name\": \"damage_10_1_gunmetal\",\n      \"scene_material\": true,\n      \"user_count\": 0,\n      \"users\": []\n    },\n    {\n      \"name\": \"damage_11_0_gunmetal\",\n      \"scene_material\": true,\n      \"user_count\": 0,\n      \"users\": []\n    },\n    {\n      \"name\": \"damage_11_1_tan_paint\",\n      \"scene_material\": true,\n      \"user_count\": 0,\n      \"users\": []\n    },\n    {\n      \"name\": \"damage_11_2_strap\",\n      \"scene_material\": true,\n      \"user_count\": 0,\n      \"users\": []\n    },\n    {\n      \"name\": \"damage_12_0_gunmetal\",\n      \"scene_material\": true,\n      \"user_count\": 0,\n      \"users\": []\n    },\n    {\n      \"name\": \"damage_12_1_tan_paint\",\n      \"scene_material\": true,\n      \"user_count\": 0,\n      \"users\": []\n    },\n    {\n      \"name\": \"damage_12_2_strap\",\n      \"scene_material\": true,\n      \"user_count\": 0,\n      \"users\": []\n    },\n    {\n      \"name\": \"damage_13_0_gunmetal\",\n      \"scene_material\": true,\n      \"user_count\": 0,\n      \"users\": []\n    },\n    {\n      \"name\": \"damage_13_1_tan_paint\",\n      \"scene_material\": true,\n      \"user_count\": 0,\n      \"users\": []\n    },\n    {\n      \"name\": \"damage_14_0_gunmetal\",\n      \"scene_material\": true,\n      \"user_count\": 0,\n      \"users\": []\n    },\n    {\n      \"name\": \"damage_15_0_gunmetal\",\n      \"scene_material\": true,\n      \"user_count\": 0,\n      \"users\": []\n    },\n    {\n      \"name\": \"damage_15_1_tan_paint\",\n      \"scene_material\": true,\n      \"user_count\": 0,\n      \"users\": []\n    }\n  ],\n  \"next_offset\": 24,\n  \"offset\": 0,\n  \"total\": 99\n}",
+            "type": "text"
+          }
+        ],
+        "isError": false
+      }
+    }
+  },
+  "set_material_edit": {
+    "seconds": 0.012293624924495816,
+    "text_bytes": 111,
+    "isError": false,
+    "reply": {
+      "id": 4,
+      "jsonrpc": "2.0",
+      "result": {
+        "content": [
+          {
+            "text": "{\n  \"changed\": [\n    \"roughness\"\n  ],\n  \"layers\": 16,\n  \"materials\": 58,\n  \"name\": \"tan_paint\",\n  \"users\": 19\n}",
+            "type": "text"
+          }
+        ],
+        "isError": false
+      }
+    }
+  }
+}

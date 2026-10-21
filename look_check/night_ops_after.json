@@ -1,0 +1,138 @@
+{
+  "camera_position": [
+    9.0,
+    2.0,
+    15.0
+  ],
+  "camera_target": [
+    0.0,
+    3.4000000953674316,
+    0.0
+  ],
+  "fov": 30.0,
+  "height": 540,
+  "render_film": {
+    "aspect": 1.7777777777777777,
+    "bounces": 4,
+    "camera": {
+      "fov": 30.0,
+      "position": [
+        9.0,
+        2.0,
+        15.0
+      ],
+      "target": [
+        0.0,
+        3.4000000953674316,
+        0.0
+      ]
+    },
+    "denoise": true,
+    "exposure": 1.0,
+    "extra_lights": [
+      {
+        "color": [
+          0.18,
+          0.5,
+          1
+        ],
+        "intensity": 15,
+        "position": [
+          2,
+          4,
+          6
+        ],
+        "radius": 1,
+        "type": "sphere"
+      }
+    ],
+    "floor": false,
+    "fog": {
+      "density": 0.03,
+      "distance": 35,
+      "falloff": 1.2,
+      "height": 0.2,
+      "noise": 0.7
+    },
+    "look": "night_ops",
+    "samples": 512,
+    "size": 960,
+    "time_limit": 600
+  },
+  "resolved": {
+    "background": "environment",
+    "bloom": {
+      "streaks": 0.3,
+      "strength": 0.12
+    },
+    "camera": {
+      "aperture": 2,
+      "focal_length_mm": 50,
+      "fov": 30,
+      "position": [
+        9.0,
+        2.0,
+        15.0
+      ],
+      "target": [
+        0.0,
+        3.4000000953674316,
+        0.0
+      ]
+    },
+    "environment": "night",
+    "extra_lights": [
+      {
+        "color": [
+          0.18,
+          0.5,
+          1
+        ],
+        "intensity": 15,
+        "position": [
+          2,
+          4,
+          6
+        ],
+        "radius": 1,
+        "type": "sphere"
+      }
+    ],
+    "fog": {
+      "anisotropy": 0.5,
+      "density": 0.03,
+      "distance": 35,
+      "falloff": 1.2,
+      "height": 0.2,
+      "noise": 0.7
+    },
+    "grade": {
+      "look": "night_ops"
+    },
+    "grain": 0.015,
+    "lights": [
+      {
+        "color": [
+          0.25,
+          0.55,
+          0.9
+        ],
+        "direction": [
+          -0.6,
+          0.5,
+          -0.4
+        ],
+        "intensity": 1.5,
+        "size": 2,
+        "type": "sun"
+      }
+    ],
+    "look": "night_ops",
+    "tonemap": "agx",
+    "vignette": 0.3
+  },
+  "samples": 512,
+  "scene": "mech.json",
+  "seconds": 51.14299392700195,
+  "size": 960
+}

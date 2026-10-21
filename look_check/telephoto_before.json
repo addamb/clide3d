@@ -1,0 +1,200 @@
+{
+  "camera_position": [
+    17.0,
+    1.2000000476837158,
+    20.0
+  ],
+  "camera_target": [
+    0.5,
+    5.650000095367432,
+    0.5
+  ],
+  "fov": 6.867260456085205,
+  "height": 540,
+  "render_film": {
+    "aspect": 1.7777777777777777,
+    "bounces": 4,
+    "camera": {
+      "aperture": null,
+      "dof": {
+        "blades": 7,
+        "focus_point": [
+          0.3,
+          6.15,
+          0.8
+        ]
+      },
+      "focal_length_mm": 200,
+      "fov": 6.867260456085205,
+      "position": [
+        17.0,
+        1.2000000476837158,
+        20.0
+      ],
+      "sensor_size_mm": [
+        36,
+        24
+      ],
+      "target": [
+        0.5,
+        5.650000095367432,
+        0.5
+      ]
+    },
+    "denoise": true,
+    "environment": {
+      "intensity": 0.2,
+      "preset": "golden_hour"
+    },
+    "exposure": 1.0,
+    "floor": false,
+    "fog": {
+      "color": [
+        0.95,
+        0.83,
+        0.65
+      ],
+      "density": 0.006,
+      "distance": 90,
+      "falloff": 1.5,
+      "height": 0.2,
+      "noise": 0.65,
+      "noise_scale": 0.18
+    },
+    "grain": 0.006,
+    "lights": [
+      {
+        "color": [
+          1,
+          0.78,
+          0.5
+        ],
+        "direction": [
+          0.5,
+          0.7,
+          0.8
+        ],
+        "intensity": 3,
+        "size": 3,
+        "type": "sun"
+      },
+      {
+        "color": [
+          1,
+          0.65,
+          0.3
+        ],
+        "direction": [
+          -0.6,
+          0.2,
+          -0.8
+        ],
+        "intensity": 8,
+        "size": 1,
+        "type": "sun"
+      }
+    ],
+    "look": "trailer",
+    "samples": 512,
+    "size": 960,
+    "time_limit": 600
+  },
+  "resolved": {
+    "background": "environment",
+    "bloom": {
+      "dirt": 0.12,
+      "streaks": 0.15,
+      "strength": 0.08,
+      "threshold": 1.5
+    },
+    "camera": {
+      "aperture": null,
+      "dof": {
+        "blades": 7,
+        "focus_point": [
+          0.3,
+          6.15,
+          0.8
+        ]
+      },
+      "focal_length_mm": 200,
+      "position": [
+        17.0,
+        1.2000000476837158,
+        20.0
+      ],
+      "sensor_size_mm": [
+        36,
+        24
+      ],
+      "target": [
+        0.5,
+        5.650000095367432,
+        0.5
+      ]
+    },
+    "environment": {
+      "intensity": 0.2,
+      "preset": "golden_hour"
+    },
+    "fog": {
+      "anisotropy": 0.55,
+      "color": [
+        0.95,
+        0.83,
+        0.65
+      ],
+      "density": 0.006,
+      "distance": 90,
+      "falloff": 1.5,
+      "height": 0.2,
+      "noise": 0.65,
+      "noise_scale": 0.18
+    },
+    "grade": {
+      "contrast": 1.16,
+      "look": "modern_warfare"
+    },
+    "grain": 0.006,
+    "lights": [
+      {
+        "color": [
+          1,
+          0.78,
+          0.5
+        ],
+        "direction": [
+          0.5,
+          0.7,
+          0.8
+        ],
+        "intensity": 3,
+        "size": 3,
+        "type": "sun"
+      },
+      {
+        "color": [
+          1,
+          0.65,
+          0.3
+        ],
+        "direction": [
+          -0.6,
+          0.2,
+          -0.8
+        ],
+        "intensity": 8,
+        "size": 1,
+        "type": "sun"
+      }
+    ],
+    "look": "trailer",
+    "sharpen": 0.12,
+    "tonemap": "agx",
+    "vignette": 0.22
+  },
+  "samples": 512,
+  "scene": "telephoto_scene.json",
+  "seconds": 92.70323181152344,
+  "size": 960
+}

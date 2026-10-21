@@ -1,0 +1,365 @@
+{
+  "blobs": [
+    {
+      "name": "mount",
+      "type": "box",
+      "center": [
+        1.75,
+        6.28,
+        -0.1
+      ],
+      "size": [
+        0.55,
+        0.22,
+        0.65
+      ],
+      "rotate": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "round": 0.03,
+      "op": "add",
+      "blend": 0.0,
+      "color": [
+        0.17,
+        0.17,
+        0.18
+      ],
+      "material": "damage_9_0_gunmetal",
+      "smooth": 0.0,
+      "join": "round",
+      "join_size": null,
+      "wall": 0.004,
+      "rim": 0.0,
+      "ridge": 0.0,
+      "flare": 0.0
+    },
+    {
+      "name": "box",
+      "type": "box",
+      "center": [
+        1.78,
+        6.78,
+        -0.05
+      ],
+      "size": [
+        1.2,
+        0.82,
+        1.2
+      ],
+      "rotate": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "round": 0.04,
+      "op": "add",
+      "blend": 0.0,
+      "color": [
+        0.72,
+        0.57,
+        0.4
+      ],
+      "smooth": 0.0,
+      "join": "round",
+      "join_size": null,
+      "wall": 0.004,
+      "rim": 0.0,
+      "ridge": 0.0,
+      "flare": 0.0
+    },
+    {
+      "name": "ch_top_f",
+      "type": "box",
+      "center": [
+        1.78,
+        7.19,
+        0.55
+      ],
+      "size": [
+        1.4,
+        0.22,
+        0.22
+      ],
+      "rotate": [
+        45.0,
+        0.0,
+        0.0
+      ],
+      "round": 0.0,
+      "op": "carve",
+      "blend": 0.0,
+      "color": [
+        0.8,
+        0.8,
+        0.8
+      ],
+      "smooth": 0.0,
+      "join": "round",
+      "join_size": null,
+      "wall": 0.004,
+      "rim": 0.0,
+      "ridge": 0.0,
+      "flare": 0.0
+    },
+    {
+      "name": "face_recess",
+      "type": "box",
+      "center": [
+        1.78,
+        6.78,
+        0.58
+      ],
+      "size": [
+        1.08,
+        0.7,
+        0.08
+      ],
+      "rotate": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "round": 0.01,
+      "op": "carve",
+      "blend": 0.0,
+      "color": [
+        0.8,
+        0.8,
+        0.8
+      ],
+      "smooth": 0.0,
+      "join": "round",
+      "join_size": null,
+      "wall": 0.004,
+      "rim": 0.0,
+      "ridge": 0.0,
+      "flare": 0.0
+    },
+    {
+      "name": "lids",
+      "type": "array",
+      "source": {
+        "type": "array",
+        "source": {
+          "type": "box",
+          "center": [
+            1.42,
+            6.61,
+            0.55
+          ],
+          "size": [
+            0.32,
+            0.3,
+            0.06
+          ],
+          "rotate": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "round": 0.025
+        },
+        "count": 2,
+        "step": [
+          0.0,
+          0.34,
+          0.0
+        ],
+        "radius": 0.0,
+        "center": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "axis": [
+          0.0,
+          1.0,
+          0.0
+        ],
+        "points": []
+      },
+      "count": 3,
+      "step": [
+        0.36,
+        0.0,
+        0.0
+      ],
+      "radius": 0.0,
+      "center": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "points": [],
+      "op": "add",
+      "blend": 0.0,
+      "color": [
+        0.74,
+        0.59,
+        0.42
+      ],
+      "smooth": 0.0,
+      "join": "round",
+      "join_size": null,
+      "wall": 0.004,
+      "rim": 0.0,
+      "ridge": 0.0,
+      "flare": 0.0
+    },
+    {
+      "name": "lid_slots",
+      "type": "array",
+      "source": {
+        "type": "array",
+        "source": {
+          "type": "box",
+          "center": [
+            1.42,
+            6.55,
+            0.6
+          ],
+          "size": [
+            0.14,
+            0.03,
+            0.04
+          ],
+          "rotate": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "round": 0.008
+        },
+        "count": 2,
+        "step": [
+          0.0,
+          0.34,
+          0.0
+        ],
+        "radius": 0.0,
+        "center": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "axis": [
+          0.0,
+          1.0,
+          0.0
+        ],
+        "points": []
+      },
+      "count": 3,
+      "step": [
+        0.36,
+        0.0,
+        0.0
+      ],
+      "radius": 0.0,
+      "center": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "points": [],
+      "op": "add",
+      "blend": 0.0,
+      "color": [
+        0.1,
+        0.1,
+        0.1
+      ],
+      "material": "damage_9_0_gunmetal",
+      "smooth": 0.0,
+      "join": "round",
+      "join_size": null,
+      "wall": 0.004,
+      "rim": 0.0,
+      "ridge": 0.0,
+      "flare": 0.0
+    },
+    {
+      "name": "side_rail",
+      "type": "box",
+      "center": [
+        2.4,
+        6.78,
+        -0.05
+      ],
+      "size": [
+        0.06,
+        0.6,
+        1.0
+      ],
+      "rotate": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "round": 0.015,
+      "op": "add",
+      "blend": 0.0,
+      "color": [
+        0.7,
+        0.55,
+        0.39
+      ],
+      "smooth": 0.0,
+      "join": "round",
+      "join_size": null,
+      "wall": 0.004,
+      "rim": 0.0,
+      "ridge": 0.0,
+      "flare": 0.0
+    },
+    {
+      "name": "back_plate",
+      "type": "box",
+      "center": [
+        1.78,
+        6.78,
+        -0.67
+      ],
+      "size": [
+        1.0,
+        0.6,
+        0.06
+      ],
+      "rotate": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "round": 0.015,
+      "op": "add",
+      "blend": 0.0,
+      "color": [
+        0.7,
+        0.55,
+        0.39
+      ],
+      "smooth": 0.0,
+      "join": "round",
+      "join_size": null,
+      "wall": 0.004,
+      "rim": 0.0,
+      "ridge": 0.0,
+      "flare": 0.0
+    }
+  ],
+  "resolution": 150,
+  "shell": null,
+  "sharp": true
+}
