@@ -17,6 +17,11 @@ use std::time::{Duration, Instant};
 use glam::{IVec3, Vec3};
 
 use super::{BuildKey, MeshLib};
+
+/// Triangles up to which picking builds a mesh's tree on the spot (tens
+/// of ms); larger meshes are tested triangle by triangle until their tree,
+/// built in the background, is ready.
+const PICK_TREE_NOW: usize = 200_000;
 use crate::clay::chunks::{self, ChunkKey, ChunkMesh, ChunkSet, Mesher};
 use crate::clay::{Clay, Detail};
 use crate::groups::Groups;
@@ -373,7 +378,17 @@ impl MeshLib {
 
     /// The nearest hit of a ray on a mesh (as `Mesh::ray_hit_triangle`,
     /// through a tree kept with the mesh), with barycentrics and normal.
+    /// A large mesh with no tree yet (just rebuilt) is tested triangle by
+    /// triangle while its tree builds in the background: building it here
+    /// would stall the window for seconds on a click.
     pub fn ray_hit(&self, mesh: &Arc<super::Mesh>, origin: Vec3, dir: Vec3) -> Option<super::RayHit> {
+        if let Some(tree) = self.bvhs.ready(mesh) {
+            return tree.hit(mesh, origin, dir);
+        }
+        if mesh.indices.len() / 3 > PICK_TREE_NOW {
+            self.bvhs.warm(mesh);
+            return super::pick::brute_hit(mesh, origin, dir);
+        }
         self.bvhs.of(mesh).hit(mesh, origin, dir)
     }
 

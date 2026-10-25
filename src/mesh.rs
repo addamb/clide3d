@@ -39,6 +39,9 @@ pub use session::{SculptChunk, SculptVertex};
 type EyeKey = (Eye, f32, Mat4);
 type SolidKey = (Shape, Material, Vec<crate::smart::Decal>);
 
+/// Object id -> (clay, library, fallback, palette made from them).
+type Palettes = Arc<std::sync::Mutex<HashMap<u64, (Clay, Vec<Material>, String, Vec<Material>)>>>;
+
 /// Every mesh the scene needs. Clay meshes are rebuilt when their blobs
 /// change; rigged clay is skinned and posed for `frame`.
 #[derive(Clone)]
@@ -101,6 +104,11 @@ pub struct MeshLib {
     /// Clays whose regular build waits for their strokes to pause (see
     /// `sculpting_now`); `busy` while any does.
     deferred: std::collections::HashSet<u64>,
+    /// Clay palettes by object, with what each was made from: working one
+    /// out builds the clay's field (for its bounds), far too slow to redo
+    /// every frame for a clay of many sweeps. Shared by copies; an entry is
+    /// only used when its inputs match.
+    palettes: Palettes,
     /// Chunks built and made draw-ready.
     #[cfg(test)]
     pub chunk_builds: usize,
@@ -236,7 +244,7 @@ struct BuildKey {
 }
 
 /// What a clay object's meshes are built from.
-fn clay_key(scene: &Scene, o: &Object) -> BuildKey {
+fn clay_key(scene: &Scene, o: &Object, palettes: &Palettes) -> BuildKey {
     // Stroke ledgers do not shape the mesh (the grids they built do): a
     // record alone (a label, a disabled stroke replayed to the same grid)
     // rebuilds nothing, and keys never serialize them. The sculpt and
@@ -250,7 +258,16 @@ fn clay_key(scene: &Scene, o: &Object) -> BuildKey {
     let mut library = crate::damage::library(scene, o);
     let names = clay.material_names();
     library.retain(|m| names.iter().any(|n| m.name.as_str() == if n.is_empty() { fallback.as_str() } else { n.as_str() }));
-    let palette = clay.palette(&library, &fallback);
+    let mut known = palettes.lock().unwrap_or_else(|e| e.into_inner());
+    let palette = match known.get(&o.id) {
+        Some((c, l, f, p)) if *c == clay && *l == library && *f == fallback => p.clone(),
+        _ => {
+            let p = clay.palette(&library, &fallback);
+            known.insert(o.id, (clay.clone(), library.clone(), fallback.clone(), p.clone()));
+            p
+        }
+    };
+    drop(known);
     let rig = o.rig.as_ref().filter(|r| !r.bones.is_empty());
     BuildKey { clay, cloth: None, palette, library, fallback, rig: rig.map(|r| (r.bones.clone(), r.split, r.weights.clone())) }
 }
@@ -371,7 +388,7 @@ struct Baked {
 
 impl MeshLib {
     pub fn new() -> Self {
-        Self { #[cfg(test)] geometry_builds:0, #[cfg(test)] shading_updates:0, #[cfg(test)] aliases_installed:0, #[cfg(test)] fine_builds:0, #[cfg(test)] blocking_joins: 0, #[cfg(test)] no_sharing:false, #[cfg(test)] overlay_ms: 0.0, overlay: crate::overlay::Overlay::default(), owner_of: HashMap::new(), solids: HashMap::new(), prims: Mesh::all().into_iter().map(|(s, m)| (s, Arc::new(m))).collect(), clay: HashMap::new(), eyes: HashMap::new(), hairs: HashMap::new(), fires: HashMap::new(), kits: HashMap::new(), scatter_bounds: HashMap::new(), frame: None, show_baked: false, show_fine: false, pending: Pending::default(), chunked: HashMap::new(), sessions: Default::default(), sculpt_tool: Default::default(), previews: Default::default(), session_now: None, bvhs: Default::default(), chunk_timing: (0.0, 0.0), deferred: Default::default(), #[cfg(test)] chunk_builds: 0, #[cfg(test)] slim_updates: 0 }
+        Self { #[cfg(test)] geometry_builds:0, #[cfg(test)] shading_updates:0, #[cfg(test)] aliases_installed:0, #[cfg(test)] fine_builds:0, #[cfg(test)] blocking_joins: 0, #[cfg(test)] no_sharing:false, #[cfg(test)] overlay_ms: 0.0, overlay: crate::overlay::Overlay::default(), owner_of: HashMap::new(), solids: HashMap::new(), prims: Mesh::all().into_iter().map(|(s, m)| (s, Arc::new(m))).collect(), clay: HashMap::new(), eyes: HashMap::new(), hairs: HashMap::new(), fires: HashMap::new(), kits: HashMap::new(), scatter_bounds: HashMap::new(), frame: None, show_baked: false, show_fine: false, pending: Pending::default(), chunked: HashMap::new(), sessions: Default::default(), sculpt_tool: Default::default(), previews: Default::default(), session_now: None, bvhs: Default::default(), chunk_timing: (0.0, 0.0), deferred: Default::default(), palettes: Default::default(), #[cfg(test)] chunk_builds: 0, #[cfg(test)] slim_updates: 0 }
     }
 
     pub fn prims(&self) -> impl Iterator<Item = (MeshKey, Arc<Mesh>)> + '_ {
@@ -411,7 +428,7 @@ impl MeshLib {
             None => true,
             Some(e) => {
                 let fine = e.fine.as_ref().is_some_and(|f| Arc::ptr_eq(&f.from, &e.rest)) || e.fine_error.as_ref().is_some_and(|f| Arc::ptr_eq(&f.0, &e.rest));
-                e.key != clay_key(scene, o) || (self.show_fine && !e.use_baked && e.key.clay.detail_cell.is_some() && !fine)
+                e.key != clay_key(scene, o, &self.palettes) || (self.show_fine && !e.use_baked && e.key.clay.detail_cell.is_some() && !fine)
             }
         })
     }
@@ -422,7 +439,7 @@ impl MeshLib {
     pub fn sync_joined(&mut self, scene: &Scene) {
         self.sync(scene);
         let clays: Vec<&Object> = scene.objects.iter().filter(|o| o.shape == Shape::Clay).collect();
-        let keys: Vec<BuildKey> = clays.iter().map(|o| clay_key(scene, o)).collect();
+        let keys: Vec<BuildKey> = clays.iter().map(|o| clay_key(scene, o, &self.palettes)).collect();
         self.sync_chunks(&clays, &keys, true);
     }
 
@@ -482,11 +499,12 @@ impl MeshLib {
         }
         let live: std::collections::HashSet<u64> = objects.iter().filter(|o| matches!(o.shape, Shape::Clay | Shape::Cloth)).map(|o| o.id).collect();
         self.clay.retain(|id, _| live.contains(id));
+        self.palettes.lock().unwrap_or_else(|e| e.into_inner()).retain(|id, _| live.contains(id));
         self.pending.clay.retain(|id, _| live.contains(id));
         self.pending.alias.retain(|id, _| live.contains(id));
         self.pending.hashes.retain(|id, _| live.contains(id));
         let clays: Vec<&Object> = objects.iter().filter(|o| o.shape == Shape::Clay).collect();
-        let keys: Vec<BuildKey> = clays.iter().map(|o| clay_key(scene, o)).collect();
+        let keys: Vec<BuildKey> = clays.iter().map(|o| clay_key(scene, o, &self.palettes)).collect();
         // Sculpt sessions' chunks first: in the background, the regular
         // mesh of a clay a sculpt tool is on starts building once its
         // chunks are drawn. Nothing waits for chunks here (see
@@ -497,7 +515,7 @@ impl MeshLib {
         } else {
             let shown: Vec<Object> = clays.iter().filter_map(|o| self.previews.shown.get(&o.id).map(|(_, c)| Object { clay: Some(c.clone()), ..(*o).clone() })).collect();
             let chunk_clays: Vec<&Object> = clays.iter().map(|o| shown.iter().find(|s| s.id == o.id).unwrap_or(o)).collect();
-            let chunk_keys: Vec<BuildKey> = chunk_clays.iter().zip(&keys).map(|(o, k)| if self.previews.shown.contains_key(&o.id) { clay_key(scene, o) } else { k.clone() }).collect();
+            let chunk_keys: Vec<BuildKey> = chunk_clays.iter().zip(&keys).map(|(o, k)| if self.previews.shown.contains_key(&o.id) { clay_key(scene, o, &self.palettes) } else { k.clone() }).collect();
             self.sync_chunks(&chunk_clays, &chunk_keys, false);
         }
         // Objects with the same key share one build and one set of meshes
@@ -1559,6 +1577,58 @@ impl Mesh {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A clay's palette is worked out once and reused every frame while
+    /// its clay and materials stay the same (working it out builds the
+    /// clay's field); a change of material works it out again.
+    #[test]
+    fn clay_palettes_are_reused_until_their_inputs_change() {
+        let mut scene = Scene::default();
+        let id = scene.add(Shape::Clay);
+        scene.get_mut(id).unwrap().clay = Some(serde_json::from_value(serde_json::json!({"blobs":[{"type":"sphere","center":[0,1,0],"radius":0.5}],"resolution":32})).unwrap());
+        let lib = MeshLib::new();
+        let key = |scene: &Scene| clay_key(scene, scene.get(id).unwrap(), &lib.palettes);
+        let first = key(&scene);
+        assert_eq!(lib.palettes.lock().unwrap().len(), 1);
+        assert!(key(&scene) == first);
+        scene.get_mut(id).unwrap().material = Some("metal".into());
+        let metal = key(&scene);
+        let o = scene.get(id).unwrap();
+        let fresh = metal.clay.palette(&crate::damage::library(&scene, o), "metal");
+        assert!(metal.palette == fresh && metal.palette != first.palette);
+    }
+
+    /// Picking a large mesh that has no tree yet answers at once, triangle
+    /// by triangle, with the tree's hit, and builds the tree in the
+    /// background for the next pick.
+    #[test]
+    fn picking_a_large_mesh_does_not_wait_for_its_tree() {
+        let n = 400u32; // 2 * 399^2 = 318k triangles
+        let mut m = Mesh::default();
+        for j in 0..n {
+            for i in 0..n {
+                let (x, y) = (i as f32 / n as f32, j as f32 / n as f32);
+                m.vertices.push(Vertex { pos: [x, y, (x * 40.0).sin() * 0.01], normal: [0.0, 0.0, 1.0], ..bytemuck::Zeroable::zeroed() });
+            }
+        }
+        for j in 0..n - 1 {
+            for i in 0..n - 1 {
+                let a = j * n + i;
+                m.indices.extend([a, a + 1, a + n, a + 1, a + n + 1, a + n]);
+            }
+        }
+        let mesh = Arc::new(m);
+        let lib = MeshLib::new();
+        let (origin, dir) = (Vec3::new(0.37, 0.61, 1.0), Vec3::NEG_Z);
+        let hit = lib.ray_hit(&mesh, origin, dir);
+        assert!(hit.is_some() && hit == pick::MeshBvh::new(&mesh).hit(&mesh, origin, dir));
+        let t = std::time::Instant::now();
+        while lib.bvhs.ready(&mesh).is_none() {
+            assert!(t.elapsed().as_secs() < 30, "the tree never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(lib.ray_hit(&mesh, origin, dir), hit);
+    }
 
     #[test]
     fn painting_invalidates_skin_and_carries_through_baking() {

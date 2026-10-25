@@ -961,10 +961,12 @@ impl ClideApp {
         let o = self.scene.get(c.target).ok_or("The stroke's clay object is gone; nothing was sent.")?;
         let mesh = self.meshes.display(o).cloned().ok_or("The clay has no mesh; nothing was sent.")?;
         let to_local = posed.shown.inverse();
+        // Many rays: one tree for all of them (brush tools warm it while on).
+        let tree = self.meshes.bvh(&mesh);
         let mut points = Vec::new();
         for s in thin(&c.trail.samples, crate::brush::resolve::MAX_POINTS) {
             let (o, d) = c.camera.ray(s.px[0], s.px[1]);
-            let Some(hit) = self.meshes.ray_hit(&mesh, to_local.transform_point3(o), to_local.transform_vector3(d)) else { continue };
+            let Some(hit) = tree.hit(&mesh, to_local.transform_point3(o), to_local.transform_vector3(d)) else { continue };
             let local = to_local.transform_point3(o) + to_local.transform_vector3(d) * hit.t;
             let world = if posed.rigged.is_some() { posed.shown.transform_point3(local) } else { posed.rest.transform_point3(local) };
             let mut p = world.to_array().to_vec();

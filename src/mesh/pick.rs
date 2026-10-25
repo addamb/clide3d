@@ -87,19 +87,40 @@ impl MeshBvh {
                 stack.push(n.start);
             }
         }
-        let (t, tri, u, v) = best?;
-        let ix = &mesh.indices[tri * 3..tri * 3 + 3];
-        let vn = |k: usize| Vec3::from(mesh.vertices[ix[k] as usize].normal);
-        let mut normal = (vn(0) * (1.0 - u - v) + vn(1) * u + vn(2) * v).normalize_or_zero();
-        if normal == Vec3::ZERO {
-            let p = |k: usize| Vec3::from(mesh.vertices[ix[k] as usize].pos);
-            normal = (p(1) - p(0)).cross(p(2) - p(0)).normalize_or_zero();
-        }
-        if normal.dot(dir) > 0.0 {
-            normal = -normal;
-        }
-        Some(RayHit { t, tri, u, v, normal })
+        finish(mesh, best?, dir)
     }
+}
+
+/// The nearest hit of a ray tested against every triangle: the same hit as
+/// `MeshBvh::hit` (same test, same choice between equal hits), with no tree
+/// to build first. Picking takes it while a large mesh's tree is built in
+/// the background (a few ms per ray against seconds for the tree).
+pub fn brute_hit(mesh: &Mesh, origin: Vec3, dir: Vec3) -> Option<RayHit> {
+    let mut best: Option<(f32, usize, f32, f32)> = None;
+    for i in 0..mesh.indices.len() / 3 {
+        if let Some((t, u, v)) = triangle(mesh, i, origin, dir)
+            && best.is_none_or(|b| t < b.0)
+        {
+            best = Some((t, i, u, v));
+        }
+    }
+    finish(mesh, best?, dir)
+}
+
+/// A hit's normal: the vertex normals blended (the face's where they
+/// cancel), facing the ray's origin.
+fn finish(mesh: &Mesh, (t, tri, u, v): (f32, usize, f32, f32), dir: Vec3) -> Option<RayHit> {
+    let ix = &mesh.indices[tri * 3..tri * 3 + 3];
+    let vn = |k: usize| Vec3::from(mesh.vertices[ix[k] as usize].normal);
+    let mut normal = (vn(0) * (1.0 - u - v) + vn(1) * u + vn(2) * v).normalize_or_zero();
+    if normal == Vec3::ZERO {
+        let p = |k: usize| Vec3::from(mesh.vertices[ix[k] as usize].pos);
+        normal = (p(1) - p(0)).cross(p(2) - p(0)).normalize_or_zero();
+    }
+    if normal.dot(dir) > 0.0 {
+        normal = -normal;
+    }
+    Some(RayHit { t, tri, u, v, normal })
 }
 
 /// `Mesh::ray_hit_triangle`'s test for one triangle: (t, u, v).
@@ -182,6 +203,11 @@ impl BvhCache {
         });
     }
 
+    /// The tree of `mesh` if it is built already.
+    pub fn ready(&self, mesh: &Arc<Mesh>) -> Option<Arc<MeshBvh>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).get(&(Arc::as_ptr(mesh) as usize)).map(|(_, b)| b.clone())
+    }
+
     /// The tree of `mesh`, built the first time it is asked for.
     pub fn of(&self, mesh: &Arc<Mesh>) -> Arc<MeshBvh> {
         let key = Arc::as_ptr(mesh) as usize;
@@ -227,5 +253,24 @@ mod tests {
             }
         }
         assert!(hits > 3000 && worst <= 1e-5, "{hits} hits, worst {worst}");
+    }
+
+    /// Picking without a tree (a large mesh whose tree is still building)
+    /// gives exactly the tree's hit: distance, triangle, weights and normal.
+    #[test]
+    fn brute_force_picking_matches_the_tree() {
+        let mesh = crate::harness::figure(128, true).build_mesh_with(&[], "");
+        let bvh = MeshBvh::new(&mesh);
+        let mut hits = 0;
+        for k in 0..2000 {
+            let (a, b) = (k as f32 * 0.6180339, k as f32 * 0.4142135);
+            let origin = Vec3::new(a.fract() * 2.0 - 1.0, b.fract() * 2.0, 2.0);
+            let target = Vec3::new((a * 3.0).fract() * 0.8 - 0.4, (b * 5.0).fract() * 1.8, 0.0);
+            let dir = (target - origin).normalize();
+            let tree = bvh.hit(&mesh, origin, dir);
+            assert_eq!(brute_hit(&mesh, origin, dir), tree);
+            hits += tree.is_some() as usize;
+        }
+        assert!(hits > 500, "{hits} hits");
     }
 }
