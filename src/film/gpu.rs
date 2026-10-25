@@ -31,17 +31,22 @@ const BINDINGS: u32 = 19;
 /// The one read-write binding (the running sums).
 const ACCUM: u32 = 16;
 
-/// The shared GPU, made on first use; None when there is none usable.
-pub fn get() -> Option<&'static Gpu> {
-    static GPU: OnceLock<Option<Gpu>> = OnceLock::new();
+/// The shared GPU, made on first use, or why there is none usable.
+fn shared() -> &'static Result<Gpu, String> {
+    static GPU: OnceLock<Result<Gpu, String>> = OnceLock::new();
     GPU.get_or_init(|| {
         let made = Gpu::new();
         if let Err(e) = &made {
             eprintln!("film: no GPU tracer ({e}); using the CPU");
         }
-        made.ok()
+        made
     })
-    .as_ref()
+}
+
+/// The shared GPU; None when there is none usable.
+#[cfg(test)]
+pub fn get() -> Option<&'static Gpu> {
+    shared().as_ref().ok()
 }
 
 impl Gpu {
@@ -63,7 +68,17 @@ impl Gpu {
             ..Default::default()
         }))
         .map_err(|e| e.to_string())?;
-        device.on_uncaptured_error(Arc::new(|e| eprintln!("film GPU error: {e}")));
+        // Errors outside the first pass's error scope, and a lost device,
+        // fail the render they happen in (see `render`) instead of only
+        // being printed.
+        device.on_uncaptured_error(Arc::new(|e| {
+            eprintln!("film GPU error: {e}");
+            *FAULT.lock().unwrap_or_else(|p| p.into_inner()) = Some(e.to_string());
+        }));
+        device.set_device_lost_callback(|reason, message| {
+            eprintln!("film GPU lost ({reason:?}): {message}");
+            *LOST.lock().unwrap_or_else(|p| p.into_inner()) = Some(format!("{reason:?}: {message}"));
+        });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("trace"), source: wgpu::ShaderSource::Wgsl(include_str!("trace.wgsl").into()) });
         let entry = |binding: u32, ty: wgpu::BufferBindingType| wgpu::BindGroupLayoutEntry {
             binding,
@@ -101,16 +116,14 @@ impl Gpu {
         } else {
             bytes
         };
-        if bytes.len() as u64 > self.limits.max_storage_buffer_binding_size as u64 || bytes.len() as u64 > self.limits.max_buffer_size {
-            return Err(format!("{label} is {} MB, more than the GPU takes in one buffer", bytes.len() >> 20));
-        }
+        check_size(label, bytes.len() as u64, binding_limit(&self.limits))?;
         Ok(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: bytes, usage: wgpu::BufferUsages::STORAGE }))
     }
 }
 
 /// Small blocking executor for wgpu's futures (they finish on their own
 /// on native backends; this just waits for them).
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
+pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
     struct Wake(std::thread::Thread);
     impl std::task::Wake for Wake {
         fn wake(self: Arc<Self>) {
@@ -187,8 +200,79 @@ const DISPATCHES_PER_SUBMIT: usize = 8;
 /// The longest wait for one pass before the GPU counts as stuck.
 const STUCK: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Set when the GPU once got stuck: later renders use the CPU.
+/// Set when the GPU once got stuck: later renders use the CPU, unless one
+/// asks for the GPU by name (which tries it again).
 static BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The latest GPU error no error scope caught (cleared per render).
+static FAULT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// Why the device was lost, once it is: no later render can use it.
+static LOST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Takes the uncaught GPU error since the last call, if any.
+fn take_fault() -> Option<String> {
+    FAULT.lock().unwrap_or_else(|p| p.into_inner()).take()
+}
+
+fn lost() -> Option<String> {
+    LOST.lock().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+/// The traversal stack in `trace.wgsl` (`array<u32, 32>`): a deeper ray
+/// tree can drop far boxes on the GPU when the stack fills.
+const GPU_STACK: usize = 32;
+
+/// The most bytes one storage binding can hold on this GPU.
+fn binding_limit(limits: &wgpu::Limits) -> u64 {
+    (limits.max_storage_buffer_binding_size as u64).min(limits.max_buffer_size)
+}
+
+fn check_size(label: &str, bytes: u64, limit: u64) -> Result<(), String> {
+    if bytes > limit {
+        return Err(format!("{label}: {} is more than one GPU buffer holds ({})", show_bytes(bytes), show_bytes(limit)));
+    }
+    Ok(())
+}
+
+/// Bytes for people: "512 KB", "40.0 MB", "5.12 GB".
+fn show_bytes(b: u64) -> String {
+    match b {
+        b if b >= 1 << 30 => format!("{:.2} GB", b as f64 / (1u64 << 30) as f64),
+        b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
+        b => format!("{} KB", b.div_ceil(1 << 10)),
+    }
+}
+
+/// The sizes of the largest GPU buffers of a render, counted from the
+/// scene before anything is packed or uploaded, so a scene the GPU cannot
+/// hold is refused in milliseconds and the CPU keeps the whole time limit.
+/// (Textures, smart data and the per-view lists are checked exactly when
+/// packed, still before any buffer is made.)
+pub(crate) struct BufferPlan {
+    pub entries: Vec<(&'static str, u64)>,
+}
+
+impl BufferPlan {
+    /// From counts: ray-tree nodes, triangles, vertices (once per distinct
+    /// mesh: items sharing one share its vertices), and each view's size.
+    pub(crate) fn from_counts(nodes: u64, tris: u64, verts: u64, views: &[(usize, usize)]) -> BufferPlan {
+        let mut entries = vec![("ray tree nodes", nodes * 32), ("triangles", tris * 48), ("triangle data", tris * 16), ("vertices", verts * 80)];
+        // The running sums: color, albedo and normal per pixel.
+        entries.extend(views.iter().map(|&(w, h)| ("picture sums", (w * h * 48) as u64)));
+        BufferPlan { entries }
+    }
+
+    pub(crate) fn of(meshes: &Meshes, views: &[(usize, usize)]) -> BufferPlan {
+        let mut seen = std::collections::HashSet::new();
+        let verts = meshes.items.iter().filter(|it| seen.insert(Arc::as_ptr(&it.mesh))).map(|it| it.mesh.vertices.len() as u64).sum();
+        Self::from_counts(meshes.bvh.node_count() as u64, meshes.tris.len() as u64, verts, views)
+    }
+
+    /// Err naming the first buffer larger than one binding of `limits`.
+    pub(crate) fn check(&self, limits: &wgpu::Limits) -> Result<(), String> {
+        let limit = binding_limit(limits);
+        self.entries.iter().try_for_each(|&(label, bytes)| check_size(label, bytes, limit))
+    }
+}
 
 fn tile_side(view: &View) -> u32 {
     if view.scene.hair.is_empty() && view.scene.look.volumes.is_empty() { TILE_NO_STRANDS } else { TILE }
@@ -266,18 +350,26 @@ fn upload_meshes(gpu: &Gpu, meshes: &Meshes) -> Result<SceneBuffers, String> {
         [m.emission, m.transmission, m.ior, m.subsurface, m.scatter[0], m.scatter[1], m.scatter[2], m.skin_specular, m.pores, m.mottling, if m.name == "hair" { 1.0 } else { 0.0 }, if m.name == "flame" { 1.0 } else { 0.0 },
             d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], m.metallic, m.clearcoat, m.sheen, m.roughness]
     };
+    // Vertices are in object space (each item has its own matrix): items
+    // sharing a mesh (copies, identical clay) share its vertices. Per-item
+    // data indexed by vertex (smart inputs, imported alpha) is written per
+    // item, relative to the shared base.
+    let mut vert_bases: std::collections::HashMap<*const crate::mesh::Mesh, u32> = std::collections::HashMap::new();
     for it in &meshes.items {
-        let base = verts.len() as u32;
+        let base = *vert_bases.entry(Arc::as_ptr(&it.mesh)).or_insert_with(|| {
+            let base = verts.len() as u32;
+            verts.extend(it.mesh.vertices.iter().map(|v| {
+                [
+                    v.pos[0], v.pos[1], v.pos[2], v.color[0],
+                    v.normal[0], v.normal[1], v.normal[2], v.color[1],
+                    v.uv[0], v.uv[1], v.color[2], f32::from_bits(v.material),
+                    v.tangent[0], v.tangent[1], v.tangent[2], v.tangent[3],
+                    v.surface[0], v.surface[1], v.surface[2], v.surface[3],
+                ]
+            }));
+            base
+        });
         bases.push(base);
-        verts.extend(it.mesh.vertices.iter().map(|v| {
-            [
-                v.pos[0], v.pos[1], v.pos[2], v.color[0],
-                v.normal[0], v.normal[1], v.normal[2], v.color[1],
-                v.uv[0], v.uv[1], v.color[2], f32::from_bits(v.material),
-                v.tangent[0], v.tangent[1], v.tangent[2], v.tangent[3],
-                v.surface[0], v.surface[1], v.surface[2], v.surface[3],
-            ]
-        }));
         let object = mats.len() as u32;
         let face = it.mesh.face.as_ref().filter(|_| it.mesh.textures.is_none());
         let mut push = |m: &crate::material::Material, texels: &mut Vec<u32>, floats: &mut Vec<f32>| {
@@ -360,7 +452,7 @@ fn upload_meshes(gpu: &Gpu, meshes: &Meshes) -> Result<SceneBuffers, String> {
         items: gpu.storage("items", bytemuck::cast_slice(&items))?,
         mats: gpu.storage("materials", bytemuck::cast_slice(&mats))?,
         texels: gpu.storage("textures", bytemuck::cast_slice(&texels))?,
-        floats: gpu.storage("vertex alpha", bytemuck::cast_slice(&floats))?,
+        floats: gpu.storage("shading data", bytemuck::cast_slice(&floats))?,
         details: gpu.storage("detail maps", bytemuck::cast_slice(&maps.details))?,
     })
 }
@@ -581,9 +673,7 @@ fn upload_view(gpu: &Gpu, scene: &SceneBuffers, view: &View, bounces: u32) -> Re
     let stride = stride(gpu);
     let uniform = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("params"), size: stride * (tiles * MAX_BATCH) as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
     let accum_size = (view.w * view.h * 3 * 16) as u64;
-    if accum_size > gpu.limits.max_storage_buffer_binding_size as u64 {
-        return Err("the picture is too big for one GPU buffer".into());
-    }
+    check_size("picture sums", accum_size, binding_limit(&gpu.limits))?;
     let accum = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("sums"), size: accum_size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
     let volume_data = crate::fire::pack(&look.volumes);
     let own = [
@@ -611,31 +701,66 @@ fn upload_view(gpu: &Gpu, scene: &SceneBuffers, view: &View, bounces: u32) -> Re
     }).collect();
     let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("trace"), layout: &gpu.layout, entries: &entries });
     if let Some(e) = block_on(gpu.device.pop_error_scope()) {
-        return Err(e.to_string());
+        return Err(format!("GPU error binding the scene: {e}"));
     }
     Ok(GpuView { params, uniform, accum, group })
 }
 
-/// Renders `views` on the GPU into their sums (as `View::pass` would),
-/// sharing `time_limit` from `start` like the CPU loop. Err (nothing
-/// changed in the views) when the GPU cannot take this render.
-pub(super) fn render(views: &mut [View], meshes: &Meshes, s: super::Settings, start: Instant, progress: &crate::progress::Progress) -> Result<String, String> {
-    let gpu = get().ok_or("no GPU")?;
-    if BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err("the GPU got stuck before".into());
+/// Why the GPU did not trace a render: the CPU was asked for, or the
+/// reason it could not (no adapter, a buffer over its limit, stuck, ...).
+pub(super) enum Refusal {
+    CpuAsked,
+    Because(String),
+}
+
+impl From<String> for Refusal {
+    fn from(reason: String) -> Refusal {
+        Refusal::Because(reason)
     }
-    if views.first().is_some_and(|v| v.scene.look.device == Device::Cpu) {
-        return Err("cpu asked for".into());
+}
+
+impl From<&str> for Refusal {
+    fn from(reason: &str) -> Refusal {
+        Refusal::Because(reason.into())
+    }
+}
+
+/// Renders `views` on the GPU into their sums (as `View::pass` would),
+/// sharing `time_limit` from `start` like the CPU loop. Ok: the GPU's
+/// name; Err (nothing changed in the views): why the CPU traces instead.
+pub(super) fn render(views: &mut [View], meshes: &Meshes, s: super::Settings, start: Instant, progress: &crate::progress::Progress) -> Result<String, Refusal> {
+    let device = views.first().map_or(Device::Auto, |v| v.scene.look.device);
+    if device == Device::Cpu {
+        return Err(Refusal::CpuAsked);
+    }
+    let gpu = shared().as_ref().map_err(|e| format!("no usable GPU ({e})"))?;
+    if let Some(why) = lost() {
+        return Err(format!("the GPU device was lost earlier in this session ({why}); restart to use it again").into());
+    }
+    if BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
+        // Asking for the GPU by name tries it again (it is marked broken
+        // again if it gets stuck again).
+        if device != Device::Gpu {
+            return Err("the GPU stopped responding earlier in this session (watchdog); use device: gpu to try it again".into());
+        }
+        BROKEN.store(false, std::sync::atomic::Ordering::Relaxed);
     }
     // Hair strands trace slower here than on the CPU (the GPU has no
     // ray-tracing hardware access through wgpu yet, and the strands' tree
     // is millions of thin ribbons), so auto keeps them on the CPU.
     let strands = views.iter().any(|v| !v.scene.hair.is_empty());
-    if strands && views[0].scene.look.device == Device::Auto {
+    if strands && device == Device::Auto {
         return Err("hair strands trace faster on the CPU".into());
     }
+    // The big buffers from counts alone, before packing anything.
+    BufferPlan::of(meshes, &views.iter().map(|v| (v.w, v.h)).collect::<Vec<_>>()).check(&gpu.limits)?;
+    take_fault();
     let scene = upload_meshes(gpu, meshes)?;
     let mut gviews = views.iter().map(|v| upload_view(gpu, &scene, v, s.bounces)).collect::<Result<Vec<_>, _>>()?;
+    if let Some(e) = take_fault() {
+        return Err(format!("GPU error uploading the scene: {e}").into());
+    }
+    progress.stage(&format!("tracing light on {}", gpu.name), 0.02);
     let total = s.samples as usize * views.len();
     // Samples per dispatch: grown or shrunk to about 0.15 s of GPU work,
     // so a time limit or cancel stops promptly and the OS never sees a
@@ -691,7 +816,7 @@ pub(super) fn render(views: &mut [View], meshes: &Meshes, s: super::Settings, st
                 Ok(wgpu::PollStatus::WaitSucceeded | wgpu::PollStatus::QueueEmpty) => {}
                 other => {
                     BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
-                    return Err(format!("the GPU got stuck ({other:?}); using the CPU from now on"));
+                    return Err(format!("the GPU stopped responding: one pass took over {} s ({other:?}); auto renders use the CPU from now on", STUCK.as_secs()).into());
                 }
             }
             let took = t.elapsed().as_secs_f32();
@@ -706,8 +831,14 @@ pub(super) fn render(views: &mut [View], meshes: &Meshes, s: super::Settings, st
         if !checked {
             checked = true;
             if let Some(e) = block_on(gpu.device.pop_error_scope()) {
-                return Err(format!("GPU error: {e}"));
+                return Err(format!("GPU error in the first pass: {e}").into());
             }
+        }
+        if let Some(why) = lost() {
+            return Err(format!("the GPU device was lost mid-render ({why})").into());
+        }
+        if let Some(e) = take_fault() {
+            return Err(format!("GPU error mid-render: {e}").into());
         }
         let sum: usize = done.iter().map(|&d| d as usize).sum();
         let by_time = start.elapsed().as_secs_f32() / s.time_limit.as_secs_f32().max(1e-3);
@@ -725,7 +856,7 @@ pub(super) fn render(views: &mut [View], meshes: &Meshes, s: super::Settings, st
         gpu.queue.submit([encoder.finish()]);
         let slice = staging.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
-        gpu.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| e.to_string())?;
+        gpu.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| format!("GPU error reading the picture back: {e}"))?;
         {
             let data = slice.get_mapped_range();
             let sums: &[[f32; 4]] = bytemuck::cast_slice(&data);
@@ -735,6 +866,8 @@ pub(super) fn render(views: &mut [View], meshes: &Meshes, s: super::Settings, st
                 view.guides[i].albedo = Vec3::new(a[0], a[1], a[2]);
                 view.guides[i].normal = Vec3::new(n[0], n[1], n[2]);
                 view.guides[i].depth = n[3];
+                view.guides[i].light = a[3];
+                view.guides[i].light2 = c[3];
             }
         }
         staging.unmap();
@@ -742,6 +875,14 @@ pub(super) fn render(views: &mut [View], meshes: &Meshes, s: super::Settings, st
         view.seconds = seconds[k];
     }
     Ok(gpu.name.clone())
+}
+
+/// A note when a ray tree is deeper than the GPU's traversal stack: the
+/// GPU may then miss boxes the CPU would visit.
+pub(super) fn stack_warning(views: &[View], meshes: &Meshes) -> Option<String> {
+    let depth = views.iter().map(|v| v.scene.hair_bvh.depth()).fold(meshes.bvh.depth(), usize::max);
+    // A walk keeps at most one far box per inner node above its leaf.
+    (depth.saturating_sub(1) > GPU_STACK).then(|| format!("the ray tree is {depth} levels deep but the GPU's traversal stack holds {GPU_STACK} boxes; the GPU may miss some surfaces"))
 }
 
 #[cfg(test)]
@@ -774,7 +915,9 @@ mod tests {
         let cam = Camera { eye: Vec3::new(0.0, 0.5 + 0.7 * distance / 4.0, distance), target: Vec3::new(0.0, 0.5, 0.0), up: Vec3::Y, fov_deg: 30.0, ortho: None };
         let s = Settings { width: 64, height: 48, samples, bounces: 4, time_limit: Duration::from_secs(300), floor: true, exposure: 1.0, denoise: false };
         let meshes = Meshes::new(items);
+        let asked = look.device;
         let img = render_views_with_look(&meshes, fibers, &[cam], s, Arc::new(look), &Default::default()).pop().unwrap();
+        img.traced.assert_honours(asked);
         assert_eq!(img.samples, samples);
         let mean = img.pixels.iter().map(|p| Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32)).sum::<Vec3>() / img.pixels.len() as f32;
         (img.pixels, mean)
@@ -787,6 +930,39 @@ mod tests {
         let mut mesh = clay.build_mesh();
         mesh.vertices.iter_mut().for_each(|v| v.surface = crate::mesh::OBJECT_SURFACE);
         Item { mesh: Arc::new(mesh), world: Mat4::IDENTITY, tint: [1.0; 3], surface: m.surface(), material: m.clone() }
+    }
+
+    /// The denoiser's noise measure (each pixel's sum and square sum of
+    /// demodulated lighting) comes out the same from both tracers: the
+    /// mean lighting and the per-sample spread agree over the picture.
+    #[test]
+    fn gpu_matches_cpu_lighting_moments() {
+        if super::get().is_none() {
+            eprintln!("no GPU here; skipped");
+            return;
+        }
+        let items = || vec![ball([0.8, 0.4, 0.3], &Material::preset("skin").unwrap()), ball([0.3, 0.5, 0.8], &Material { roughness: 0.3, ..Material::default() })];
+        let cam = Camera { eye: Vec3::new(1.5, 1.6, 2.6), target: Vec3::new(0.0, 0.4, 0.0), up: Vec3::Y, fov_deg: 40.0, ortho: None };
+        let s = Settings { width: 64, height: 48, samples: 256, bounces: 4, time_limit: Duration::from_secs(300), floor: true, exposure: 1.0, denoise: true };
+        let stats = |device: Device| {
+            let meshes = Meshes::new({ let mut v = items(); v[1].world = Mat4::from_translation(Vec3::new(-1.1, 0.0, -0.4)); v });
+            let (views, traced) = super::super::trace_views(&meshes, &[], std::slice::from_ref(&cam), s, Arc::new(look(Some("golden_hour"), device)), &Default::default());
+            traced.assert_honours(device);
+            let v = &views[0];
+            assert_eq!(v.done, s.samples);
+            let n = v.done as f32;
+            let hit: Vec<_> = v.guides.iter().filter(|g| g.normal != Vec3::ZERO).collect();
+            let count = hit.len() as f32;
+            let mean = hit.iter().map(|g| g.light / n).sum::<f32>() / count;
+            let spread = hit.iter().map(|g| (g.light2 / n - (g.light / n).powi(2)).max(0.0).sqrt()).sum::<f32>() / count;
+            (mean, spread, hit.len())
+        };
+        let (cpu, gpu) = (stats(Device::Cpu), stats(Device::Gpu));
+        eprintln!("lighting moments: cpu mean {:.4} spread {:.4} ({} px), gpu mean {:.4} spread {:.4} ({} px)", cpu.0, cpu.1, cpu.2, gpu.0, gpu.1, gpu.2);
+        assert!(cpu.1 > 0.01 && gpu.1 > 0.01, "no noise measured: cpu {cpu:?} gpu {gpu:?}");
+        assert!((cpu.0 - gpu.0).abs() < 0.02 * cpu.0, "mean lighting: cpu {} gpu {}", cpu.0, gpu.0);
+        assert!((cpu.1 - gpu.1).abs() < 0.03 * cpu.1, "per-sample spread: cpu {} gpu {}", cpu.1, gpu.1);
+        assert!(cpu.2.abs_diff(gpu.2) < cpu.2 / 50, "hit pixels: cpu {} gpu {}", cpu.2, gpu.2);
     }
 
     /// The GPU traces the same light as the CPU: plain, glossy, skin,
@@ -874,7 +1050,7 @@ mod tests {
         o.visible = false;
         let sc = scene.add(Shape::Scatter);
         let instances = (0..6).map(|i| Instance { source: 0, position: Vec3::new(i as f32 * 0.5 - 1.0, 0.0, 1.0), rotation: glam::Quat::IDENTITY, scale: 1.0 }).collect();
-        scene.get_mut(sc).unwrap().scatter = Some(Scatter { sources: vec![candle], instances, settings: Default::default() });
+        scene.get_mut(sc).unwrap().scatter = Some(Scatter { sources: vec![candle], instances, settings: Default::default(), placed_by: None });
         let mut lib = crate::mesh::MeshLib::new();
         lib.sync(&scene);
         let eval = scene.evaluate();
@@ -901,6 +1077,47 @@ mod tests {
         assert!(cpu.x > 15.0 && cpu.x > cpu.z * 1.5, "warm light reaches the floor: {cpu}");
         assert!((cpu - gpu).abs().max_element() < 4.0, "cpu {cpu} gpu {gpu}");
         assert!(mad < MATCH * 1.5, "pixels differ by {mad:.2} on average");
+    }
+
+    /// Every image says which tracer made it: auto with hair strands
+    /// falls back to the CPU and says why; asking for the CPU gives no
+    /// reason.
+    #[test]
+    fn auto_fallback_reports_reason() {
+        let fibers = vec![Fiber { points: vec![Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 1.2, 0.1)], root_width: 0.004, tip_width: 0.001, root_color: Vec3::splat(0.4), tip_color: Vec3::splat(0.6) }];
+        let cam = Camera { eye: Vec3::new(0.0, 0.8, 3.0), target: Vec3::new(0.0, 0.5, 0.0), up: Vec3::Y, fov_deg: 30.0, ortho: None };
+        let s = Settings { width: 16, height: 12, samples: 2, bounces: 1, time_limit: Duration::from_secs(60), floor: false, exposure: 1.0, denoise: false };
+        let meshes = Meshes::new(vec![ball([0.8, 0.4, 0.3], &Material::default())]);
+        let traced = |device| render_views_with_look(&meshes, &fibers, &[cam], s, Arc::new(look(None, device)), &Default::default()).pop().unwrap().traced;
+        let auto = traced(Device::Auto);
+        let super::super::Traced::Cpu { reason: Some(reason) } = &auto else { panic!("auto with strands: {auto:?}") };
+        let expected = if super::get().is_some() { "hair strands" } else { "no usable GPU" };
+        assert!(reason.contains(expected), "{reason}");
+        assert_eq!(auto.json()["used"], "cpu");
+        assert_eq!(auto.json()["fallback_reason"], reason.as_str());
+        assert_eq!(traced(Device::Cpu), super::super::Traced::Cpu { reason: None });
+    }
+
+    /// The pre-flight names the buffer that does not fit, with its size
+    /// and the limit, from counts alone (no GPU needed).
+    #[test]
+    fn preflight_names_the_buffer() {
+        let clay: crate::clay::Clay = serde_json::from_value(serde_json::json!({
+            "blobs": [{ "type": "sphere", "center": [0, 0.5, 0], "radius": 0.5, "blend": 0.0 }], "resolution": 64
+        })).unwrap();
+        let m = Material::default();
+        let meshes = Meshes::new(vec![Item { mesh: Arc::new(clay.build_mesh()), world: Mat4::IDENTITY, tint: [1.0; 3], surface: m.surface(), material: m }]);
+        let tris = meshes.tris.len() as u64;
+        assert!(tris * 48 > 1 << 20 && meshes.bvh.node_count() as u64 * 32 < 1 << 20, "{tris} triangles");
+        let plan = super::BufferPlan::of(&meshes, &[(64, 48)]);
+        let small = egui_wgpu::wgpu::Limits { max_storage_buffer_binding_size: 1 << 20, max_buffer_size: 1 << 30, ..Default::default() };
+        let err = plan.check(&small).unwrap_err();
+        assert_eq!(err, format!("triangles: {} is more than one GPU buffer holds (1.0 MB)", super::show_bytes(tris * 48)));
+        assert!(plan.check(&egui_wgpu::wgpu::Limits::default()).is_ok());
+        // A picture over the limit is named too.
+        let err = super::BufferPlan::from_counts(1, 1, 3, &[(4096, 4096)]).check(&small).unwrap_err();
+        assert!(err.starts_with("picture sums: 768.0 MB"), "{err}");
+        assert!(plan.entries.iter().map(|e| e.1).sum::<u64>() > tris * 64);
     }
 
     /// Mean per-pixel difference (0..255) allowed between the two tracers
@@ -946,6 +1163,31 @@ mod tests {
             assert!(mad < MATCH, "{name}: pixels differ by {mad:.2} on average");
         }
     }
+
+    /// A physical sky traces the same on both: one CPU bake reaches both
+    /// tracers as a map and a sun disc, so only noise may differ.
+    #[test]
+    fn gpu_matches_cpu_under_a_physical_sky() {
+        if super::get().is_none() {
+            eprintln!("no GPU here; skipped");
+            return;
+        }
+        let paint = Material { roughness: 0.4, ..Material::default() };
+        for env in [serde_json::json!({ "preset": "physical", "sun_elevation": 60 }), serde_json::json!({ "preset": "physical", "sun_elevation": 20, "sun_azimuth": 120, "turbidity": 4 })] {
+            let lit = |device: Device| {
+                let mut l = look(None, device);
+                l.environment = Arc::new(Environment::parse(&env).unwrap());
+                l.background = true;
+                l
+            };
+            let (cpu_px, cpu) = render_with(vec![ball([0.8, 0.4, 0.3], &paint)], &[], 4.0, 1024, lit(Device::Cpu));
+            let (gpu_px, gpu) = render_with(vec![ball([0.8, 0.4, 0.3], &paint)], &[], 4.0, 1024, lit(Device::Gpu));
+            let mad = cpu_px.iter().zip(&gpu_px).map(|(a, b)| a.iter().zip(b.iter()).map(|(x, y)| (*x as f32 - *y as f32).abs()).sum::<f32>()).sum::<f32>() / (cpu_px.len() * 3) as f32;
+            eprintln!("{env}: cpu {cpu} gpu {gpu}, mean pixel difference {mad:.2}");
+            assert!((cpu - gpu).abs().max_element() < 4.0, "{env}: cpu {cpu} gpu {gpu}");
+            assert!(mad < MATCH, "{env}: pixels differ by {mad:.2} on average");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -968,7 +1210,9 @@ mod detail_tests {
         look.background = true;
         look.device = device;
         let s = Settings { width: 64, height: 48, samples: 1024, bounces: 4, time_limit: Duration::from_secs(300), floor: true, exposure: 1.0, denoise: false };
-        render_views_with_look(&Meshes::new(items), &[], &[camera()], s, Arc::new(look), &Default::default()).pop().unwrap().pixels
+        let img = render_views_with_look(&Meshes::new(items), &[], &[camera()], s, Arc::new(look), &Default::default()).pop().unwrap();
+        img.traced.assert_honours(device);
+        img.pixels
     }
 
     fn difference(a: &[[u8; 3]], b: &[[u8; 3]]) -> f32 {
@@ -1044,7 +1288,9 @@ mod smart_tests {
         look.device = device;
         let cam = Camera { eye: Vec3::new(0.2, 0.45, 0.75), target: Vec3::new(-0.02, 0.19, 0.0), up: Vec3::Y, fov_deg: 35.0, ortho: None };
         let s = Settings { width: 72, height: 54, samples: 1024, bounces: 4, time_limit: Duration::from_secs(300), floor: true, exposure: 1.0, denoise: false };
-        render_views_with_look(meshes, &[], &[cam], s, Arc::new(look), &Default::default()).pop().unwrap().pixels
+        let img = render_views_with_look(meshes, &[], &[cam], s, Arc::new(look), &Default::default()).pop().unwrap();
+        img.traced.assert_honours(device);
+        img.pixels
     }
 
     /// A wide continuous leak must match, rather than disappearing in a
@@ -1168,7 +1414,9 @@ mod face_tests {
             let target = face.origin - face.up * 0.045 + face.forward * 0.03;
             let cam = Camera { eye: target + face.forward * 0.16 + face.right * 0.05, target, up: Vec3::Y, fov_deg: 40.0, ortho: None };
             let s = Settings { width: 72, height: 54, samples: 1024, bounces: 4, time_limit: Duration::from_secs(300), floor: false, exposure: 1.0, denoise: false };
-            render_views_with_look(&meshes, &[], &[cam], s, Arc::new(look), &Default::default()).pop().unwrap().pixels
+            let img = render_views_with_look(&meshes, &[], &[cam], s, Arc::new(look), &Default::default()).pop().unwrap();
+            img.traced.assert_honours(device);
+            img.pixels
         };
         let (cpu, gpu) = (render(Device::Cpu), render(Device::Gpu));
         let mean = |px: &[[u8; 3]]| px.iter().map(|p| Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32)).sum::<Vec3>() / px.len() as f32;
@@ -1401,6 +1649,7 @@ mod lens_tests {
                 let meshes = Meshes::new(items());
                 let images = render_views_with_look(&meshes,&[],&[cam],settings,Arc::new(look),&Default::default());
                 assert_eq!(images[0].samples,settings.samples);
+                images[0].traced.assert_honours(device);
                 results.push(images.into_iter().next().unwrap());
             }
             let a=&results[0]; let b=&results[1];

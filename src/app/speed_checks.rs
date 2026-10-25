@@ -188,6 +188,7 @@ fn atlas_bake_glb_roundtrip_keeps_uvs_and_part_identity() {
         lods: false,
         atlas: true,
         texel_density: Some(128.0),
+        gpu_instancing: false, blend_shapes: Vec::new(),
     };
     let export = crate::gltf::export(&s, &meshes, &opts).unwrap();
     let loaded = crate::glb_read::from_bytes(&export.bytes, None, None).unwrap();
@@ -350,7 +351,7 @@ fn speed_mech_acceptance() {
         file_stem: String::new(),
         lods: false,
         atlas: false,
-        texel_density: None,
+        texel_density: None, gpu_instancing: false, blend_shapes: Vec::new(),
     };
     let mut images = Vec::new();
     let camera = crate::film::Camera {

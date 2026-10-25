@@ -2519,6 +2519,11 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     var albedo = vec3f(0.0);
     var normal = vec3f(0.0);
     var depth = 0.0;
+    // Sum and square sum of each sample's lighting luminance (its color
+    // over its albedo), for the denoiser's per-pixel noise; as the CPU's
+    // demodulated().
+    var light = 0.0;
+    var light2 = 0.0;
     for (var k = 0u; k < P.size.w; k++) {
         rng_seed(pixel + 1u, P.size.z + k + 7u);
         let j = rnd2();
@@ -2528,16 +2533,20 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         if (!finite3(c)) { c = vec3f(0.0); }
         sum += c;
         // A rare bad (NaN) guide would blacken the pixel in the denoiser.
+        var a = vec3f(0.5);
         if (finite3(r.albedo) && finite3(r.normal) && finite1(r.depth)) {
-            albedo += r.albedo;
+            a = r.albedo;
             normal += r.normal;
             depth += min(r.depth, 1e4);
         } else {
-            albedo += vec3f(0.5);
             depth += 1e4;
         }
+        albedo += a;
+        let l = luminance(c / max(a, vec3f(0.02)));
+        light += l;
+        light2 += l * l;
     }
-    accum[pixel * 3u] += vec4f(sum, 0.0);
-    accum[pixel * 3u + 1u] += vec4f(albedo, 0.0);
+    accum[pixel * 3u] += vec4f(sum, light2);
+    accum[pixel * 3u + 1u] += vec4f(albedo, light);
     accum[pixel * 3u + 2u] += vec4f(normal, depth);
 }

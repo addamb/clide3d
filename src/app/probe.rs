@@ -62,8 +62,12 @@ impl ClideApp {
                 let local = world.inverse().transform_point3(Vec3::from(p));
                 out.push(match snap(local) {
                     Some((q, n)) => {
+                        // The persistent mask and polygroup there (clay space).
+                        let clay = o.clay.as_ref();
+                        let mask = clay.and_then(|c| c.sculpt_mask.as_ref()).map_or(0.0, |m| m.grid().value(q));
+                        let group = clay.and_then(|c| c.groups.as_ref()).map(|g| g.label(q)).filter(|g| *g != 0);
                         let (q, n) = (world.transform_point3(q), world.inverse().transpose().transform_vector3(n).normalize_or_zero());
-                        json!({ "from": p, "hit": true, "object": o.name, "point": r3(q), "normal": r3(n), "distance": round(q.distance(Vec3::from(p))) })
+                        json!({ "from": p, "hit": true, "object": o.name, "point": r3(q), "normal": r3(n), "distance": round(q.distance(Vec3::from(p))), "mask": round(mask), "group": group })
                     }
                     None => json!({ "from": p, "hit": false }),
                 });
@@ -92,7 +96,7 @@ impl ClideApp {
             let world: Mat4 = self.scene.world_matrix(o.id);
             let inv = world.inverse();
             let (lo, ld) = (inv.transform_point3(origin), inv.transform_vector3(dir));
-            if let Some((t, tri)) = mesh.ray_hit_triangle(lo, ld)
+            if let Some((t, tri)) = self.meshes.ray_hit(mesh, lo, ld).map(|h| (h.t, h.tri))
                 && best.is_none_or(|b| t < b.0)
             {
                 let p = |i: u32| Vec3::from(mesh.vertices[i as usize].pos);
@@ -122,6 +126,25 @@ impl ClideApp {
         let s = Surface::new(clay, mesh).ok_or("clay is empty")?;
         Ok(move |p| s.snap(p))
     }
+
+    /// Casts clay-space rays at a clay object's mesh: (hit point, normal
+    /// facing the ray). Screen-frame strokes start here.
+    pub(super) fn clay_caster(&self, id: u64) -> Result<impl Fn(Vec3, Vec3) -> Option<(Vec3, Vec3)> + Send + Sync + 'static, String> {
+        let mesh = self.meshes.whole(id).ok_or("clay has no mesh yet")?.clone();
+        // Through a tree: the brute-force hit, bit for bit (see `mesh::pick`).
+        let bvh = self.meshes.bvh(&mesh);
+        Ok(move |origin: Vec3, dir: Vec3| cast(&mesh, &bvh, origin, dir))
+    }
+}
+
+/// Where a clay-space ray first meets `mesh`: the point, and the face
+/// normal turned toward the ray.
+pub(super) fn cast(mesh: &crate::mesh::Mesh, bvh: &crate::mesh::MeshBvh, origin: Vec3, dir: Vec3) -> Option<(Vec3, Vec3)> {
+    let (t, tri) = bvh.hit(mesh, origin, dir).map(|h| (h.t, h.tri))?;
+    let p = |i: u32| Vec3::from(mesh.vertices[i as usize].pos);
+    let ix = &mesh.indices[tri * 3..tri * 3 + 3];
+    let n = (p(ix[1]) - p(ix[0])).cross(p(ix[2]) - p(ix[0])).normalize_or_zero();
+    Some((origin + dir * t, if n.dot(dir) > 0.0 { -n } else { n }))
 }
 
 fn round(v: f32) -> f32 {

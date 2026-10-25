@@ -87,13 +87,28 @@ impl ClideApp {
                 if item(ui, "Save Scene As…", "⇧⌘S", true) {
                     self.save(true);
                 }
+                // The same call an agent makes: history {action: quicksave}.
+                let on = self.quicksave.enabled;
+                if item(ui, if on { "QuickSave Every 5 Min ✓" } else { "QuickSave Every 5 Min" }, "", true) {
+                    match self.history_tool(&serde_json::json!({ "action": "quicksave", "enabled": !on, "now": false })) {
+                        Ok(_) => self.status = format!("QuickSave {}", if on { "off" } else { "on" }),
+                        Err(e) => self.status = e,
+                    }
+                }
                 ui.separator();
-                disabled(ui, "Import…");
+                // The same call an agent makes: import_mesh {path}.
+                if item(ui, "Import…", "", true) {
+                    self.import_dialog();
+                }
                 if item(ui, "Export glTF (.glb)…", "", true) {
                     self.export_dialog("glb");
                 }
                 if item(ui, "Export FBX (.fbx)…", "", true) {
                     self.export_dialog("fbx");
+                }
+                // export_print {path, targets: the selection}.
+                if item(ui, "Export for Print…", "", true) {
+                    self.export_print_dialog();
                 }
                 ui.separator();
                 if item(ui, "Exit", "⌘Q", true) {
@@ -101,10 +116,10 @@ impl ClideApp {
                 }
             });
             ui.menu_button("Edit", |ui| {
-                if item(ui, "Undo", "⌘Z", !self.undo.is_empty()) {
+                if item(ui, "Undo", "⌘Z", self.history.can_undo()) {
                     self.undo();
                 }
-                if item(ui, "Redo", "⇧⌘Z", !self.redo.is_empty()) {
+                if item(ui, "Redo", "⇧⌘Z", self.history.can_redo()) {
                     self.redo();
                 }
                 ui.separator();
@@ -171,6 +186,10 @@ impl ClideApp {
                     self.reset_selected();
                 }
                 disabled(ui, "Freeze Transformations");
+                // to_clay {target, mode: volume, resolution, blur, polish}.
+                if item(ui, "Remesh as Clay…", "", sel) {
+                    self.open_remesh_dialog();
+                }
                 ui.separator();
                 if item(ui, "Center Pivot", "", sel) {
                     self.center_pivot_selected();
@@ -198,6 +217,20 @@ impl ClideApp {
                 });
                 ui.separator();
                 ui.checkbox(&mut self.show_grid, "Grid");
+                // MatCaps: the same set_display call an agent sends.
+                ui.menu_button("MatCap", |ui| {
+                    for name in crate::render::matcap::BUILTIN {
+                        let on = self.matcap.as_ref().is_some_and(|m| m.name == name);
+                        if ui.selectable_label(on, name).clicked() {
+                            self.send_ui_call("set_display", serde_json::json!({ "shading": "matcap", "matcap": name }));
+                            ui.close();
+                        }
+                    }
+                    if ui.selectable_label(self.matcap.is_none(), "Off (shaded)").clicked() {
+                        self.send_ui_call("set_display", serde_json::json!({ "shading": "shaded" }));
+                        ui.close();
+                    }
+                });
             });
             ui.menu_button("Windows", |ui| {
                 ui.checkbox(&mut self.show_outliner, "Outliner");
@@ -265,10 +298,10 @@ impl ClideApp {
                 self.save(false);
             }
             ui.separator();
-            if icons::button(ui, Icon::Undo, s, false, !self.undo.is_empty(), "Undo").clicked() {
+            if icons::button(ui, Icon::Undo, s, false, self.history.can_undo(), "Undo").clicked() {
                 self.undo();
             }
-            if icons::button(ui, Icon::Redo, s, false, !self.redo.is_empty(), "Redo").clicked() {
+            if icons::button(ui, Icon::Redo, s, false, self.history.can_redo(), "Redo").clicked() {
                 self.redo();
             }
             ui.separator();
@@ -310,6 +343,10 @@ impl ClideApp {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), egui::Sense::hover());
         ui.painter().rect_filled(rect, 0.0, theme::BUTTON);
         let mut shelf = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(6.0, 3.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        if SHELF_TABS[self.shelf_tab] == "Sculpting" {
+            self.brush_shelf(&mut shelf);
+            return;
+        }
         if SHELF_TABS[self.shelf_tab] != "Poly Modeling" {
             shelf.label(RichText::new("(empty shelf)").color(theme::TEXT_DIM));
             return;
@@ -346,10 +383,13 @@ impl ClideApp {
             let tools = [
                 (Some(Tool::Select), Icon::Select, "Select Tool (Q)"),
                 (None, Icon::Lasso, "Lasso Tool"),
-                (None, Icon::Paint, "Paint Selection Tool"),
                 (Some(Tool::Move), Icon::Move, "Move Tool (W)"),
                 (Some(Tool::Rotate), Icon::Rotate, "Rotate Tool (E)"),
                 (Some(Tool::Scale), Icon::Scale, "Scale Tool (R)"),
+                (Some(Tool::Sculpt), Icon::Sculpt, "Sculpt Tool: drag on a clay (brush on the Sculpting shelf)"),
+                (Some(Tool::Paint), Icon::Paint, "Paint Tool: drag on a clay (brush on the Sculpting shelf)"),
+                (Some(Tool::Mask), Icon::Lasso, "Mask Tool: drag paints the sculpt mask (Alt erases, Shift lassos)"),
+                (Some(Tool::Groups), Icon::FaceMode, "Groups Tool: drag paints a polygroup (pick it in the HUD)"),
             ];
             for (tool, icon, tip) in tools {
                 let r = icons::button(ui, icon, 26.0, tool == Some(self.tool), tool.is_some(), tip);
@@ -359,7 +399,17 @@ impl ClideApp {
                 if r.clicked()
                     && let Some(t) = tool
                 {
-                    self.tool = t;
+                    // Sculpt and Paint go through brush_preset, as an agent
+                    // switches them; their brush lives on the Sculpting shelf.
+                    if matches!(t, Tool::Sculpt | Tool::Paint | Tool::Mask | Tool::Groups) {
+                        let name = super::recorder::tool_name(t);
+                        if let Err(e) = self.brush_preset(&serde_json::json!({ "action": "set_current", "tool": name })) {
+                            self.status = e;
+                        }
+                        self.shelf_tab = SHELF_TABS.iter().position(|n| *n == "Sculpting").unwrap_or(self.shelf_tab);
+                    } else {
+                        self.tool = t;
+                    }
                 }
             }
             ui.add_space(24.0);

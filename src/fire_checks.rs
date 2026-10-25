@@ -94,6 +94,7 @@ fn gpu_matches_cpu_fire_smoke() {
         let f = source(preset);
         let cpu = render(&f, 5, Device::Cpu, 32, Vec::new());
         let gpu = render(&f, 5, Device::Gpu, 32, Vec::new());
+        gpu.traced.assert_honours(Device::Gpu);
         assert_eq!(gpu.samples, 8);
         assert_eq!(cpu.samples, 8);
         let error = cpu
@@ -441,7 +442,7 @@ fn fire_film_checks() {
                 animations: true,
                 fps: 24.0,
                 file_stem: preset.into(),
-                lods: false, atlas: true, texel_density: None,
+                lods: false, atlas: true, texel_density: None, gpu_instancing: false, blend_shapes: Vec::new(),
             },
         )
         .unwrap();

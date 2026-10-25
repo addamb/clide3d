@@ -25,6 +25,9 @@ pub struct ToolCall {
     pub name: String,
     pub args: Value,
     pub reply: Sender<ToolResult>,
+    /// Who sent it: an agent over MCP, or the editor's own controls (a UI
+    /// stroke sends the same request through the same handlers).
+    pub source: crate::ledger::Source,
 }
 
 /// Starts the server thread. Returns the channel the UI drains each frame
@@ -84,7 +87,7 @@ fn handle(mut request: Request, tx: &Sender<ToolCall>, ctx: &egui::Context) {
 }
 
 /// Returns `None` for messages that need no reply.
-fn dispatch(msg: &Value, tx: &Sender<ToolCall>, ctx: &egui::Context) -> Option<Value> {
+pub(crate) fn dispatch(msg: &Value, tx: &Sender<ToolCall>, ctx: &egui::Context) -> Option<Value> {
     let id = msg.get("id")?.clone();
     let method = msg.get("method")?.as_str()?;
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
@@ -140,7 +143,7 @@ fn dispatch(msg: &Value, tx: &Sender<ToolCall>, ctx: &egui::Context) -> Option<V
 
 fn call_on_ui_thread(name: String, args: Value, tx: &Sender<ToolCall>, ctx: &egui::Context) -> ToolResult {
     let (reply, wait) = mpsc::channel();
-    tx.send(ToolCall { name, args, reply }).map_err(|_| "editor is shutting down".to_string())?;
+    tx.send(ToolCall { name, args, reply, source: crate::ledger::Source::Agent }).map_err(|_| "editor is shutting down".to_string())?;
     // eframe sleeps while idle; wake it so the call runs now.
     ctx.request_repaint();
     wait.recv_timeout(TOOL_TIMEOUT).map_err(|_| "editor did not answer in time".to_string())?
@@ -179,6 +182,64 @@ fn tool_definitions() -> Value {
     let target = json!({ "type": ["integer", "string"], "description": "Object id (number) or name (string)." });
     let color = json!({ "type": "array", "items": { "type": "number", "minimum": 0, "maximum": 1 }, "minItems": 3, "maxItems": 3, "description": "sRGB [r, g, b], 0..1." });
     let shape = json!({ "type": "string", "enum": ["Cube", "Sphere", "Cylinder", "Cone", "Plane", "Torus", "Group", "Clay", "Eye", "Hair", "Kit", "Terrain"] });
+    // Stroke controls shared by sculpt and paint strokes (brush::spec).
+    let curve_points = |what: &str| json!({ "type": "array", "maxItems": 16, "items": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 }, "description": what });
+    let stroke_controls = json!({
+        "points": { "type": "array", "maxItems": 512, "items": { "description": "[x, y, z], [x, y, z, pressure 0..1], or {p: [x, y, z], pressure, normal, t}.", "oneOf": [
+            { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 4 },
+            { "type": "object", "properties": { "p": vec3("Point."), "pressure": { "type": "number", "minimum": 0, "maximum": 1 }, "normal": vec3("Surface normal (orients spray)."), "t": { "type": "number", "description": "Seconds since the stroke began." } }, "required": ["p"] }] },
+            "description": "A path; the brush follows the segments between points. A fourth number is pen pressure." },
+        "kind": { "description": "How points become dabs: path (default; dab brushes such as standard space dabs along it, others sweep it), dots (one dab per point), drag_dot (one dab where the drag ends), {spray: {count 1-64, jitter (x radius, default 0.5), seed}} (scattered dabs around the spaced path; the same seed replays the same dabs), {drag_rect: {from, to}} (one dab at from, as wide as the drag), {curve: {closed}} (points are control points: the stroke follows a smooth curve through them, back to the first when closed; the record keeps the control points, so stroke_edit replace with one moved is MoveCurve).",
+            "oneOf": [{ "type": "string", "enum": ["path", "dots", "drag_dot"] }, { "type": "object", "properties": {
+                "curve": { "type": "object", "properties": { "closed": { "type": "boolean" } } },
+                "spray": { "type": "object", "properties": { "count": { "type": "integer", "minimum": 1, "maximum": 64 }, "jitter": { "type": "number", "minimum": 0, "maximum": 4 }, "seed": { "type": "integer", "minimum": 0 } } },
+                "drag_rect": { "type": "object", "properties": { "from": vec3("Center."), "to": vec3("Edge.") }, "required": ["from", "to"] } } }] },
+        "frame": { "description": "What points are given in: world (default: the call's space), object (the clay's own space), {surface: {offset}} (snapped onto the clay, lifted offset along its normal), {screen: {view: front|back|left|right|top|bottom, at: [[h, v(, pressure)], ..]}} (rays from a named view, world units as in surface_point; replaces points) or {screen: {camera: {view: 16 numbers, proj: 16 numbers (wgpu depth 0..1), viewport: [w, h]}, px: [[x, y(, pressure)], ..]}}.",
+            "oneOf": [{ "type": "string", "enum": ["world", "object"] }, { "type": "object" }] },
+        "falloff": { "description": "How the dab fades from center to edge: smooth (the classic clay curve), linear, sharp, flat (plateau to 0.9 of the radius), sphere; or [[t, value], ..] (2-16 points, t rising 0..1; a monotone cubic); or {preset or curve, focal_shift -1..1} (+ narrower and pointier, - fuller). Default: the brush's usual curve.",
+            "oneOf": [{ "type": "string", "enum": ["smooth", "linear", "sharp", "flat", "sphere"] }, curve_points("[t, value] points."), { "type": "object", "properties": { "preset": { "type": "string" }, "curve": curve_points("[t, value] points."), "focal_shift": { "type": "number", "minimum": -1, "maximum": 1 } } }] },
+        "pressure": { "type": "object", "description": "How point pressure scales the dab: size and strength each linear (default), off, or [[pressure, factor], ..]. Ignored when no point has pressure.", "properties": {
+            "size": { "oneOf": [{ "type": "string", "enum": ["linear", "off"] }, curve_points("[pressure, factor] points.")] },
+            "strength": { "oneOf": [{ "type": "string", "enum": ["linear", "off"] }, curve_points("[pressure, factor] points.")] } } },
+        "spacing": { "type": "number", "minimum": 0.01, "maximum": 4, "description": "Dab spacing as a fraction of the radius (default 0.15 for dab brushes; set it to resample other brushes' paths)." },
+        "lazy": { "type": "number", "minimum": 0, "maximum": 1, "description": "LazyMouse: the brush trails the path on a string of lazy x radius, smoothing wobbles. 0 is off; otherwise 0.01 to 1." },
+        "symmetry": { "type": "object", "additionalProperties": false, "description": "Symmetric copies, applied after the stroke: mirror axes, then radial turns, about the object's pivot (default) or the world origin. mirror: true is axes [x].", "properties": {
+            "axes": { "type": "array", "items": { "type": "string", "enum": ["x", "y", "z"] } },
+            "radial": { "type": "object", "properties": { "axis": { "type": "string", "enum": ["x", "y", "z"] }, "count": { "type": "integer", "minimum": 1, "maximum": 32 } }, "required": ["axis", "count"] },
+            "about": { "type": "string", "enum": ["pivot", "origin"] },
+            "posable": { "type": "boolean", "description": "Sculpt only: the points are on the clay as posed at symmetry.frame (default: the editor's frame; a rig's clip): each goes back to the rest pose through the skin weights where it is, the copies are made there, and the rest pose is sculpted. A stroke on a posed left arm with axes [x] also lands on the right arm." },
+            "frame": { "oneOf": [{ "type": "number" }, { "type": "string", "enum": ["rest"] }], "description": "Posable only: the pose the points are on, a frame of the rig's active clip or \"rest\". Left out, the editor's frame is used and written into the record and the reply (pose_frame), so resending a stored stroke never depends on the timeline." } } },
+        "taper": { "type": "array", "items": { "type": "number", "minimum": 0, "maximum": 1 }, "minItems": 2, "maxItems": 2, "description": "[start, end]: fade the stroke in over the first and out over the last fraction of its length (crease with taper [0.2, 0.2] is the Dam Standard)." },
+    });
+    // Where a sculpt or paint stroke may work (brush::spec::StrokeMask).
+    let stroke_mask = json!({ "type": "object", "additionalProperties": false, "description": "Where the stroke may work. Every stroke also keeps off the clay's persistent mask (mask tool: each point moves by 1 - mask) and hidden polygroups (group tool).", "properties": {
+        "blobs": { "type": "array", "items": { "type": "string" }, "description": "Only where these named blobs own the nearest surface; mirrors share names. Empty = nowhere. Unknown names are errors." },
+        "above": { "type": "number", "description": "Only at or above this object-local Y, irrespective of stroke space." },
+        "below": { "type": "number", "description": "Only at or below this object-local Y. Limits intersect with blobs." },
+        "channel": { "type": "boolean", "description": "false ignores the persistent mask (default true)." },
+        "invert_channel": { "type": "boolean", "description": "Work where the persistent mask is instead of where it is not." },
+        "groups": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "maxItems": 256, "description": "Only in these polygroups." },
+        "backface": { "type": "boolean", "description": "Auto-mask: leave surface facing away from the dab alone (the far side of a thin wall). Sculpt only." },
+        "normal_angle": { "type": "number", "minimum": 0, "maximum": 180, "description": "Auto-mask: only surface within this many degrees of the dab's normal. Sculpt only." },
+        "cavity": { "type": "number", "minimum": -1, "maximum": 1, "description": "Auto-mask: positive spares cavities by that much, negative spares ridges. Sculpt only." },
+        "connected": { "type": "boolean", "description": "Auto-mask (Move Topological): only surface joined to the dab's center within 1.5 radii, so a grab moves one finger and not the one beside it. Sculpt only." } } });
+    let alpha_schema = json!({ "type": "object", "additionalProperties": false, "description": "An alpha image shaping each dab (dab brushes, paint and mask_paint; those go dab by dab with one), or for brush vdm the VDM stamp it stamps.", "properties": {
+        "name": { "type": "string", "description": "An alpha in the scene's library (alpha import / from_view / create_vdm)." },
+        "hash": { "type": "string", "description": "Or its content hash (records keep it)." },
+        "depth": { "type": "number", "description": "standard, use height: how far white rises over mid (scene units; default strength x radius / 2)." },
+        "mid": { "type": "number", "minimum": 0, "maximum": 1, "description": "The gray that stays put (default 0); with 0.5 black sinks." },
+        "rotate": { "type": "number", "description": "Degrees on the surface." },
+        "scale": { "type": "number", "minimum": 0.05, "maximum": 20, "description": "The image spans scale x the dab's diameter (default 1)." },
+        "mode": { "type": "string", "enum": ["stamp", "drag", "tile"], "description": "stamp: upright on the object; drag: turned with the stroke; tile: repeated across the surface (not with brush vdm, which also takes no depth, mid or use)." },
+        "use": { "type": "string", "enum": ["height", "mask"], "description": "height (standard's default): the dab's profile; mask (the others' default): a weight." } } });
+    let with_controls = |props: Value| {
+        let mut props = props;
+        let m = props.as_object_mut().expect("properties object");
+        for (k, v) in stroke_controls.as_object().expect("controls object") {
+            m.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        props
+    };
     let light = json!({ "description": "A light this object gives off (any shape; torch, candle and brazier pieces come with one). A preset name (candle, torch, brazier, lantern, fire, magic), settings merged onto the current light (preset, offset: where it sits in the object's space, temperature: Kelvin, 1800 candle .. 6500 daylight, color: linear RGB instead of temperature, intensity: about the light a surface 1 m away gets (studio key = 3), radius: meters, bigger = softer shadows, flicker: 0..1, every copy and frame differs), or null to remove. render_film lights the scene with every one, scattered copies included, and the viewport shows their light pools.",
         "oneOf": [{ "type": "string" }, { "type": "object" }, { "type": "null" }, { "type": "boolean" }] });
     let kit_settings = json!({ "type": "object", "description": "Kit only: piece settings, merged (see the kit tool)." });
@@ -238,11 +299,12 @@ fn tool_definitions() -> Value {
         "description": "One clay blob, in the clay object's own space. Blobs apply in order. Forms by type: \
             sphere {center, radius}; ellipsoid {center, radii [x,y,z], rotate}; capsule {a, b, radius, radius_b} (a rounded, \
             optionally tapered tube from a to b: limbs, fingers, neck, tail); box {center, size [w,h,d], rotate, round}; \
-            torus {center, radius, thickness, rotate} (ring in the XZ plane); membrane {points, thickness, sag, scallop, scallop_edges} (thin wing polygon). chain {points, size [width,length,depth], twist, taper, tilt} makes connected beads along an arc-length sampled path (braids, necklaces, plate tails). twist is degrees per bead; taper is end/start size ratio (default 1); tilt leans beads left and right in turn (a braid: tilt 30-40, twist 0, size width about 1.6 x depth). rotate is degrees [x,y,z]. Hard surfaces: extrude {profile:[[u,v],...],depth,center,axis,bevel} (default axis +Z; +Z uses XY profile); lathe {profile:[[radius,height],...],center,axis} (default +Y); sweep {profile,points,taper,twist,path_smooth} (local XY section, transported frame, total twist degrees); shell {source: form,thickness} hollows inward; array {source: form,count,step} repeats along a line, radius/center/axis selects a circle, points selects an arc-length path. Profiles are simple polygons, either winding, 3-128 points; a corner may be {point:[u,v],radius} for a circular fillet, or {point:[u,v],smooth:true} for spline interpolation (especially lathe domes; ordinary points keep sharp transitions). Sweep paths are smooth splines by default; path_smooth:false retains a polygonal path. Arrays have 1-512 copies, nested total <=4096. band {points,width,normal} with op engrave/emboss and wall depth makes a constant-depth surface groove/band; points lie on the surface, normal is its projection direction. Use separate bands for different sides/normal directions. Form wrappers contain geometry only; color/material/bone/blend belong on the outer blob. Rivets 0.004-0.006 m, plate wall 0.003-0.005 m, blade bevel 0.001 m. Resolve thickness/width with at least two mesh cells; use separate small clay objects or detail_cell for tiny parts. Sharp feature placement is automatic; sharp:false in edit_clay gives the old mesh for comparisons.",
+            torus {center, radius, thickness, rotate} (ring in the XZ plane); membrane {points, thickness, sag, scallop, scallop_edges} (thin wing polygon). chain {points, size [width,length,depth], twist, taper, tilt} makes connected beads along an arc-length sampled path (braids, necklaces, plate tails). twist is degrees per bead; taper is end/start size ratio (default 1); tilt leans beads left and right in turn (a braid: tilt 30-40, twist 0, size width about 1.6 x depth). rotate is degrees [x,y,z]. Hard surfaces: extrude {profile:[[u,v],...],depth,center,axis,bevel} (default axis +Z; +Z uses XY profile); lathe {profile:[[radius,height],...],center,axis} (default +Y); sweep {profile,points,taper,twist,path_smooth} (local XY section, transported frame, total twist degrees); shell {source: form,thickness} hollows inward; array {source: form,count,step} repeats along a line, radius/center/axis selects a circle, points selects an arc-length path. Profiles are simple polygons, either winding, 3-128 points; a corner may be {point:[u,v],radius} for a circular fillet, or {point:[u,v],smooth:true} for spline interpolation (especially lathe domes; ordinary points keep sharp transitions). Sweep paths are smooth splines by default; path_smooth:false retains a polygonal path. Arrays have 1-512 copies, nested total <=4096. For many repeated modules (tower floors, railings, columns) call instance_array afterwards, so one copy is meshed and every copy is drawn, rendered and exported as an instance of it. band {points,width,normal} with op engrave/emboss and wall depth makes a constant-depth surface groove/band; points lie on the surface, normal is its projection direction. Use separate bands for different sides/normal directions. Form wrappers contain geometry only; color/material/bone/blend belong on the outer blob. Rivets 0.004-0.006 m, plate wall 0.003-0.005 m, blade bevel 0.001 m. Resolve thickness/width with at least two mesh cells; use separate small clay objects or detail_cell for tiny parts. Sharp feature placement is automatic; sharp:false in edit_clay gives the old mesh for comparisons.",
         "properties": {
-            "type": { "type": "string", "enum": ["sphere", "ellipsoid", "capsule", "box", "torus", "membrane", "chain", "extrude", "lathe", "sweep", "shell", "array", "band"] },
+            "type": { "type": "string", "enum": ["sphere", "ellipsoid", "capsule", "box", "torus", "membrane", "chain", "extrude", "lathe", "sweep", "shell", "array", "band", "mesh"] },
+            "asset": { "type": "string", "description": "mesh: a triangle mesh by content hash (get_clay lists a clay's; import_mesh and to_clay make them). With sign (closed: the pseudo normals, default; winding: the generalized winding number, for open meshes: holes close), center, rotate and scale (uniform)." },
             "name": { "type": "string", "description": "Label to address the blob later." },
-            "op": { "type": "string", "enum": ["add", "carve", "cover", "plate", "engrave", "emboss"], "description": "add melts it on (default); carve cuts it away (eye sockets, mouths); cover makes clothing: everything before this blob, grown by offset, kept only inside this blob's shape (a box over the torso = a fitted tunic, a capsule around the upper arm = a sleeve, around the shin = a boot). Covers fit the body exactly, have a crisp edge (blend rounds it; use about 0.004) and their own color and material, and move with the rig. For loose parts (a flared skirt, a cape) use add blobs. plate fits a filtered body shell with a hollow wall (default 0.004), offset clearance and rim bevel, clipped to this shape. Use smooth:0.08-0.14 for a forged breastplate that bridges anatomy; 0.03-0.06 for greaves/vambraces; 0 keeps an exact anatomical fit. ridge adds a center crest and flare turns the limiting edge outward (meters). Set bone to a deform bone for rigid armor, including split rigs. engrave/emboss require band and use wall as constant depth; blend 0 gives crisp walls." },
+            "op": { "type": "string", "enum": ["add", "carve", "cover", "plate", "engrave", "emboss", "intersect"], "description": "add melts it on (default); carve cuts it away (eye sockets, mouths); intersect keeps only what is inside both it and everything before it (blend rounds the cut); cover makes clothing: everything before this blob, grown by offset, kept only inside this blob's shape (a box over the torso = a fitted tunic, a capsule around the upper arm = a sleeve, around the shin = a boot). Covers fit the body exactly, have a crisp edge (blend rounds it; use about 0.004) and their own color and material, and move with the rig. For loose parts (a flared skirt, a cape) use add blobs. plate fits a filtered body shell with a hollow wall (default 0.004), offset clearance and rim bevel, clipped to this shape. Use smooth:0.08-0.14 for a forged breastplate that bridges anatomy; 0.03-0.06 for greaves/vambraces; 0 keeps an exact anatomical fit. ridge adds a center crest and flare turns the limiting edge outward (meters). Set bone to a deform bone for rigid armor, including split rigs. engrave/emboss require band and use wall as constant depth; blend 0 gives crisp walls." },
             "smooth": { "type": "number", "minimum": 0, "maximum": 0.5, "description": "cover/plate: smoothing footprint in object units, with clearance to conceal bumps and bridge pits (0 = exact fitted behavior). Tunic 0.02-0.04; boots 0.02-0.05. Forged torso plate 0.08-0.14; limb plates 0.03-0.06. Plate fitting uses a cached broad filter with smooth reconstruction and sampled conservative clearance; earlier plate operations do not inflate the fitting body again. Increase the limiting blob to contain the loose garment." },
             "loose": { "type": "number", "minimum": 0, "maximum": 0.5, "description": "Alias for cover/plate smooth; supply only one." },
             "twist": { "type": "number", "description": "chain: rotation about its tangent in degrees per bead; sweep: total twist along arc length." },
@@ -317,6 +379,7 @@ fn tool_definitions() -> Value {
         if name=="export_glb" {
             properties.insert("atlas".into(),json!({"type":"boolean","default":true,"description":"Pack baked parts into shared color/normal/ORM atlases within check_export limits; false keeps original maps."}));
             properties.insert("texel_density".into(),json!({"type":"number","exclusiveMinimum":0,"description":"Atlas target pixels per world meter; automatically reduced to fit the checker budget."}));
+            properties.insert("instancing".into(),json!({"type":"string","enum":["nodes","ext"],"default":"nodes","description":"How scattered copies (and instance_array copies) are written: nodes (default) gives each copy a node pointing at one shared mesh; ext writes one node per source with EXT_mesh_gpu_instancing transforms (smaller; readers without the extension show one copy). Identical objects share meshes either way."}));
         }
         if name=="kitbash" {
             properties.insert("route".into(),json!({"type":"boolean","default":true,"description":"Route flexible spans outside targets, with sag between authored clips. Pistons warn on intersections. action:reattach accepts from/to world endpoints and bones."}));
@@ -325,11 +388,15 @@ fn tool_definitions() -> Value {
         json!({"name":name,"description":description,"inputSchema":schema})
     };
 
-    let film_environment = json!({ "description": "Image lighting (default studio). Skies include ground bounce and an optional finite sun disc; HDR is linear Radiance RGBE, equirectangular. Use lights none for natural illumination. Presets also accept {preset, intensity, rotate} to adjust sky fill independently of explicit lights.", "oneOf": [
-            { "type": "string", "enum": ["studio", "overcast", "sunset", "forest", "golden_hour", "night", "storm"] },
+    let film_environment = json!({ "description": "Image lighting (default studio). Skies include ground bounce and an optional finite sun disc; HDR is linear Radiance RGBE, equirectangular. Use lights none for natural illumination. Presets also accept {preset, intensity, rotate} to adjust sky fill independently of explicit lights. physical is a physical sun and sky (single Rayleigh, Mie and ozone scattering): the sun and sky redden and dim as sun_elevation drops, the sun is a 0.53 degree disc sampled directly; sky_noon, sky_afternoon, sky_golden and sky_sunset are physical at 60, 30, 8 and 1.5 degrees. Its brightness is calibrated so a 30 degree sun lights the ground like golden_hour. Fog does not follow the sky: set fog color to match.", "oneOf": [
+            { "type": "string", "enum": ["studio", "overcast", "sunset", "forest", "golden_hour", "night", "storm", "physical", "sky_noon", "sky_afternoon", "sky_golden", "sky_sunset"] },
             { "type": "object", "oneOf": [{"required":["hdr"]},{"required":["preset"]}], "properties": {
                     "hdr": { "type": "string", "description": "Absolute .hdr path, up to 16 million pixels." },
-                    "preset": {"type":"string","enum":["studio","overcast","sunset","forest","golden_hour","night","storm"]},
+                    "preset": {"type":"string","enum":["studio","overcast","sunset","forest","golden_hour","night","storm","physical","sky_noon","sky_afternoon","sky_golden","sky_sunset"]},
+                    "sun_elevation": { "type": "number", "minimum": -5, "maximum": 90, "description": "Physical sky only: degrees above the horizon (preset's default; physical 30). Below 0 leaves twilight and no sun." },
+                    "sun_azimuth": { "type": "number", "minimum": -36000, "maximum": 36000, "default": 39.29, "description": "Physical sky only: degrees from +Z toward +X (default: render_film's key light, [0.45, 0.75, 0.55]). rotate turns it further." },
+                    "turbidity": { "type": "number", "minimum": 1, "maximum": 10, "default": 2.5, "description": "Physical sky only: haze, 1 clear air to 10 thick haze (whiter sky, wider glow round the sun, redder low sun)." },
+                    "ground_albedo": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.3, "description": "Physical sky only: brightness of the ground below the horizon." },
                     "rotate": { "type": "number", "minimum": -36000, "maximum": 36000, "default": 0, "description": "Degrees around world +Y." },
                     "intensity": { "type": "number", "minimum": 0, "maximum": 10000, "default": 1 }
                 }, "additionalProperties": false }
@@ -399,10 +466,18 @@ fn tool_definitions() -> Value {
             "floor": { "type": "boolean", "description": "A floor under the scene that catches shadows (default true)." },
             "exposure": { "type": "number", "description": "Brightness multiplier (default 1)." },
             "denoise": { "type": "boolean", "description": "Remove grain (default true)." },
+            "denoiser": { "type": "string", "enum": ["variance", "classic"], "description": "How grain is removed: variance (default) is guided by each pixel's measured noise, so clean areas and edges stay sharp and noisy ones are smoothed harder; classic is the previous filter, whose strength follows only the sample count." },
             "frame": { "type": "number", "description": "Pose rigs at this time-slider frame (default: the rest pose)." },
             "baked": { "type": "boolean", "description": "Render baked game meshes instead of clay." },
             "fine": { "type": "boolean", "description": "Render clay with a detail_cell at that fine size (default true)." },
+            "fine_wait": { "type": "number", "minimum": 0, "maximum": 600, "description": "Seconds the render waits for fine meshes still building (default half of time_limit, at most 30). The wait runs in the render job, not the tool call, and counts against time_limit. Objects not ready render at their regular mesh and are listed in fine_mesh_errors; their builds go on, so a later render uses them." },
             "save_path": { "type": "string", "description": "Also save the picture to this absolute .png path." },
+            "passes": { "type": "array", "maxItems": 7, "items": { "type": "string", "enum": ["depth", "normal", "albedo", "ao", "shadow", "mask", "emission"] }, "description": "Also write render passes for compositing (like ZBrush BPR passes), from the camera's first hits of the same scene on the CPU: depth (distance along the view axis), normal (shading normal), albedo (color without light; the floor shows its gray 0.42, the background 0), ao (1 = open), shadow (1 = blocked from the lights, or the studio key with lights none), mask (object silhouette, anti-aliased; floor and background 0), emission. Files <pass>.png|exr in passes_dir (<view>_<pass> with several views, whose names must make distinct file names); the reply's passes maps each name to its path ({name: {view: path}} with several views), passes_info says how to decode, and a second image shows them. They are traced after the picture, outside time_limit (well under a second at 640 px). Not with motion_blur." },
+            "passes_dir": { "type": "string", "description": "Absolute folder for the passes (made when the render starts, if missing); required with passes." },
+            "passes_format": { "type": "string", "enum": ["png", "exr"], "description": "png (default: 16-bit for depth, normal, ao, shadow, mask; 8-bit sRGB for albedo and emission) or exr (32-bit floats: depth in world units, linear colors)." },
+            "pass_samples": { "type": "integer", "minimum": 1, "maximum": 64, "description": "Anti-aliasing samples per pixel for the passes (default 8); ao casts 8 rays per sample." },
+            "ao_distance": { "type": "number", "minimum": 0, "maximum": 1000, "description": "How far the ao pass looks for occluders, in world units (default a quarter of the framing radius)." },
+            "normal_space": { "type": "string", "enum": ["world", "camera"], "description": "The normal pass's space (default world; camera: x right, y up, z toward the camera)." },
         },
     });
     let film_lighting = json!({
@@ -414,7 +489,7 @@ fn tool_definitions() -> Value {
         "bloom": film_bloom,
         "vignette": { "type": "number", "minimum": 0, "maximum": 1, "default": 0, "description": "Corner darkening strength." },
         "white_balance": film_white_balance,
-        "device": { "type": "string", "enum": ["auto", "gpu", "cpu"], "default": "auto", "description": "Where to trace. auto: GPU when available and within device limits, CPU fallback otherwise. HDR finishing is shared." },
+        "device": { "type": "string", "enum": ["auto", "gpu", "cpu"], "default": "auto", "description": "Where to trace. auto: GPU when available and within device limits, CPU fallback otherwise. gpu: also tries again after the GPU stopped responding earlier (auto then stays on the CPU). HDR finishing is shared. The reply's device {used: gpu|cpu, gpu: adapter name, fallback_reason: why not the GPU (null when it traced or cpu was asked for), asked, mixed: shutter slices traced on different devices, warning: a known GPU difference} says what traced; each view lists its own; asking for gpu and getting the CPU also adds a warnings line." },
         "tonemap": { "type": "string", "enum": ["aces", "agx", "filmic"], "default": "aces", "description": "ACES: default contrast; AgX: smooth highlight gamut compression; filmic: hue-preserving shoulder for saturated glowing eyes." },
     });
     film_schema["properties"].as_object_mut().unwrap().extend(film_lighting.as_object().unwrap().clone());
@@ -461,7 +536,8 @@ fn tool_definitions() -> Value {
                 "frames":{"type":"array","items":{"type":"number"}}, "clip":{"type":"string"},"fps":{"type":"number"}
             },"additionalProperties":false
         })),
-        tool("get_scene", "Compact scene counts, top-level objects, selection and camera. all:true includes children; parent, target and filter narrow the list; offset/limit paginate. detail:true or verbose:true returns full object properties.", empty.clone()),
+        tool("get_scene", "Compact scene counts, top-level objects, selection and camera. all:true includes children; parent, target and filter narrow the list; offset/limit paginate. detail:true or verbose:true returns full object properties. \
+            ui_activity lists the human's latest brush strokes (newest last): tool, target, brush, radius, samples, job, status, step and record_ids; with detail:true each also has request, the exact tool request the editor sent (send it to that tool to repeat the stroke).", empty.clone()),
         tool("create_object", "Add a primitive, an empty Group, a Clay sculpture (pass blobs), or an Eye. Primitives fit a 1x1x1 box (Sphere: diameter 1). Solids default to sitting on the grid at the origin; Clay and Eye start at the origin. \
             Eye: a ready-made eyeball of diameter 1 (size it with scale, e.g. 0.024 for a human), looking down its local +Z, with a sharp iris and pupil, a cornea bulge, and glossy materials; \
             much crisper than painting eyes on clay. Usually: parent the head clay, bone the head bone, mirror true, aim a point in front of the face. \
@@ -608,6 +684,12 @@ fn tool_definitions() -> Value {
                 "exact": { "type": "boolean", "description": "Read every texel from the exact clay field (slow, the old way) instead of the fine mesh." },
                 "show": { "type": "boolean", "description": "Also show baked meshes in the viewport (like set_display baked)." },
                 "off": { "type": "boolean" },
+                "maps": { "type": "array", "maxItems": 2, "items": { "type": "string", "enum": ["displacement", "vector_displacement"] }, "description": "Also write displacement maps over the bake's UVs, for renderers and sculpting apps that displace the simple mesh back into the clay: displacement (height along the simple mesh's normal) and/or vector_displacement (the offset in its tangent frame: R along +u, G along the bitangent, B along the normal). The bake finds the clay's surface only along the simple mesh's interpolated normal from each texel, so R and G are about 0 and B is the height map's value: the vector map is that offset in vector form, for tools that read vector maps; it does not capture overhangs or detail pushed sideways. Files in save_dir named <object>_displacement / <object>_vector_displacement; one-off outputs, not saved on the object. The reply's maps says the files, scale and how to decode." },
+                "map_size": { "type": "integer", "enum": [512, 1024, 2048, 4096], "description": "Displacement map pixels across (default the texture size, at most 2048)." },
+                "map_format": { "type": "string", "enum": ["png", "exr"], "description": "png (default): 16-bit, value = (code / 65535 - 0.5) * scale, mid grey = 0, each map's scale in the reply; exr: 32-bit floats as they are (clay units)." },
+                "save_dir": { "type": "string", "description": "Absolute folder for the maps (made when the maps are written, if missing); required with maps." },
+                "verify": { "type": "boolean", "description": "With maps: reapply them as geometry (diced to half a cell) and report the error to the clay in cells (max_error_cells, mean_error_cells)." },
+                "lowpoly": { "type": "string", "enum": ["meshopt"], "description": "How the simple mesh is made: meshopt (default; retopo arrives with the Stage 9 Poly track)." },
             },
             "required": ["target"],
         })),
@@ -624,7 +706,7 @@ fn tool_definitions() -> Value {
                 "points": { "type": "array", "items": vec3("A world point near the surface.") },
             },
         })),
-        tool("check_export", "Load an exported GLB from disk and render that file with the film path tracer. Returns the picture and file geometry, materials/textures, images, skins, animations, bounds and warnings. Independent of the editor scene. Runs as a background job; after 40 s use job_status to fetch the answer. Supports embedded PNG/JPEG, triangle meshes, TRS/matrix node trees and LINEAR/STEP skeletal animation.", json!({
+        tool("check_export", "Load an exported GLB from disk and render that file with the film path tracer. Returns the picture and file geometry, materials/textures, images, skins, animations, bounds and warnings. Independent of the editor scene. Runs as a background job; after 40 s use job_status to fetch the answer. Supports embedded PNG/JPEG, triangle meshes, TRS/matrix node trees and LINEAR/STEP skeletal animation. device says which tracer ran (as in render_film).", json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Absolute .glb path to check." },
@@ -635,13 +717,15 @@ fn tool_definitions() -> Value {
                 "animation": { "type": "string", "description": "Clip name; with no frame samples frame 0. No animation/frame shows the rest pose." },
                 "frame": { "type": "number", "description": "Frame at file fps, with clip time zero as frame 0. Uses first clip if animation is omitted; older files infer fps from sample spacing (reported in warnings)." },
                 "save_path": { "type": "string", "description": "Also save contact sheet to an absolute .png path." },
+                "morph_weights": { "type": "object", "additionalProperties": { "type": "number" }, "description": "Morph target weights by name (glTF extras.targetNames), applied to the vertices; default the file's own weights." },
             },
             "required": ["path"],
         })),
         tool("render_film", "Film-quality picture from the path tracer (like Blender's Cycles): soft studio lights with real shadows, light bouncing between surfaces, glossy and metal materials, \
             baked textures and normal maps, see-through hair cards, a shadow-catching floor, denoised, filmic tone. Procedural skies or HDR image lighting, physical camera and polygonal thin-lens depth of field, motion blur, energy-conserving HDR glare, grading and film grain. look: trailer applies a photographic preset. Framed like render_views (views, center, radius). \
             Lights carried by objects (torches, candles, braziers, their scattered copies) light the scene as soft spheres; fog adds mist with light shafts; views [\"iso\"] and aspect 1.78 give a game-style environment shot (see kit). \
-            Try golden_hour + lights none + dof f/2.8 focused on the eyes for portraits. Slow: seconds to minutes; samples and time_limit trade speed for less grain. Use render_views while working and this to judge the final look.", film_schema),
+            Try golden_hour + lights none + dof f/2.8 focused on the eyes for portraits. Slow: seconds to minutes; samples and time_limit trade speed for less grain. Use render_views while working and this to judge the final look. \
+            The reply's device field says whether the GPU or the CPU traced, and why not the GPU (e.g. a buffer over the GPU's limit, hair strands under auto).", film_schema),
         tool("create_human", "Start a character from a correct human base (MakeHuman's CC0 base mesh and shape targets, built in): \
             a body clay with a full rig (spine, neck, head, arms, three bones per finger, legs, feet), a finer head clay on the head bone, and Eye objects in the sockets. \
             Real anatomy, unlike blobs. Shape it with human (sex, age, weight, muscle, height, proportions, ancestry, and 600+ named face and body shapes; see human_controls), \
@@ -710,7 +794,7 @@ fn tool_definitions() -> Value {
         tool("job_status", "No call waits longer than about 40 s. Long work (render_film, bake, exports) runs in the background with a progress bar in the editor, and so does a call that waits for meshes to build. \
             When time is up, the call answers with a job id instead of its result, and a status: 'running' (a job), 'done, answer pending' (the change IS made; only its summary waits for meshes), or 'waiting in line (not run yet)' (it runs later, in order; do not send it again). \
             Call this with that id to get the result. wait: N (up to 45) answers as soon as the job is done, or after N seconds with how far it is (percent, seconds_left): use it instead of polling. \
-            cancel: true stops a running job (nothing it made is kept) or drops a call still in line. Without id, lists pending and finished jobs. Results remain retrievable for 24 hours, including after timeouts and repeated reads.", json!({
+            cancel: true stops a running job (nothing it made is kept) or drops a call still in line. Without id, lists pending and finished jobs and ui_activity (the human's latest strokes, as in get_scene). Results remain retrievable for 24 hours, including after timeouts and repeated reads.", json!({
             "type": "object",
             "properties": {
                 "id": { "type": "integer" },
@@ -719,7 +803,13 @@ fn tool_definitions() -> Value {
             },
         })),
         tool("delete_object", "Remove one object and everything under it.", json!({ "type": "object", "properties": { "target": target.clone() }, "required": ["target"] })),
-        tool("duplicate_object", "Copy one object (and its children) in place. The copy becomes selected.", json!({ "type": "object", "properties": { "target": target.clone() }, "required": ["target"] })),
+        tool("duplicate_object", "Copy one object (and its children) in place. The copy becomes selected. Identical clay copies share one mesh (built once, drawn instanced) until one is edited.", json!({ "type": "object", "properties": { "target": target.clone() }, "required": ["target"] })),
+        tool("instance_array", "Turn an array blob of a clay object into instances: one copy is meshed (a hidden clay under the object) and a scatter under the object holds every copy, which the viewport draws instanced and render_film and exports share. The blob leaves the clay. Refused when separate copies would not look the same: the blob is not an added, unmirrored array, other blobs blend with, carve into or cover the copies, or the clay has sculpt, paint, masks or decals (force: true instances anyway; copies are then separate closed shapes that do not merge with their neighbours). Reply: unit, scatter, copies, triangles before and after (drawn and unique).", json!({ "type": "object", "properties": {
+            "target": target.clone(),
+            "blob": blob_key.clone(),
+            "level": { "type": "string", "enum": ["outer", "leaf"], "description": "Nested arrays: outer (default) copies the inner array as one unit; leaf copies the innermost shape." },
+            "force": { "type": "boolean", "description": "Skip the neighbour, sculpt and paint checks (default false)." },
+        }, "required": ["target", "blob"] })),
         tool("select_object", "Set the selection. Pass target and/or targets; omit both to clear. add: true adds to the current selection. The last one is the lead.", json!({ "type": "object", "properties": { "target": target.clone(), "targets": { "type": "array", "items": target.clone() }, "add": { "type": "boolean" } } })),
         tool("group_objects", "Put objects under a new empty group (Maya Ctrl+G), keeping where they are. Defaults to the selection.", json!({ "type": "object", "properties": { "targets": { "type": "array", "items": target.clone() }, "name": { "type": "string" } } })),
         tool("parent_objects", "Move children under a parent (or to the world when parent is null), keeping where they are.", json!({ "type": "object", "properties": { "children": { "type": "array", "items": target.clone() }, "parent": target.clone() }, "required": ["children"] })),
@@ -782,6 +872,7 @@ fn tool_definitions() -> Value {
         tool("kitbash", "Hard-surface detail parts (Call of Duty / Titanfall style): procedural, game-ready (chamfered hard edges, UVs, a material per role) and placed ON a target surface. \
             The three detail levels, quickly: (1) secondary forms with detail_pass panel (plates, seams, hatches), (2) tertiary with detail_pass bolt and greeble, cables with detail_pass cable, (3) then a few hand placements here: pistons behind knees, hoses at hips, handles, latches, lights, antennas, stencils. \
             action place (default): part is a kind name or {kind, style, size [along X, out of the surface, across] meters, count, radius, sag, clips, ends, text, lit, glow, paint, color, materials {role: material}, detail, seed} (these keys also work at the top level). \
+            InsertMesh: part {object, op: add|carve, scale} puts any object's shape (as to_clay makes it) into a clay target at at / points: its +Y along the surface normal, its pivot on the surface (a carve sinks half of it: a hole), its world size times scale, X along along, turned by rotate, lifted by offset; remove {group} takes the blobs out. A mesh becomes one asset (welded and decimated once, in a background job like to_clay) that every spot places; into an unevenly scaled clay it goes one spot per call. \
             Kinds: bolt (hex|socket|rivet|countersunk|carriage), nut, washer, hinge (count knuckles), latch (draw|toggle|cam), clamp (over a pipe), handle (bar|loop|recessed), vent (louver|slots|grille|fan|mesh), hatch (handle|latch|plain|vented: seam, hinges, corner bolts), piston and cable, hose, corrugated_tube, pipe, strap (between points), light (round|rect|cage|strip, glowing lens; lit false = dark), antenna (whip|blade|stub), sensor (dome|camera|lidar), exhaust (stack|port), armor_plate (bolted|plain|layered), track_link (count links), gear, spring, connector, ammo_box, jerry_can (real size), net, stencil (text, A-Z 0-9 - / . :), seam (rect|line panel line), greeble (box|canister|pipes|junction|tank), clip. action catalog lists them all with default sizes. \
             Unsized parts scale with the asset they go on (a 6.5 m mech: 4.5 cm bolts; a 1 m rifle: 7 mm). target: the object to put it on (several: targets). \
             Where: at (a world point near the surface: it snaps to the nearest surface, or along normal when given), points (several), path + spacing (along a polyline), array {count, step [x,y,z]} | {count, to} | {grid [cols, rows], spacing [along, across]}, along (a direction for the part's X, or \"edge\": the nearest hard edge; with count_along it spreads copies along that edge), rotate (degrees about the normal), offset (lift off the surface). \
@@ -856,7 +947,7 @@ fn tool_definitions() -> Value {
         tool("frame_view", "Point a view's camera at one object (and its children), or at everything when target is omitted.", json!({ "type": "object", "properties": { "target": target.clone(), "view": { "type": "string", "enum": ["persp", "top", "front", "side"] } } })),
         tool("screenshot", "PNG image of the 3D viewport as it looks right now. Set whole_window to see the full editor UI.", json!({ "type": "object", "properties": { "whole_window": { "type": "boolean" } } })),
         tool("run_mel", "Run a line of MEL in the editor's command line (subset: polyCube/polySphere/polyCylinder/polyCone/polyPlane/polyTorus [-n name], select [-add|-tgl|-d|-cl|-all|-hi] names, move/rotate/scale [-r] x y z [names], delete, duplicate, hide, showHidden [-all], group [-em] [-n name] [names], ungroup, parent children... parent, parent -w, xform -cp | -piv x y z, setAttr name.attr value, ls [-sl], currentTime n, undo, redo, file -new; without names commands use the selection). Separate commands with ';'.", json!({ "type": "object", "properties": { "command": { "type": "string" } }, "required": ["command"] })),
-        tool("set_display", "Viewport display: shading mode, grid, joints (rig skeletons), single or four-view layout, and which camera the single view shows.", json!({ "type": "object", "properties": { "shading": { "type": "string", "enum": ["wireframe", "shaded", "wireframe_on_shaded"] }, "grid": { "type": "boolean" }, "bones": { "type": "boolean" }, "baked": { "type": "boolean", "description": "Show baked game meshes (see bake) instead of clay." }, "fine": { "type": "boolean", "description": "Show clay with a detail_cell at that fine size (pores, wrinkles) instead of the mesh resolution. Slower to build the first time." }, "layout": { "type": "string", "enum": ["single", "four"] }, "view": { "type": "string", "enum": ["persp", "top", "front", "side"] } } })),
+        tool("set_display", "Viewport display: shading mode (matcap: a sculpt matcap, built in or an image), grid, joints (rig skeletons), lighting (render_film's environments and lights), ambient occlusion, key-light shadows, HDR finishing (bloom, exposure, tonemap), single or four-view layout, and which camera the single view shows.", json!({ "type": "object", "properties": { "shading": { "type": "string", "enum": ["wireframe", "shaded", "wireframe_on_shaded", "matcap"], "description": "matcap shades every fill with a matcap (a lit sphere looked up by the normal as the camera sees it; creases on sculpted clay darker), as sculpting apps do." }, "matcap": { "type": "string", "description": "The matcap: clay (default), red_wax, skin, metal, or a square PNG/JPEG of a shaded sphere (at most 1024 a side). Turns matcap shading on unless shading says otherwise." }, "ao": { "description": "Short for ambient_occlusion (the same values).", "oneOf": [{ "type": "boolean" }, { "type": "object" }] }, "ao_radius": { "type": "number", "minimum": 0.01, "maximum": 10, "description": "Ambient occlusion radius in world units (ambient_occlusion.radius)." }, "grid": { "type": "boolean" }, "bones": { "type": "boolean" }, "baked": { "type": "boolean", "description": "Show baked game meshes (see bake) instead of clay." }, "brush_cursor": { "type": "boolean", "description": "Draw the brush tools' ring on the surface under the mouse (default true)." }, "overlay": { "type": "string", "enum": ["none", "mask", "groups"], "description": "How clay shows its sculpt mask and polygroups: mask (default: masked surface darker), groups (each group tinted, and the mask), none. Hidden groups are left out in every mode. Viewport only (render_film, bakes and exports are untouched); not an undo step." }, "fine": { "type": "boolean", "description": "Show clay with a detail_cell at that fine size (pores, wrinkles) instead of the mesh resolution. Slower to build the first time." }, "layout": { "type": "string", "enum": ["single", "four"] }, "view": { "type": "string", "enum": ["persp", "top", "front", "side"] }, "shadows": { "description": "Real-time key-light shadows in the viewport, render_views and render_animation (render_film always traces its own). Default on. true/false, or an object changing some settings. Scenes over the triangle budget draw without them; the reply's shadows.last_frame says whether the last frame had them and why not.", "oneOf": [{ "type": "boolean" }, { "type": "object", "properties": { "enabled": { "type": "boolean" }, "soft": { "type": "boolean", "description": "Contact-hardening penumbrae (PCSS) that widen away from the caster, instead of a fixed soft edge." }, "quality": { "type": "string", "enum": ["normal", "high"], "description": "Shadow map size: 2048 (normal) or 4096 (high, sharper on large scenes)." }, "strength": { "type": "number", "minimum": 0, "maximum": 1, "description": "How much of the key light a shadow takes away (1)." }, "softness": { "type": "number", "minimum": 0.005, "maximum": 0.3, "description": "The key's angular radius in radians for soft shadows (0.12, as render_film's key)." }, "ground": { "type": "boolean", "description": "Catch shadows on the grid plane y = 0 where there is no floor (default true; off when objects reach below it)." }, "key_direction": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "Direction toward the key light, default [0.45, 0.75, 0.55] (render_film's key). Also moves the key's highlight. Applies to the studio and classic lighting; other lighting shadows its brightest sun." } } }] }, "lighting": { "description": "What lights the viewport, render_views and render_animation: render_film's environments and lights, so the viewport previews a film look (diffuse light from the environment, reflections of it, its sun and render_film's studio lights as directional lights; the first casts the shadows). Default \"studio\" (render_film's default: the studio environment and its key, fill and rim lights, plus a viewport-only catchlight). An environment preset (overcast, sunset, golden_hour, forest, night, storm, or the physical sun and sky: physical, sky_noon, sky_afternoon, sky_golden, sky_sunset; as render_film environment, with its studio lights), a look preset (trailer, desert_heat, night_ops, ...), \"film\" (the last render_film's lighting), \"classic\" (the viewport's old fixed studio, no environment), or an object of render_film's lighting arguments {environment, lights, extra_lights, look} (e.g. {environment: \"sunset\", lights: \"none\"} or {environment: {preset: \"physical\", sun_elevation: 10}, lights: \"none\"}). Exposure, tonemap and grade are post's.", "oneOf": [{ "type": "string" }, { "type": "object", "properties": { "environment": {}, "lights": {}, "extra_lights": { "type": "array" }, "look": { "type": "string" } } }] }, "ambient_occlusion": { "description": "Screen-space ambient occlusion (contact darkening of the environment light in creases and under objects). Default on, radius 0.5, strength 1. true/false or {enabled, radius (world units 0.01..10), strength (0..2)}. Off for masks, classic lighting and scenes over the triangle budget; the reply's ambient_occlusion.last_frame says why.", "oneOf": [{ "type": "boolean" }, { "type": "object", "properties": { "enabled": { "type": "boolean" }, "radius": { "type": "number", "minimum": 0.01, "maximum": 10 }, "strength": { "type": "number", "minimum": 0, "maximum": 2 } } }] }, "post": { "description": "HDR finishing in the viewport, render_views and render_animation: a live preview of render_film's exposure, white balance, bloom (energy-conserving glare: only light above the threshold, such as emitters, torches and glowing windows, spreads), vignette, tonemap and grade. Default on: ACES and bloom {strength 0.08, threshold 1}, as render_film with bloom: true. Masks never change. true/false, or an object changing some settings (the rest stay; reset: true restores the defaults first). A look preset's environment, lights, fog, lens effects, grain and sharpening are render_film only. The reply's post echoes the settings.", "oneOf": [{ "type": "boolean" }, { "type": "object", "properties": { "enabled": { "type": "boolean", "description": "false draws as before HDR (no bloom or tonemap)." }, "look": { "type": "string", "enum": ["neutral", "trailer", "modern_warfare", "desert_heat", "night_ops", "cinematic_teal_orange"], "description": "render_film look preset (its tonemap, bloom, grade, vignette)." }, "tonemap": { "type": "string", "enum": ["aces", "agx", "filmic", "none"], "description": "none clips at white like the viewport before HDR." }, "exposure": { "type": "number", "minimum": -10, "maximum": 10, "description": "Stops brighter (+) or darker (-), default 0: render_film camera ev = 12 - exposure." }, "bloom": { "description": "As render_film: true (strength 0.08), false, a strength 0..1, or {strength, threshold}.", "oneOf": [{ "type": "boolean" }, { "type": "number", "minimum": 0, "maximum": 1 }, { "type": "object", "properties": { "strength": { "type": "number", "minimum": 0, "maximum": 1 }, "threshold": { "type": "number", "minimum": 0, "maximum": 100 } } }] }, "vignette": { "type": "number", "minimum": 0, "maximum": 1 }, "white_balance": { "description": "Kelvin 2000..12000 or [r, g, b] gains, as render_film.", "oneOf": [{ "type": "number" }, { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }] }, "grade": { "type": "object", "description": "As render_film's grade: look, saturation, contrast, lift, gamma, gain." }, "reset": { "type": "boolean" } } }] } } })),
         tool("edit_clay", "Change a Clay object's blobs. Steps run in this order: replace (new full list), remove, update (merge fields into existing blobs), add (append). Returns the blob names and the built mesh's bounds.", json!({
             "type": "object",
             "properties": {
@@ -881,67 +972,93 @@ fn tool_definitions() -> Value {
             smooth (soften bumps and seams), flatten (press onto a plane through the stroke: planes of the face, soles), \
             grab (pull the surface by delta, at most radius: a nose forward, a chin down). Use stretch/extrude for thin tips: a continuous tapered deformation following delta, up to 8 radii; use a radius spanning the base and at least 2 mesh cells across the tip. crease makes a sharp V line (strength is depth in scene units, negative or invert makes a ridge); pinch tightens edges toward the path (strength 0-1); layer applies a fixed plateau height per stroke (strength is signed scene units), so overlapping dabs do not build up. \
             noise (texture over an area in one stroke: pores, bumps, wrinkles, overlapping scales or belly plates, see pattern and scale; set a detail_cell with edit_clay first, a few times finer than scale, and detail_regions where the features are finer than that). \
+            standard raises the surface along its area normal dab by dab (invert carves): strength * radius / 2 at a lone dab's center; along a path the dabs are spaced and scaled so the ridge is about as high. smooth_mode peaks only lowers and valleys only fills; flatten side above only cuts, below only fills. \
+            Every stroke takes a falloff curve (with focal_shift), per-point pen pressure with pressure curves, spacing, kind (dots, seeded spray, drag_rect, drag_dot), lazy, taper (crease + taper = Dam Standard), symmetry (mirror axes and radial copies; mirror: true = x) and a frame (world, object, surface, screen); paint: {color} also colors the stroke (MRGB). The reply lists dabs and symmetric copies per stroke. \
             With detail regions every stroke lands on the coarse grid and on each region it reaches, at that region's cell (radius_used is the finest), so fine features show inside regions and fade out at their edges. \
             Typical meter-scale settings: skin crease/layer depth 0.0005-0.002, pinch 0.2-0.5, pores strength 0.03-0.08 at scale 0.0008; cloth folds strength 0.5-0.9 at scale 0.02-0.05, crease depth 0.002-0.006; creature scales strength 0.3-0.7 at scale 0.03-0.06. Masks restrict every brush on the pre-stroke surface, including tiled strokes. A whole flank or tail takes one noise stroke: a path along it with a radius covering it. \
             Strokes run in the background: the call answers when they are applied (or with a job id after 40 s; see job_status); the mesh then rebuilds and later calls wait for it. \
             Points are world space by default; take them from compare_reference's pixel_to_world or the mesh bounds. \
-            Detail stays in place in space: moving a blob later does not move what was sculpted on it. undo removes a whole call.", json!({
+            Detail stays in place in space: moving a blob later does not move what was sculpted on it. undo removes a whole call. \
+            Clay-family brushes work toward the plane of the area under each dab (its mean surface): clay fills hollows up to it (square footprint, never cuts), clay_buildup fills them and lays a layer over it (strength sets the layer, about strength x radius / 10 per stroke), clay_tubes lays an even strip strength x radius / 2 high along the path (square, flat across; overlapping dabs do not build up), trim_dynamic cuts what stands above the plane with a sharp edge (never adds), polish (hPolish) presses both ways onto it. invert makes clay and clay_buildup cut instead. \
+            snakehook pulls a horn out of the surface along points (its first point on the surface, the rest out in the air, at most 16 radii long; or one point and delta); curl_deg curls it about normal (default level, across the pull): the tip ends curl_deg degrees from the base direction. \
+            alpha: {name (alpha import) or hash, depth, mid, rotate, scale, mode stamp|drag|tile, use height|mask} shapes dab brushes (standard, clay, clay_buildup, trim_dynamic, polish): with standard and use height the dab rises depth x (gray - mid); use mask scales any dab brush's weight. \
+            vdm stamps a VDM (alpha create_vdm; alpha: {name, rotate, scale, mode stamp|drag}) on the surface under each dab, overhangs and all: the stamp's width is the dab's (radius = the captured radius stamps it at its own size), its up the area normal; strength (default 1) blends it in, invert carves it, spacing defaults to 2 (a stamp's width apart); kind drag_dot or a single point stamps once. \
+            preset (call-level, or per stroke) names a brush preset (brush_preset list: ClayBuildup, ClayTubes, DamStandard, TrimDynamic, hPolish, Pores ... and the scene's own); the stroke's own fields override it and the record keeps the merged stroke. \
+            The clay's persistent mask (mask tool) holds every brush back: each point moves by 1 - mask, and hidden polygroups (group tool) are skipped; mask: {channel: false} ignores it, {invert_channel: true} works on the masked part instead, {groups: [ids]} keeps to some groups, and auto-masking {backface, normal_angle, cavity, connected} reads the surface around each dab (connected is Move Topological). Each record keeps the mask and groups it read, so it replays the same after they change. \
+            transform (brush) moves, turns or scales the unmasked part by transform {translate, rotate, scale, pivot} (the gizmo sends it when the clay has a mask): mask the part to keep still, transform the rest. \
+            Every stroke is a record on its layer's stroke ledger (base unless layer says) (reply: record_ids, ledger_head, per-stroke changed_points, bricks, bbox, max_disp, mean_disp; volume_delta with measure): stroke_log lists them, stroke_edit disables, scales (Adjust Last: {action: scale, last: true, factor}), replaces or replays them, sculpt_diff measures changes. dry_run: true applies to a copy and reports without changing the clay.", json!({
             "type": "object",
             "properties": {
                 "target": target.clone(),
                 "space": { "type": "string", "enum": ["world", "local"], "description": "Coordinate space of points, delta, normal (default world)." },
+                "layer": { "type": "string", "description": "The sculpt layer to write: base or one made with sculpt_layer add (default: the clay's recording layer, sculpt_layer record, else base). A stroke reads every enabled layer (what you see) and writes its own: the change divided by the layer's amount goes into it, so the surface moves as the brush says; refused below amount 0.05." },
+                "dry_run": { "type": "boolean", "description": "Measure only: run the strokes on a copy and reply with the records' stats; nothing changes." },
+                "cell": { "type": "number", "description": "Sculptris Pro for every stroke without its own cell (see the strokes' cell)." },
+                "level": { "type": "integer", "minimum": 0, "description": "The detail level (detail_level) for every stroke without its own level (default: the clay's active level, when it has levels)." },
+                "measure": { "type": "boolean", "description": "Also measure volume_delta per stroke (slower)." },
+                "label": { "type": "string", "description": "A name for these records and the undo step." },
+                "pressure_source": { "type": "string", "enum": ["touch_force", "nsevent", "velocity"], "description": "Where a UI stroke's pen pressure came from (kept on its records; the editor sends it)." },
+                "preset": { "type": "string", "description": "A brush preset under every stroke (brush_preset list); each stroke's own fields win." },
                 "strokes": { "type": "array", "maxItems": 64, "items": {
                     "type": "object",
-                    "properties": {
-                        "brush": { "type": "string", "enum": ["add", "carve", "inflate", "deflate", "smooth", "flatten", "grab", "noise", "crease", "pinch", "layer", "stretch", "extrude"] },
+                    "properties": with_controls(json!({
+                        "brush": { "type": "string", "enum": ["add", "carve", "inflate", "deflate", "smooth", "flatten", "grab", "noise", "crease", "pinch", "layer", "stretch", "extrude", "standard", "clay", "clay_buildup", "clay_tubes", "trim_dynamic", "polish", "snakehook", "vdm", "paint", "transform"] },
+                        "transform": { "type": "object", "additionalProperties": false, "description": "transform brush: move, turn and scale the clay's material (in the call's space), each point by 1 - mask: what the gizmo sends with a mask (Transpose). Scale, then rotate (degrees about X, then Y, then Z), both about pivot, then translate; or a whole affine matrix (16 numbers, column-major). strength 0..1 (default 1) is how much of the move applies; radius is not needed. Offsets cap at 127 detail cells: big moves belong to blobs.", "properties": {
+                            "translate": vec3("Move."), "rotate": vec3("Degrees about X, Y, Z."), "scale": { "oneOf": [{ "type": "number" }, { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }] }, "pivot": vec3("Turn and scale about this point."), "matrix": { "type": "array", "items": { "type": "number" }, "minItems": 16, "maxItems": 16 } } },
+                        "preset": { "type": "string", "description": "A brush preset under this stroke (over the call's preset); the stroke's fields win. With a preset, brush may be left out." },
+                        "alpha": alpha_schema.clone(),
+                        "curl_deg": { "type": "number", "minimum": -720, "maximum": 720, "description": "snakehook: degrees the horn curls from base to tip." },
+                        "cell": { "type": "number", "description": "Sculptris Pro: a detail cell finer than the clay's. Before the stroke, a detail region of that cell grows over it (a same-cell region it overlaps grows to hold both; at most 16 regions, the smallest of the nearest cell merging into its neighbour), so the stroke writes the finer grid there. The reply's detail_regions counts them." },
+                        "level": { "type": "integer", "minimum": 0, "description": "The detail level the stroke works at (detail_level lists them; 0 is the clay's own cell). It writes that level and the coarser ones; finer detail under it on the layer it writes is carried along (a grab, stretch, snakehook or transform moves it with the material, other brushes move it with the surface), so pores made at a finer level survive coarse edits. A level above 0 sets cell to its own (Sculptris Pro). Default: the clay's active level when it has levels and the stroke gives no cell; records keep it." },
                         "pattern": { "type": "string", "enum": ["pores", "bumps", "wrinkles", "scales", "plates", "folds"], "description": "noise: pores (small pits: skin), bumps (soft lumps), wrinkles (fine lines across normal; default horizontal), scales (overlapping reptile/dragon scales: each one domed, rising to a free edge that overlaps the next one along normal), plates (belly plates: bands across normal, each overlapping the next). For scales and plates, normal is the way their free edges point (default down; e.g. toward the tail). folds are soft raised ridges running along normal (default gravity [0,-1,0]), winding a little; faces turned along normal (a sleeve end) stay smooth. Height is about strength x scale / 2." },
                         "scale": { "type": "number", "description": "noise: spacing of the features (default radius / 10): one scale or plate across. Skin pores about 0.001 on a 1.7-unit person; dragon body scales about 0.03-0.06 on a 5-unit dragon, face and limb scales smaller, belly plates larger. Set a detail_cell several times finer first." },
                         "point": vec3("A single dab."),
-                        "points": { "type": "array", "items": vec3("Path point."), "description": "A path; the brush follows the segments between points." },
                         "radius": { "type": "number", "description": "Brush size (world units)." },
                         "strength": { "type": "number", "description": "Default 0.5 for traditional brushes (0-1). Crease: signed groove depth in scene units; layer: signed raised height in scene units; specify 0.001 for facial detail. Ignored by grab/stretch." },
-                        "invert": { "type": "boolean", "description": "Reverse crease or layer sign: crease becomes a ridge, layer lowers (default false)." },
-                        "mask": { "type": "object", "additionalProperties": false, "properties": {
-                            "blobs": { "type": "array", "items": { "type": "string" }, "description": "Only where these named blobs own the nearest surface; mirrors share names. Empty = nowhere. Unknown names are errors." },
-                            "above": { "type": "number", "description": "Only at or above this object-local Y, irrespective of stroke space." },
-                            "below": { "type": "number", "description": "Only at or below this object-local Y. Limits intersect with blobs." }
-                        } },
+                        "invert": { "type": "boolean", "description": "Reverse crease or layer sign (crease becomes a ridge, layer lowers); standard carves (default false)." },
+                        "smooth_mode": { "type": "string", "enum": ["gentle", "normal", "peaks", "valleys"], "description": "smooth: gentle (half as strong), normal, peaks (only lowers bumps), valleys (only fills dips)." },
+                        "side": { "type": "string", "enum": ["above", "below", "both"], "description": "flatten: above only cuts down to the plane, below only fills up to it (default both)." },
+                        "paint": { "type": "object", "additionalProperties": false, "description": "Also color the stroke as it sculpts (MRGB): the same coverage as a paint stroke with this spec.", "properties": { "color": color.clone(), "hardness": { "type": "number", "minimum": 0, "maximum": 1 }, "strength": { "type": "number", "minimum": 0, "maximum": 1, "description": "Opacity (default 1)." }, "erase": { "type": "boolean" } } },
+                        "mask": stroke_mask.clone(),
                         "delta": vec3("grab/stretch: the pull; stretch allows up to 8 radii and tapers its influence around the moving path."),
                         "normal": vec3("flatten: plane normal; crease/layer/pinch: surface normal (inferred at path center); noise folds: fold direction (default gravity); scales/plates: free-edge direction."),
                         "mirror": { "type": "boolean", "description": "Also apply it mirrored across the object's X = 0 (both brows, both cheeks)." },
                         "snap": { "type": "boolean", "description": "Move every point onto the nearest clay surface first (no guessing how deep the surface is)." },
-                    },
-                    "required": ["brush", "radius"],
+                    })),
+                    "description": "radius is required but for the transform brush.",
                 } },
             },
             "required": ["target", "strokes"],
         })),
         tool("paint", "Works in the rest pose: points in and out are rest-pose points, even while a clip plays. Paint color onto a Clay object, over its blob colors. Steps run in order: clear (remove all paint), fill (one color over the whole surface), strokes. \
             A stroke is a soft round brush: a single point or a path, painting surfaces within radius. Use it for eyes, lips, spots, stripes, clothing edges. \
-            Points are world space by default. Single-point dabs snap to the rest surface by default (snap:false opts out). mask:{blobs:[names],above:y,below:y} restricts a stroke to named blobs or local height, as sculpt does. Painted channels can drive metallic and roughness in smart layers. Paint stays in place in space. \
+            Points are world space by default. Single-point dabs snap to the rest surface by default (snap:false opts out). Strokes take the same falloff, pressure, spacing, kind (dots, spray), lazy, taper, symmetry and frame controls as sculpt strokes. mask:{blobs:[names],above:y,below:y} restricts a stroke to named blobs or local height, as sculpt does. Painted channels can drive metallic and roughness in smart layers. Paint stays in place in space. \
             With channel, the steps paint a named mask channel instead of color (white = 1; color is not needed): smart material layers read it with a painted mask term {source: painted, channel} (where blood, moss or wear go by hand). At most 4 channels per clay.", json!({
             "type": "object",
             "properties": {
                 "target": target.clone(),
                 "channel": { "type": "string", "description": "Paint this mask channel instead of color (see smart material layers)." },
+                "label": { "type": "string", "description": "A name for the color strokes' records (the paint layer's stroke ledger; see stroke_log layer paint)." },
+                "pressure_source": { "type": "string", "enum": ["touch_force", "nsevent", "velocity"], "description": "Where a UI stroke's pen pressure came from (kept on its records; the editor sends it)." },
+                "layer": { "type": "string", "description": "The paint layer: paint (default) or a paint layer made with sculpt_layer add {kind: paint}; layers lie over paint in order, each at its amount (opacity)." },
                 "space": { "type": "string", "enum": ["world", "local"] },
                 "clear": { "type": "boolean" },
                 "fill": color.clone(),
                 "fill_strength": { "type": "number", "minimum": 0, "maximum": 1 },
                 "strokes": { "type": "array", "maxItems": 64, "items": {
                     "type": "object",
-                    "properties": {
+                    "properties": with_controls(json!({
                         "point": vec3("A single dab."),
-                        "points": { "type": "array", "items": vec3("Path point.") },
                         "radius": { "type": "number" },
                         "color": color.clone(),
                         "strength": { "type": "number", "minimum": 0, "maximum": 1, "description": "Opacity, default 1." },
                         "hardness": { "type": "number", "minimum": 0, "maximum": 1, "description": "0 soft edge, 1 hard edge (default 0.5)." },
                         "erase": { "type": "boolean", "description": "Remove paint instead (color not needed)." },
-                        "mask": {"type":"object","properties":{"blobs":{"type":"array","items":{"type":"string"}},"above":{"type":"number"},"below":{"type":"number"}},"additionalProperties":false},
+                        "mask": stroke_mask.clone(),
+                        "alpha": alpha_schema.clone(),
                         "mirror": { "type": "boolean", "description": "Also paint mirrored across the object's X = 0." },
                         "snap": { "type": "boolean", "description": "Move every point onto the nearest clay surface first (no guessing how deep the surface is)." },
-                    },
+                    })),
                     "required": ["radius"],
                 } },
             },
@@ -1017,6 +1134,8 @@ fn tool_definitions() -> Value {
                 "baked": { "type": "boolean", "description": "Show baked game meshes (see bake) instead of clay, as a game would." },
                 "fine": { "type": "boolean", "description": "Show clay with a detail_cell at that fine size (pores, wrinkles) instead of the mesh resolution. Slower to build the first time." },
                 "weights": { "type": "string", "description": "A bone name: color its object by that bone's skin weights (blue none, green half, red full)." },
+                "lighting": { "description": "Lighting for this render only, as set_display lighting (default: the viewport's)." },
+                "ambient_occlusion": { "description": "Ambient occlusion for this render only, as set_display ambient_occlusion (default: the viewport's)." },
             },
         })),
         tool("compare_reference", "Line the model up with the reference image (same height on screen, centered) from one view, and measure how well the silhouettes overlap. Returns overlap (IoU, 1 = perfect), the regions that are missing or extra, a pixel_to_world mapping to turn image features into coordinates, and reference | model | overlap images.", json!({
@@ -1098,18 +1217,271 @@ fn tool_definitions() -> Value {
                 "clip": { "type": ["string", "null"], "description": "With target: the clip to play." },
             },
         })),
-        tool("render_animation", "Render one view at several frames of the playing clips, as a contact sheet in frame order, with one fixed camera. Off screen, as a background job (like render_film): a long one answers with a job id; job_status {id, wait: 45} fetches the sheet. clip picks the clip (else the playing ones). save_path also writes the PNG.", json!({
+        tool("render_animation", "Render one view at several frames of the playing clips, as a contact sheet in frame order, with one fixed camera. Off screen, as a background job (like render_film): a long one answers with a job id; job_status {id, wait: 45} fetches the sheet. clip picks the clip (else the playing ones). save_path also writes the PNG. format png_sequence or mp4 also writes every frame (a movie through ffmpeg).", json!({
             "type": "object",
             "properties": {
                 "view": view.clone(),
-                "frames": { "type": ["integer", "array"], "description": "How many frames spread over the clip (2..16, default 8), or a list of frames." },
-                "size": { "type": "integer", "minimum": 64, "maximum": 512, "description": "Pixels per tile (default 256)." },
+                "frames": { "type": ["integer", "array"], "description": "How many frames spread over the clip (2..16, default 8), or a list of frames. With format: up to 1200, default every whole frame of the clip; the sheet then shows 16 of them." },
+                "size": { "type": "integer", "minimum": 64, "maximum": 1024, "description": "Pixels per tile (default 256, at most 512); with format the frame size (default 512, at most 1024, made even)." },
+                "format": { "type": "string", "enum": ["png_sequence", "mp4"], "description": "Also write every frame: png_sequence = frame_00000.png .. in the folder path; mp4 = a movie at path (H.264 through an external ffmpeg from CLIDE_FFMPEG when set, else the PATH, /opt/homebrew/bin, /usr/local/bin or /usr/bin; without one the frames stay as a PNG sequence in <name>_frames next to it and the reply warns)." },
+                "path": { "type": "string", "description": "With format: an absolute folder (png_sequence, made if missing) or an absolute .mp4 path." },
+                "fps": { "type": "number", "minimum": 1, "maximum": 120, "description": "Movie frame rate (default the timeline's)." },
                 "show_bones": { "type": "boolean", "description": "Draw the skeleton on top." },
                 "clip": { "type": "string", "description": "Play this clip on every rig that has it for the render (the playing clip is restored after)." },
                 "save_path": { "type": "string", "description": "Absolute .png path to also save the sheet to." },
                 "center": vec3("Close-up center."),
                 "radius": { "type": "number" },
             },
+        })),
+        tool("stroke_log", "List a Clay object's stroke records, oldest first: each sculpt (layer base) or paint (layer paint) stroke, each mask or group action and stroke (layers mask and groups), regions records for detail regions a stroke's cell grew (Sculptris Pro: kind regions, the regions not the grid), and opaque records for grid changes made outside strokes (an older file's detail, a new detail_cell, a paint fill). \
+            A record has id, seq (its place), source (agent, ui, replay, import), tool, label, brush, radius, strength, dabs, bbox, enabled, factor, stale_context (the blobs or cell changed since it was made, so replaying it now gives another result), engine_stale (made by an older brush kernel) and stats {changed_points, bricks_touched, bbox, max_disp, mean_disp}. \
+            full: true adds the stroke as sent (spec, resend it through sculpt after editing) and as resolved (the object-space dabs it applies); pages of 20. layer reports head, in_sync and replay_verified (whether replaying the records on load gave the saved grid).", json!({
+            "type": "object",
+            "properties": {
+                "target": target.clone(),
+                "layer": { "type": "string", "description": "base (default), paint, mask, groups, a sculpt or paint layer's name (sculpt_layer list), or archived:NAME (a baked or merged layer's records, read only)." },
+                "from_seq": { "type": "integer", "minimum": 1 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+                "ids": { "type": "array", "items": { "type": "integer" }, "description": "Only these records." },
+                "full": { "type": "boolean" },
+            },
+            "required": ["target"],
+        })),
+        tool("stroke_edit", "Edit a Clay object's stroke records and replay the layer from the first one changed (from the nearest checkpoint, every 32 records): selective undo. Runs as a background job; one undo step. \
+            Actions: disable / enable / delete {ids}; replace {id, spec: a new stroke, in the call's space; its level and cell fill as in sculpt, and a stroke that would grow a detail region is refused: replace cannot grow them} (on a kind {curve: {closed}} stroke, the same spec with a control point moved is MoveCurve: stroke_log full gives the spec); move {ids, to_seq}; scale {ids, factor 0..2} (how much of each stroke applies); scale {last: true, factor} is Adjust Last: the newest stroke this session made, rescaled from its own before and after at once (stale after undo or any other change: then scale by id); \
+            rebase (replay every record with the current blobs and brush kernel and take the results as theirs: clears stale_context and engine_stale); replay {from_seq?} (a check: replay and report mismatched records; with none it installs the replayed grid, with some the clay keeps its own); squash {ids} (collapse records into one opaque record). Reply: replayed, from_seq, head, diff_stats of the layer, timing_ms.", json!({
+            "type": "object",
+            "properties": {
+                "target": target.clone(),
+                "layer": { "type": "string", "description": "Default base; paint, mask, groups or a layer's name (sculpt_layer list). mask and groups hold the mask and group tools' actions and strokes (replace takes mask_paint strokes on mask; group strokes are painted again instead). Records on a layer read the others: changing another layer's amount or strokes marks them stale_context, and rebase replays them against the layers as they are." },
+                "action": { "type": "string", "enum": ["disable", "enable", "delete", "replace", "move", "scale", "rebase", "replay", "squash"] },
+                "ids": { "type": "array", "items": { "type": "integer" } },
+                "id": { "type": "integer" },
+                "spec": { "type": "object", "description": "replace: the new stroke (as in sculpt or paint strokes)." },
+                "space": { "type": "string", "enum": ["world", "local"] },
+                "to_seq": { "type": "integer", "minimum": 1 },
+                "factor": { "type": "number", "minimum": 0, "maximum": 2 },
+                "last": { "type": "boolean", "description": "scale: Adjust Last." },
+                "from_seq": { "type": "integer", "minimum": 1 },
+            },
+            "required": ["target", "action"],
+        })),
+        tool("sculpt_diff", "Measure how a Clay object's base sculpt layer differs between two points of its ledger: from and to are a seq (the grid after that many records; 0 = none), {id: record} (after that record), \"blobs\" (no sculpting) or \"current\" (to's default); a seq or {id} is replayed as a background job. \
+            Reply: changed_points, max_disp, mean_disp, rms, volume_delta, area_changed, bbox and a histogram of the changes; region {center, radius} limits it.", json!({
+            "type": "object",
+            "properties": {
+                "target": target.clone(),
+                "from": { "description": "seq, {id}, \"blobs\", \"current\" or \"morph:NAME\" (that morph's grid of the layer)." },
+                "layer": { "type": "string", "description": "The sculpt layer measured: base (default) or a sculpt layer's name." },
+                "to": { "description": "Default current." },
+                "region": { "type": "object", "properties": { "center": vec3("Center."), "radius": { "type": "number" } } },
+                "histogram_bins": { "type": "integer", "minimum": 1, "maximum": 64 },
+                "space": { "type": "string", "enum": ["world", "local"] },
+            },
+            "required": ["target", "from"],
+        })),
+        tool("probe_clay", "Read a Clay object's field: at points (up to 256), along rays {origin, direction} or from a view (screen: {view: front|back|left|right|top|bottom, at: [[h, v], ..]}). \
+            Each probe: hit, point (the nearest surface point), distance (signed: + outside), inside, normal, curvature (mean, 1/radius, + on bumps), layer_offsets {base and each sculpt layer: millimetres it moves the surface there (a layer's at its amount)}, blob_owner (the blob that makes the surface there), mask (the sculpt mask there, 0..1), group (the polygroup id there, null for none) and group_visible. Works in the rest pose.", json!({
+            "type": "object",
+            "properties": {
+                "target": target.clone(),
+                "points": { "type": "array", "maxItems": 256, "items": vec3("Point.") },
+                "rays": { "type": "array", "items": { "type": "object", "properties": { "origin": vec3("Start."), "direction": vec3("Direction.") } } },
+                "screen": { "type": "object", "properties": { "view": { "type": "string", "enum": ["front", "back", "left", "right", "top", "bottom"] }, "at": { "type": "array", "items": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 } } } },
+                "space": { "type": "string", "enum": ["world", "local"] },
+            },
+            "required": ["target"],
+        })),
+        tool("history", "The undo history: one step per agent call (labelled like \"sculpt standard x3 on Head [agent]\") or continuous UI edit. \
+            list: steps {index, label, source, tools, time, mark, bytes, undone}, current (the snapshot the scene is), dropped (old steps removed by the cap of 300 steps and 2 GB of grid data). \
+            goto {index | mark}: undo or redo to the scene after that step (index = dropped is the scene before the first kept step). mark {index? (default current), name}: name a step (name null clears). label {index, name}. \
+            quicksave {enabled?, now?}: QuickSave writes a backup every 5 minutes while there are unsaved changes, keeping the last 10 in the app's backups folder (an app setting, not saved in the scene); now writes one at once.", json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["list", "goto", "mark", "label", "quicksave"] },
+                "index": { "type": "integer", "minimum": 0 },
+                "mark": { "type": "string" },
+                "name": { "type": ["string", "null"] },
+                "enabled": { "type": "boolean" },
+                "now": { "type": "boolean" },
+            },
+        })),
+        tool("brush_preset", "Brush presets and the human's current brush. \
+            Presets are a stroke's settings without its points (brush, strength, falloff, alpha, pattern, taper ...): 20 are built in (Standard, Clay, ClayBuildup, ClayTubes, DamStandard, TrimDynamic, hPolish, Inflate, Move, Pinch, Snakehook, Layer, Flatten, Planar, Smooth, SmoothPeaks, SmoothValleys, Pores, Wrinkles, Scales) and scenes save their own. \
+            list: every preset {name, builtin, brush, radius, strength, falloff, alpha, kind}. get {name}: its settings. save {name, spec: settings} or {name, from_record: {target, layer, id}} (a stroke's settings from stroke_log) saves one in the scene (an undo step; built-in names are taken). delete {name} removes a saved one. \
+            sculpt takes preset per call or per stroke; the stroke's own fields win and the record keeps the merged stroke. \
+            get_current: the editor's brush tools' brush {tool (the editor's active tool), brush, radius, strength, invert, color, symmetry, preset, falloff, alpha, pressure, lazy, velocity, tablet, group} (UI state: not saved and not an undo step). set_current merges the given fields: tool (sculpt, paint, mask or groups switches the editor to that tool), \
+            brush (a sculpt brush a drag can make: standard, clay, clay_buildup, clay_tubes, trim_dynamic, polish, add, carve, inflate, deflate, smooth, flatten, crease, pinch, layer, grab and snakehook (dragged across the view plane), vdm (stamps the alpha's VDM along the drag), mask_paint), preset (a preset's name, or null: the human's strokes go on top of it), radius (world units), strength, invert, color (the Paint tool's), symmetry ({axes: [x, y, z], radial} or null), falloff (as a stroke's, with focal_shift), alpha (a scene alpha's name, for dab brushes; a VDM stamp's for vdm), pressure (pressure curves {size, strength}), lazy (LazyMouse {radius, step (points), snap, backtrack} or null; the samples are smoothed, the request holds no lazy), velocity (pressure from pointer speed when no pen gives any), tablet (macOS tablet pen pressure monitor), group (the Groups tool's id). \
+            A human drag sends a sculpt (paint, mask or group) request with these settings: Shift smooths, Alt inverts, Ctrl paints the mask (Ctrl+Alt erases), Ctrl+Shift draws a mask lasso; it shows in get_scene ui_activity, with pressure_source when a pen pressed.", json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["list", "get", "save", "delete", "get_current", "set_current"] },
+                "name": { "type": "string", "description": "get, save, delete: the preset." },
+                "spec": { "type": "object", "description": "save: the settings (a sculpt stroke without points, frame or preset)." },
+                "from_record": { "type": "object", "description": "save: {target, layer (base or paint), id}: a record's stroke settings.", "properties": { "target": target.clone(), "layer": { "type": "string", "enum": ["base", "paint"] }, "id": { "type": "integer" } }, "required": ["target", "id"] },
+                "preset": { "type": ["string", "null"], "description": "set_current: a preset the human's strokes go on (null: none)." },
+                "tool": { "type": "string", "enum": ["sculpt", "paint", "mask", "groups"] },
+                "brush": { "type": "string", "enum": ["standard", "clay", "clay_buildup", "clay_tubes", "trim_dynamic", "polish", "add", "carve", "inflate", "deflate", "smooth", "flatten", "crease", "pinch", "layer", "grab", "snakehook", "vdm", "mask_paint"] },
+                "radius": { "type": "number", "exclusiveMinimum": 0 },
+                "strength": { "type": "number" },
+                "invert": { "type": "boolean" },
+                "color": color.clone(),
+                "symmetry": { "type": ["object", "null"], "description": "Stroke symmetry, as in sculpt strokes; null for none." },
+                "falloff": { "description": "set_current: the falloff, as a sculpt stroke's (preset, curve, focal_shift); null: the brush's own." },
+                "alpha": { "type": ["string", "null"], "description": "set_current: a scene alpha by name (dab brushes); null for none. It must be the brush's kind (a VDM stamp for vdm, an image for the others): a wrong one given is refused, and one kept from before a brush change of kind is dropped." },
+                "pressure": { "type": ["object", "null"], "description": "set_current: pressure curves {size, strength}, as a sculpt stroke's." },
+                "lazy": { "type": ["object", "null"], "description": "set_current: LazyMouse {radius (points, 0..200), step (points, 1..50, default 3), snap, backtrack}; null: off." },
+                "velocity": { "type": "boolean", "description": "set_current: pointer speed gives pressure when no pen does." },
+                "tablet": { "type": "boolean", "description": "set_current: the macOS tablet pen pressure monitor (window only)." },
+                "group": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "set_current: the polygroup the Groups tool paints." },
+            },
+            "required": ["action"],
+        })),
+        tool("mask", "Works in the rest pose. A Clay object's persistent sculpt mask: 0 free to 1 frozen on its surface; every sculpt and paint stroke moves each point by 1 - mask (see sculpt mask), and the transform brush moves what is unmasked. The viewport shows masked surface darker (set_display overlay). \
+            actions run in order, each a record on the mask ledger (stroke_log / stroke_edit layer mask): \
+            {paint: [strokes]} (mask_paint strokes, the same controls as sculpt strokes: strength is how far the mask rises, invert lowers it; MaskPen preset); \
+            {lasso: {view: front|back|left|right|top|bottom, at: [[h, v], ..] world units} or {camera: {view, proj, viewport}, px: [[x, y], ..]}, mode, through} and {rect: the same with from and to} (surface inside the outline as the camera sees it; through: false only takes surface facing the camera; the record stores the camera matrices, so resending it selects the same wherever the viewport went); \
+            \"invert\", \"clear\", \"all\"; {grow: cells}, {shrink: cells}, {blur: cells} (along the surface band; blur keeps the mask's sum), {sharpen: amount}; \
+            {by_cavity: {radius?}}, {by_curvature: {radius?}} (the smart materials' cavity and edge estimates), {by_normal: {dir, angle}}, {by_height: {axis x|y|z|[x,y,z], min, max}}, {by_blobs: {names}}, {by_groups: {ids}}, {connected: {seed_point}} (the surface joined to a point); \
+            selections take mode set (default), add or sub. {from_channel: name} and {to_channel: name} copy from and to a smart-material mask channel (paint channel). \
+            Reply: coverage (area-weighted share of the surface masked), bricks, bbox, records (one per action). Runs as a background job; one undo step.", json!({
+            "type": "object",
+            "properties": {
+                "target": target.clone(),
+                "space": { "type": "string", "enum": ["world", "local"], "description": "Space of points, directions and heights (default world)." },
+                "label": { "type": "string" },
+                "pressure_source": { "type": "string", "enum": ["touch_force", "nsevent", "velocity"], "description": "Where a UI stroke's pen pressure came from (kept on its records; the editor sends it)." },
+                "actions": { "type": "array", "minItems": 1, "maxItems": 64, "items": { "description": "An action name (\"invert\", \"clear\", \"all\") or an object with one action: {grow: 3}, {lasso: {..}}, {paint: [..]}.", "oneOf": [{ "type": "string", "enum": ["invert", "clear", "all", "sharpen"] }, { "type": "object", "minProperties": 1, "maxProperties": 1 }] } },
+            },
+            "required": ["target", "actions"],
+        })),
+        tool("group", "Works in the rest pose. A Clay object's polygroups: ids on its surface (spatial labels, so they survive remeshing; no group edges), each with a name and visibility. Brushes skip hidden groups and the viewport leaves them out; set_display overlay groups tints each. \
+            actions run in order, each a record on the group ledger (stroke_log / stroke_edit layer groups): \"from_blobs\" (one group per blob), {from_mask: {threshold 0..1 (0.5), id?}} (the masked surface becomes a group), {from_normals: {angle}} (regions whose normals stay within angle of where each began), {paint: {id, strokes}} (group_paint strokes: surface the brush covers at half weight takes id), {rename: {id, name}}, {show: {ids}}, {hide: {ids}}, {isolate: {ids}}, \"show_all\", \"clear\", \"list\". \
+            Reply: groups [{id, name, visible, area}], hidden. Runs as a background job (list alone answers at once).", json!({
+            "type": "object",
+            "properties": {
+                "target": target.clone(),
+                "space": { "type": "string", "enum": ["world", "local"] },
+                "label": { "type": "string" },
+                "pressure_source": { "type": "string", "enum": ["touch_force", "nsevent", "velocity"], "description": "Where a UI stroke's pen pressure came from (kept on its records; the editor sends it)." },
+                "actions": { "type": "array", "minItems": 1, "maxItems": 64, "items": { "oneOf": [{ "type": "string", "enum": ["from_blobs", "show_all", "clear", "list"] }, { "type": "object", "minProperties": 1, "maxProperties": 1 }] } },
+            },
+            "required": ["target", "actions"],
+        })),
+        tool("sculpt_layer", "Works in the rest pose. A Clay object's layers, bottom first: base (its own sculpt) and paint (its own paint), then up to 14 more, each a sculpt or paint layer with an amount, a switch and a stroke ledger of its own (stroke_log / stroke_edit layer NAME). \
+            The clay shows base + sum(amount x layer) over enabled sculpt layers, and paint layers laid over paint by coverage x amount; meshes, bakes, films and exports take the composite. A sculpt stroke on a layer reads every enabled layer and writes its own (stored divided by its amount, so amount 1 is what the brush did, 0 hides it, 2 doubles it). \
+            Actions: list; add {name, kind: sculpt|paint (default sculpt), amount (default 1)}; amount {name, amount: -2..2, paint layers 0..1}; enable / disable {name}; rename {name, to}; move {name, to: place above base and paint, 1 = lowest}; \
+            bake {name} (Bake Current: fold the layer into base, or paint, at its amount: the surface stays; its records are kept for reading as archived:NAME); merge_down {name} (fold into the layer below of its kind); delete {name}; \
+            split_by_mask {name (default base), to (default \"NAME masked\")} (the masked part of a sculpt layer moves to a new layer above it: needs a mask); record {name} (the sculpt layer sculpt calls without layer write, saved with the clay; null: base); select {name} (the editor's Sculpt and Paint tools stroke it: editor state, not an undo step). \
+            base and paint stay at amount 1. Layers, morphs, mask and groups share one grid budget in memory (grid_mb, max_grid_mb: 512 MB), and a clay with layers or morphs may save at most 1 GiB of grids (saved_mb, max_saved_mb), counting its ledgers' outside-edit grids and every morph again (a file does not share): about 3 morphs of a full-size sculpt (262,144 bricks save about 260 MB), fewer once its ledgers hold outside-edit grids (a detail_cell change records the whole grid; bake, blend and split_by_mask the bricks they changed). A call past either is refused and changes nothing. Reply: layers [{name, kind, amount, enabled, records, bricks, head, in_sync, stale_records, contributes}], record, selected, morphs, archived; amount answers composite_ms.", json!({
+            "type": "object",
+            "properties": {
+                "target": target.clone(),
+                "action": { "type": "string", "enum": ["list", "add", "select", "amount", "enable", "disable", "rename", "move", "bake", "merge_down", "delete", "split_by_mask", "record"] },
+                "name": { "type": ["string", "null"] },
+                "kind": { "type": "string", "enum": ["sculpt", "paint"] },
+                "amount": { "type": "number", "minimum": -2, "maximum": 2 },
+                "to": { "description": "rename and split_by_mask: the new name; move: the new place (1 = lowest above base and paint)." },
+            },
+            "required": ["target", "action"],
+        })),
+        tool("detail_level", "Works in the rest pose. A Clay object's detail levels (like subdivision levels): level 0 is its own detail cell, finer levels are finer cells (up to 8), coarse first. \
+            add: a cell finer than level 0 becomes a level and the active one. level (an index) or cell picks the active level (a cell not listed is added). With add and level both, level indexes the list after the add (coarse first, so the new cell may move the levels finer than it up one). With none of them it lists, changing nothing. \
+            sculpt strokes without level work at the active level: a stroke at level k writes level k and the coarser ones (above 0 it grows a detail region of that cell over itself first, Sculptris Pro) and carries the written layer's finer detail along (other sculpt layers keep theirs), so a coarse grab or inflate keeps the pores made at a finer level. \
+            The levels and the active one are saved with the clay. Adding a level is an edit (an undo step); picking the active one is selection-like and never an undo step (undo and redo keep it). Reply: levels [{level, cell, regions, active}], level, active_cell, step (the undo step an add made; null for a list or pick). D and Shift+D in the editor (with a brush tool, not during a stroke) go up and down a level.", json!({
+            "type": "object",
+            "properties": {
+                "target": target.clone(),
+                "level": { "type": "integer", "minimum": 0, "description": "Make this level active (0: the clay's own cell). With add, an index into the list after the add." },
+                "cell": { "type": "number", "description": "Make the level of this cell active, adding it when the clay has none." },
+                "add": { "type": "number", "description": "Add a level of this cell (finer than level 0) and make it active." },
+            },
+            "required": ["target"],
+        })),
+        tool("morph", "Works in the rest pose. A Clay object's morph targets: snapshots of its sculpt layers (base and every sculpt layer: grids, stroke ledgers, amounts, switches), shared rather than copied. \
+            store {name} (the sculpt as it is now; again replaces it); switch {name} (swap the clay's sculpt layers with the morph's: the clay shows it and the morph holds what was there, so switching again goes back); \
+            blend {name, weight 0..1} or {weights: {name: weight}} (move the sculpt toward morphs: each grid and amount to grid + weight x (morph - grid); recorded on the layers' ledgers as opaque records); delete {name}; list; diff {name}. \
+            Morphs need the same sculpt layers as when stored. In memory a morph shares its grids, but a file writes each morph's grids and ledgers again, and a clay with layers or morphs saves at most 1 GiB of grids (sculpt_layer list: saved_mb, max_saved_mb): about 3 morphs of a full-size sculpt (262,144 bricks save about 260 MB), fewer once its ledgers hold outside-edit grids (a detail_cell change records the whole grid; bake, blend and split_by_mask the bricks they changed). A store, switch or blend past that is refused and changes nothing; delete morphs, bake layers or squash records to make room. Reply: morphs [{name, layers, changed_points, max, mean, rms (how far the morph's surface is from the clay's, as field offset), blobs_changed}]. export_glb and export_fbx take morph:NAME blend shapes.", json!({
+            "type": "object",
+            "properties": {
+                "target": target.clone(),
+                "action": { "type": "string", "enum": ["store", "switch", "blend", "delete", "list", "diff"] },
+                "name": { "type": "string" },
+                "weight": { "type": "number", "minimum": 0, "maximum": 1 },
+                "weights": { "type": "object", "additionalProperties": { "type": "number", "minimum": 0, "maximum": 1 } },
+            },
+            "required": ["target", "action"],
+        })),
+        tool("alpha", "Works in the rest pose. The scene's alpha images (16-bit grayscale, at most 1024 pixels a side) for sculpt strokes' alpha. \
+            import {name, path}: a PNG (8 or 16 bit; color becomes luminance), JPEG or OpenEXR (channel Y, else R; values 0..1), at most 32 MiB, by absolute path; the same file gives the same hash. Importing a name again with other pixels rebinds it on every clay that used it: their records made with the old image report stale_context (stroke_edit rebase takes the new one). \
+            from_view {name, target, view: front|back|left|right|top|bottom, size (16-1024, default 256), center [h, v], extent}: a height map of a clay seen from that side (nearest surface white, misses black), framed on the clay unless center and extent (half the square, world units) say. \
+            create_vdm {name, target, center [x, y, z], radius, above?, below?, normal?, tangent?, cell?, space?}: a VDM stamp (Alpha 3D) captured from a clay as sculpted: the box radius across each way, from below (default radius / 2) under the surface to above (default 2 radius) over it (each at most 8 radii), standing on the surface at center (moved onto it along normal; normal defaults to the surface's there, tangent, the stamp's across, to X). It keeps what stands out of (or sinks into) the flat base plane, overhangs and all, as a sparse volume at cell (default the clay's detail cell, coarsened to at most 2M lattice points); brush vdm stamps it (sculpt). Reply adds vdm {base, normal, radius, above, below, cell, bricks} (the clay's own units). Its image (preview, list kind vdm) is its height seen from above. \
+            list: {name, kind (image or vdm), hash, w, h, used_by}. delete {name}: from the library (clays keep the images their strokes use, so those still replay). preview {name, size}: the image as a PNG.", json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["import", "from_view", "list", "delete", "preview", "create_vdm"] },
+                "name": { "type": "string" },
+                "path": { "type": "string", "description": "import: absolute path to a .png (8 or 16 bit), .jpg or .exr." },
+                "hash": { "type": "string", "description": "preview: by content hash instead of name." },
+                "target": target.clone(),
+                "view": { "type": "string", "enum": ["front", "back", "left", "right", "top", "bottom"] },
+                "size": { "type": "integer", "minimum": 16, "maximum": 1024 },
+                "center": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 3, "description": "from_view: [h, v] in the view; create_vdm: [x, y, z], the stamp's base point on the clay." },
+                "extent": { "type": "number", "exclusiveMinimum": 0 },
+                "radius": { "type": "number", "exclusiveMinimum": 0, "description": "create_vdm: half the stamp's width." },
+                "above": { "type": "number", "minimum": 0, "description": "create_vdm: how far over the surface it reaches (default 2 radius; at most 8 radii)." },
+                "below": { "type": "number", "minimum": 0, "description": "create_vdm: how far under the surface it reaches (default radius / 2; at most 8 radii)." },
+                "normal": vec3("create_vdm: the stamp's up (default the surface normal at center)."),
+                "tangent": vec3("create_vdm: the stamp's across (default X, laid on the surface)."),
+                "cell": { "type": "number", "exclusiveMinimum": 0, "description": "create_vdm: the lattice cell (default the clay's detail cell)." },
+                "space": { "type": "string", "enum": ["world", "local"], "description": "create_vdm: what center, radius, normal are given in (default world)." },
+            },
+            "required": ["action"],
+        })),
+        tool("import_mesh", "Import a triangle mesh file: .obj, .stl (binary or ASCII), .ply (ASCII or binary), .glb (every mesh at its node's placement, rest pose) or binary .fbx (Geometry nodes in meters by UnitScaleFactor; model transforms are not applied). At most 1 GiB and 4M triangles; malformed files are refused. \
+            as clay (default): a new clay with one mesh blob, the mesh decimated to at most 200k triangles for its distance field; a mesh that is not closed is read by its generalized winding number, so its holes close (close_holes false refuses it instead). Sculpt, paint, mask and layers work on it as on any clay; resolution sets its mesh. \
+            as mesh: a Mesh object drawing the file's triangles (smooth normals, the object's material); close_holes (default true) fills boundary loops with fans. to_clay turns it into clay later, kitbash part {object} inserts it. \
+            scale multiplies the file's units; up z turns a Z-up file to Y up; center moves its box center to the origin. Reply: object, triangles (the file's), triangles_kept, watertight, holes, holes_closed, bounds, warnings. File > Import… sends this call.", json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Absolute path to .obj, .stl, .ply, .glb or .fbx." },
+                "name": { "type": "string" },
+                "as": { "type": "string", "enum": ["clay", "mesh"] },
+                "scale": { "type": "number", "exclusiveMinimum": 0 },
+                "up": { "type": "string", "enum": ["y", "z"] },
+                "center": { "type": "boolean" },
+                "close_holes": { "type": "boolean" },
+                "resolution": { "type": "integer", "minimum": 16, "maximum": 512, "description": "as clay: its mesh resolution." },
+            },
+            "required": ["path"],
+        })),
+        tool("to_clay", "Works in the rest pose. Turn objects into clay, or combine them (Make PolyMesh3D, DynaMesh any mesh, Remesh All, booleans across objects). Primitives become analytic blobs (cube: box, sphere, cylinder and cone: lathe, torus; a plane a thin slab; sheared or unevenly scaled ones a mesh blob); clay, imported meshes and every other mesh become mesh blobs of their (composed rest) mesh, decimated to 200k triangles, open ones read by winding number. \
+            Without into the first target is converted in place (it keeps its id, name, placement, children; a clay keeps its blobs and sculpt) and the others are added to it with op: add, carve (cut away) or intersect (keep only the overlap); with into (a clay), every target goes into it with op. Targets other than the result are hidden. \
+            mode exact (default) keeps the blobs; mode volume remeshes the whole result at resolution into one closed mesh blob (DynaMesh: sculpt and layers folded in, paint and the old ledgers dropped), with blur (Gaussian, in cells, 0-4) and polish (curvature flow, 0-1) as sculpt offsets, volume kept. Ledgers settle first. \
+            Reply: object, mode, op, blobs, cell, hausdorff_est and hausdorff_cells (one target: the largest distance from its surface to the clay's), hidden, notes. Modify > Remesh as Clay… sends mode volume.", json!({
+            "type": "object",
+            "properties": {
+                "target": target.clone(), "targets": { "type": "array", "items": target.clone(), "maxItems": 64 },
+                "op": { "type": "string", "enum": ["add", "carve", "intersect"] },
+                "into": target.clone(),
+                "mode": { "type": "string", "enum": ["exact", "volume"] },
+                "resolution": { "type": "integer", "minimum": 16, "maximum": 512 },
+                "blur": { "type": "number", "minimum": 0, "maximum": 4 },
+                "polish": { "type": "number", "minimum": 0, "maximum": 1 },
+            },
+        })),
+        tool("export_print", "Works in the rest pose. Export solids for 3D printing: .stl (binary), .obj, .ply (binary) or .3mf, one welded mesh of the targets (default every visible solid; groups take what is under them) in millimeters (1 scene unit = 1 m unless size_mm), Y up turned to Z up and set on the plate (lowest point z = 0). \
+            size_mm {axis: x|y|z (scene axes), value}: scale so the model is that many millimeters along the axis. hollow {wall_mm} (clay only): hollowed inward to that wall. fine: clay with a detail_cell at its fine mesh. \
+            Reply: triangles, vertices, watertight (every edge used by exactly two triangles, in opposite directions), non_manifold_edges, inconsistent_edges, degenerate_dropped, volume_cm3, bbox_mm {min, max, size}, mm_per_unit. File > Export for Print… sends this call.", json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Absolute path ending in .stl, .obj, .ply or .3mf." },
+                "targets": { "type": "array", "items": target.clone() },
+                "size_mm": { "type": "object", "properties": { "axis": { "type": "string", "enum": ["x", "y", "z"] }, "value": { "type": "number", "exclusiveMinimum": 0 } }, "required": ["value"] },
+                "hollow": { "type": "object", "properties": { "wall_mm": { "type": "number", "exclusiveMinimum": 0 } }, "required": ["wall_mm"] },
+                "fine": { "type": "boolean" },
+            },
+            "required": ["path"],
         })),
         tool("undo", "Undo the last edit (agent or human).", empty.clone()),
         tool("redo", "Redo the last undone edit.", empty.clone()),
@@ -1124,6 +1496,8 @@ fn tool_definitions() -> Value {
                 "targets": { "type": "array", "items": target.clone(), "description": "Objects to export (default: the whole scene)." },
                 "animations": { "type": "boolean", "description": "Include clips (default true)." },
                 "lods": { "type": "boolean", "description": "Baked objects also get LOD1-LOD3 (about 1/2, 1/4, 1/8 of the triangles, same UVs, textures and skin) as MSFT_lod levels on the LOD0 node: engines that read MSFT_lod swap them by screen size; other readers show LOD0 only. The textures keep the finest detail at every level. Default false." },
+                "blend_shapes": { "type": "array", "maxItems": 32, "items": { "type": "string" }, "description": "Blend shapes (glTF morph targets, FBX BlendShape channels) on every exported clay that has them: layer:NAME (the exported mesh with that sculpt layer fully on; export with the layer off or at 0) or morph:NAME. Each rest vertex is moved onto the target surface (a few Newton steps), so vertex counts stay; a shape the vertices cannot follow (big pulls stretch the surface past them) is refused and its residual reported. Reply: blend_shapes [{object, name, residual, max_residual, vertices, refused?}]." },
+                "max_residual": { "type": "number", "exclusiveMinimum": 0, "description": "Refuse a blend shape farther than this from its target surface, in scene units (default half the clay's mesh cell)." },
             },
             "required": ["path"],
         })),
@@ -1136,6 +1510,8 @@ fn tool_definitions() -> Value {
                 "targets": { "type": "array", "items": target.clone(), "description": "Objects to export (default: the whole scene)." },
                 "animations": { "type": "boolean", "description": "Include clips (default true)." },
                 "lods": { "type": "boolean", "description": "Baked objects become a LodGroup (NAME or NAME_LODGroup) of NAME_LOD0..NAME_LOD3 (about 1, 1/2, 1/4, 1/8 of the triangles; each skinned to the same skeleton): Unreal and Maya read the LodGroup, Unity groups the _LODn names. Default false." },
+                "blend_shapes": { "type": "array", "maxItems": 32, "items": { "type": "string" }, "description": "Blend shapes (glTF morph targets, FBX BlendShape channels) on every exported clay that has them: layer:NAME (the exported mesh with that sculpt layer fully on; export with the layer off or at 0) or morph:NAME. Each rest vertex is moved onto the target surface (a few Newton steps), so vertex counts stay; a shape the vertices cannot follow (big pulls stretch the surface past them) is refused and its residual reported. Reply: blend_shapes [{object, name, residual, max_residual, vertices, refused?}]." },
+                "max_residual": { "type": "number", "exclusiveMinimum": 0, "description": "Refuse a blend shape farther than this from its target surface, in scene units (default half the clay's mesh cell)." },
             },
             "required": ["path"],
         })),
@@ -1166,6 +1542,6 @@ mod tests {
         assert!(dispatch(&notif, &tx, &ctx).is_none());
         let list = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
         let tools = dispatch(&list, &tx, &ctx).unwrap()["result"]["tools"].as_array().unwrap().len();
-        assert_eq!(tools, 56);
+        assert_eq!(tools, 72);
     }
 }

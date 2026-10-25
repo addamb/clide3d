@@ -180,7 +180,7 @@ fn parts_ride_bones_and_export_under_the_joint() {
     let on_plate = kitbash(&mut scene, &mut meshes, &json!({ "part": "light", "target": "Plate", "at": [0.0, 1.5, 0.4] })).unwrap();
     assert_eq!(on_plate["attached"][0]["bone"], "top", "{on_plate}");
     meshes.sync(&scene);
-    let opts = crate::gltf::Options { roots: vec![], animations: true, fps: 24.0, file_stem: String::new(), lods: false, atlas: true, texel_density: None };
+    let opts = crate::gltf::Options { roots: vec![], animations: true, fps: 24.0, file_stem: String::new(), lods: false, atlas: true, texel_density: None, gpu_instancing: false, blend_shapes: Vec::new() };
     let out = crate::gltf::export(&scene, &meshes, &opts).unwrap();
     let doc = glb_json(&out.bytes);
     let nodes = doc["nodes"].as_array().unwrap();

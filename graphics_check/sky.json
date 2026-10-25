@@ -1,0 +1,96 @@
+{
+  "bake_ms": 45.550708,
+  "camera": {
+    "eye": [
+      1.7999999523162842,
+      1.100000023841858,
+      5.199999809265137
+    ],
+    "fov": 35.0,
+    "target": [
+      -0.30000001192092896,
+      0.8999999761581421,
+      0.0
+    ]
+  },
+  "render_film": {
+    "background": "environment",
+    "device": "auto",
+    "floor": false,
+    "lights": "none"
+  },
+  "size": [
+    480,
+    360
+  ],
+  "sky_before_after": {
+    "after": {
+      "preset": "physical",
+      "sun_azimuth": 45.0,
+      "sun_elevation": 16.899999618530273
+    },
+    "before": "golden_hour",
+    "samples": 128
+  },
+  "sky_elevation_sheet": {
+    "environments": [
+      {
+        "preset": "physical",
+        "sun_azimuth": 45.0,
+        "sun_elevation": 90.0
+      },
+      {
+        "preset": "physical",
+        "sun_azimuth": 45.0,
+        "sun_elevation": 60.0
+      },
+      {
+        "preset": "physical",
+        "sun_azimuth": 45.0,
+        "sun_elevation": 30.0
+      },
+      {
+        "preset": "physical",
+        "sun_azimuth": 45.0,
+        "sun_elevation": 10.0
+      },
+      {
+        "preset": "physical",
+        "sun_azimuth": 45.0,
+        "sun_elevation": 3.0
+      },
+      {
+        "preset": "physical",
+        "sun_azimuth": 45.0,
+        "sun_elevation": 0.0
+      }
+    ],
+    "rows": "left to right, top to bottom",
+    "samples": 64,
+    "size": [
+      240,
+      180
+    ]
+  },
+  "sky_viewport": {
+    "environments": [
+      "sky_noon",
+      "sky_afternoon",
+      "sky_golden",
+      "sky_sunset"
+    ],
+    "layout": "viewport | render_film pairs, two pairs per row",
+    "samples": 64,
+    "size": [
+      240,
+      180
+    ],
+    "viewport": {
+      "ambient_occlusion": true,
+      "lighting": {
+        "lights": "none"
+      },
+      "post": "default"
+    }
+  }
+}

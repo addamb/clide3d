@@ -97,7 +97,7 @@ pub fn crypt() -> Scene {
         let id = s.add(Shape::Scatter);
         let o = s.get_mut(id).unwrap();
         o.name = name.into();
-        o.scatter = Some(Scatter { sources: src, instances: placed.instances, settings: set });
+        o.scatter = Some(Scatter { sources: src, instances: placed.instances, settings: set, placed_by: None });
     };
     let clear = vec![[0.3, 0.9, 1.2], [0.0, -3.0, 1.0], [-1.8, -1.2, 0.5], [1.8, -1.2, 0.5]];
     scatter(&mut s, "rocks", vec![rock_a, rock_b], Settings { size: Some([7.4, 7.4]), density: 1.6, min_distance: 0.28, scale: [0.5, 1.4], align: 0.6, sink: 0.02, avoid: clear.clone(), seed: 1, ..Settings::default() });

@@ -1,0 +1,188 @@
+{
+  "instanced": {
+    "builds": {
+      "fine": 3,
+      "regular": 3,
+      "shared": 24
+    },
+    "fine_build_s": 0.4779248535633087,
+    "fine_film": {
+      "device": {
+        "fallback_reason": null,
+        "gpu": "Apple M2 Max (Metal)",
+        "used": "gpu"
+      },
+      "distinct_meshes": 3,
+      "gpu_buffers_mb": {
+        "picture sums": 3.5,
+        "ray tree nodes": 203.5,
+        "triangle data": 187.5,
+        "triangles": 562.4,
+        "vertices": 36.9
+      },
+      "ray_tree_s": 2.8634254932403564,
+      "render_s": 0.698128879070282,
+      "samples": 16,
+      "triangles_traced": 12286404,
+      "unique_triangles": 877552
+    },
+    "regular_build_s": 0.2272099256515503,
+    "regular_export": {
+      "fbx_geometries": 3,
+      "fbx_mb": 23.9,
+      "fbx_s": 0.024938249960541725,
+      "glb_ext_instanced_nodes": 18,
+      "glb_ext_instancing_mb": 14.2,
+      "glb_mb": 14.2,
+      "glb_meshes": 3,
+      "glb_nodes_sharing_a_mesh": 510,
+      "glb_s": 0.010935666970908642
+    },
+    "regular_film": {
+      "device": {
+        "fallback_reason": null,
+        "gpu": "Apple M2 Max (Metal)",
+        "used": "gpu"
+      },
+      "distinct_meshes": 3,
+      "gpu_buffers_mb": {
+        "picture sums": 3.5,
+        "ray tree nodes": 96.7,
+        "triangle data": 88.8,
+        "triangles": 266.4,
+        "vertices": 18.6
+      },
+      "ray_tree_s": 1.3105919361114502,
+      "render_s": 0.3337300717830658,
+      "samples": 16,
+      "triangles_traced": 5819076,
+      "unique_triangles": 425596
+    }
+  },
+  "scene": {
+    "detail_cell": 0.02,
+    "floors": 48,
+    "posts": 40,
+    "towers": 9
+  },
+  "separate": {
+    "builds": {
+      "fine": 9,
+      "regular": 9,
+      "shared": 0
+    },
+    "fine_build_s": 16.845455169677734,
+    "fine_film": {
+      "device": {
+        "fallback_reason": null,
+        "gpu": "Apple M2 Max (Metal)",
+        "used": "gpu"
+      },
+      "distinct_meshes": 9,
+      "gpu_buffers_mb": {
+        "picture sums": 3.5,
+        "ray tree nodes": 176.4,
+        "triangle data": 164.6,
+        "triangles": 493.8,
+        "vertices": 535.6
+      },
+      "ray_tree_s": 2.603349208831787,
+      "render_s": 1.2921500205993652,
+      "samples": 16,
+      "triangles_traced": 10786932,
+      "unique_triangles": 10786932
+    },
+    "regular_build_s": 8.904348373413086,
+    "regular_export": {
+      "fbx_geometries": 9,
+      "fbx_mb": 337.3,
+      "fbx_s": 0.3148811161518097,
+      "glb_ext_instanced_nodes": 0,
+      "glb_ext_instancing_mb": 198.1,
+      "glb_mb": 198.1,
+      "glb_meshes": 9,
+      "glb_nodes_sharing_a_mesh": 0,
+      "glb_s": 0.13281607627868652
+    },
+    "regular_film": {
+      "device": {
+        "fallback_reason": null,
+        "gpu": "Apple M2 Max (Metal)",
+        "used": "gpu"
+      },
+      "distinct_meshes": 9,
+      "gpu_buffers_mb": {
+        "picture sums": 3.5,
+        "ray tree nodes": 84.8,
+        "triangle data": 78.5,
+        "triangles": 235.5,
+        "vertices": 278.4
+      },
+      "ray_tree_s": 1.1882168054580688,
+      "render_s": 0.444256991147995,
+      "samples": 16,
+      "triangles_traced": 5144184,
+      "unique_triangles": 5144184
+    }
+  },
+  "shared": {
+    "builds": {
+      "fine": 1,
+      "regular": 1,
+      "shared": 8
+    },
+    "fine_build_s": 1.8589091300964355,
+    "fine_film": {
+      "device": {
+        "fallback_reason": null,
+        "gpu": "Apple M2 Max (Metal)",
+        "used": "gpu"
+      },
+      "distinct_meshes": 1,
+      "gpu_buffers_mb": {
+        "picture sums": 3.5,
+        "ray tree nodes": 176.4,
+        "triangle data": 164.6,
+        "triangles": 493.8,
+        "vertices": 59.5
+      },
+      "ray_tree_s": 2.4691543579101562,
+      "render_s": 0.4623566269874573,
+      "samples": 16,
+      "triangles_traced": 10786932,
+      "unique_triangles": 1198548
+    },
+    "regular_build_s": 0.9438905715942383,
+    "regular_export": {
+      "fbx_geometries": 1,
+      "fbx_mb": 37.5,
+      "fbx_s": 0.03495053946971893,
+      "glb_ext_instanced_nodes": 0,
+      "glb_ext_instancing_mb": 22.0,
+      "glb_mb": 22.0,
+      "glb_meshes": 1,
+      "glb_nodes_sharing_a_mesh": 8,
+      "glb_s": 0.014800000004470348
+    },
+    "regular_film": {
+      "device": {
+        "fallback_reason": null,
+        "gpu": "Apple M2 Max (Metal)",
+        "used": "gpu"
+      },
+      "distinct_meshes": 1,
+      "gpu_buffers_mb": {
+        "picture sums": 3.5,
+        "ray tree nodes": 84.8,
+        "triangle data": 78.5,
+        "triangles": 235.5,
+        "vertices": 30.9
+      },
+      "ray_tree_s": 1.1536846160888672,
+      "render_s": 0.34312868118286133,
+      "samples": 16,
+      "triangles_traced": 5144184,
+      "unique_triangles": 571576
+    }
+  }
+}

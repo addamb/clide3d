@@ -279,7 +279,7 @@ fn elf_cloth_film_check() {
         animations: true,
         fps: 24.0,
         file_stem: "elf_cloth".into(),
-        lods: false, atlas: true, texel_density: None,
+        lods: false, atlas: true, texel_density: None, gpu_instancing: false, blend_shapes: Vec::new(),
     };
     let exported = crate::gltf::export(&scene, &lib, &options).unwrap();
     std::fs::write(out.join("elf_cloth.glb"), &exported.bytes).unwrap();
@@ -356,7 +356,7 @@ fn elf_cloth_film_check() {
         animations: true,
         fps: 24.0,
         file_stem: "elf_cloth_game".into(),
-        lods: false, atlas: true, texel_density: None,
+        lods: false, atlas: true, texel_density: None, gpu_instancing: false, blend_shapes: Vec::new(),
     };
     let game_glb = crate::gltf::export(&game, &game_lib, &options).unwrap();
     std::fs::write(out.join("elf_cloth_game.glb"), &game_glb.bytes).unwrap();

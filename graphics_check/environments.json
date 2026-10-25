@@ -1,0 +1,165 @@
+{
+  "camera": {
+    "eye": [
+      3.200000047683716,
+      2.5999999046325684,
+      4.400000095367432
+    ],
+    "fov": 35.0,
+    "target": [
+      0.0,
+      0.5,
+      -0.20000000298023224
+    ]
+  },
+  "layout": "rows of viewport | render_film pairs, two pairs per row, in this order",
+  "tiles": [
+    {
+      "environment": "studio",
+      "render_film": {
+        "environment": "studio",
+        "floor": false,
+        "samples": 64,
+        "size": [
+          240,
+          180
+        ]
+      },
+      "viewport": {
+        "set_display": {
+          "ambient_occlusion": true,
+          "lighting": {
+            "environment": "studio"
+          },
+          "post": {}
+        }
+      }
+    },
+    {
+      "environment": "overcast",
+      "render_film": {
+        "environment": "overcast",
+        "floor": false,
+        "samples": 64,
+        "size": [
+          240,
+          180
+        ]
+      },
+      "viewport": {
+        "set_display": {
+          "ambient_occlusion": true,
+          "lighting": {
+            "environment": "overcast"
+          },
+          "post": {}
+        }
+      }
+    },
+    {
+      "environment": "sunset",
+      "render_film": {
+        "environment": "sunset",
+        "floor": false,
+        "samples": 64,
+        "size": [
+          240,
+          180
+        ]
+      },
+      "viewport": {
+        "set_display": {
+          "ambient_occlusion": true,
+          "lighting": {
+            "environment": "sunset"
+          },
+          "post": {}
+        }
+      }
+    },
+    {
+      "environment": "golden_hour",
+      "render_film": {
+        "environment": "golden_hour",
+        "floor": false,
+        "samples": 64,
+        "size": [
+          240,
+          180
+        ]
+      },
+      "viewport": {
+        "set_display": {
+          "ambient_occlusion": true,
+          "lighting": {
+            "environment": "golden_hour"
+          },
+          "post": {}
+        }
+      }
+    },
+    {
+      "environment": "forest",
+      "render_film": {
+        "environment": "forest",
+        "floor": false,
+        "samples": 64,
+        "size": [
+          240,
+          180
+        ]
+      },
+      "viewport": {
+        "set_display": {
+          "ambient_occlusion": true,
+          "lighting": {
+            "environment": "forest"
+          },
+          "post": {}
+        }
+      }
+    },
+    {
+      "environment": "night",
+      "render_film": {
+        "environment": "night",
+        "floor": false,
+        "samples": 64,
+        "size": [
+          240,
+          180
+        ]
+      },
+      "viewport": {
+        "set_display": {
+          "ambient_occlusion": true,
+          "lighting": {
+            "environment": "night"
+          },
+          "post": {}
+        }
+      }
+    },
+    {
+      "environment": "storm",
+      "render_film": {
+        "environment": "storm",
+        "floor": false,
+        "samples": 64,
+        "size": [
+          240,
+          180
+        ]
+      },
+      "viewport": {
+        "set_display": {
+          "ambient_occlusion": true,
+          "lighting": {
+            "environment": "storm"
+          },
+          "post": {}
+        }
+      }
+    }
+  ]
+}

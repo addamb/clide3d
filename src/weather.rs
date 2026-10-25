@@ -104,11 +104,17 @@ pub(crate) fn clay_wear_maps(mesh: &Mesh, field: &crate::clay::Field, width: f32
             let center = d(p);
             let laplacian: f32 = [Vec3::X, Vec3::Y, Vec3::Z].iter()
                 .map(|axis| (d(p + *axis * radius) - center) + (d(p - *axis * radius) - center)).sum();
-            let bend = laplacian / radius;
-            *value = [smooth01((bend - 0.015) / 0.6), smooth01((-bend - 0.015) / 0.4)];
+            *value = wear_of(laplacian / radius);
         }
     });
     out
+}
+
+/// Edge and cavity wear (0..1) from a surface's bend: the field's
+/// Laplacian over a footprint, per unit footprint (positive on ridges).
+/// The sculpt mask's by_cavity and by_curvature read it too.
+pub(crate) fn wear_of(bend: f32) -> Wear {
+    [smooth01((bend - 0.015) / 0.6), smooth01((-bend - 0.015) / 0.4)]
 }
 
 /// `color` (sRGB) and `rough` at surface point `p` (normal `n`) after

@@ -33,10 +33,18 @@ pub enum Action {
     GridSnapHold,
     /// Held: the manipulator moves the pivot instead of the object.
     PivotHold,
+    /// With a brush tool: the lead clay's next finer / coarser detail
+    /// level (`detail_level`). With a brush tool these win over a hold
+    /// on the same key (D is also Edit Pivot, which brushes do not use).
+    LevelFiner,
+    LevelCoarser,
+    /// With a brush tool: X symmetry on or off (wins over Snap to Grid's X,
+    /// which brushes do not use).
+    SymmetryX,
 }
 
 impl Action {
-    pub const ALL: [Action; 19] = [
+    pub const ALL: [Action; 22] = [
         Action::SelectTool,
         Action::MoveTool,
         Action::RotateTool,
@@ -56,6 +64,9 @@ impl Action {
         Action::PlayToggle,
         Action::GridSnapHold,
         Action::PivotHold,
+        Action::LevelFiner,
+        Action::LevelCoarser,
+        Action::SymmetryX,
     ];
 
     pub fn label(self) -> &'static str {
@@ -79,6 +90,9 @@ impl Action {
             Action::PlayToggle => "Play / Stop",
             Action::GridSnapHold => "Snap to Grid (hold)",
             Action::PivotHold => "Edit Pivot (hold)",
+            Action::LevelFiner => "Finer Detail Level (brush tools)",
+            Action::LevelCoarser => "Coarser Detail Level (brush tools)",
+            Action::SymmetryX => "X Symmetry (brush tools)",
         }
     }
 
@@ -198,11 +212,26 @@ impl Default for Hotkeys {
             (Action::PlayToggle, alt(Key::V)),
             (Action::GridSnapHold, Binding::plain(Key::X)),
             (Action::PivotHold, Binding::plain(Key::D)),
+            (Action::LevelFiner, Binding::plain(Key::D)),
+            (Action::LevelCoarser, shift(Key::D)),
+            (Action::SymmetryX, Binding::plain(Key::X)),
         ]))
     }
 }
 
 impl Hotkeys {
+    /// Saved bindings with the default keys of actions added since they
+    /// were saved; `known` lists the actions they already covered, so an
+    /// action the user cleared stays cleared.
+    pub fn with_new_defaults(mut self, known: &[Action]) -> Hotkeys {
+        for (a, b) in Hotkeys::default().0 {
+            if !known.contains(&a) {
+                self.0.entry(a).or_insert(b);
+            }
+        }
+        self
+    }
+
     pub fn get(&self, action: Action) -> Option<Binding> {
         self.0.get(&action).copied()
     }
@@ -344,6 +373,24 @@ mod tests {
         assert!(g.matches(Key::G, ctrl));
         assert!(!g.matches(Key::G, Modifiers::NONE));
         assert!(!Binding::plain(Key::P).matches(Key::P, Modifiers::SHIFT));
+    }
+
+    /// Bindings saved before an action existed get its default key; one
+    /// the user cleared (known when saved) stays cleared.
+    #[test]
+    fn new_actions_get_their_default_keys() {
+        let mut saved = Hotkeys::default();
+        saved.0.remove(&Action::LevelFiner);
+        saved.0.remove(&Action::LevelCoarser);
+        saved.0.remove(&Action::Group);
+        let old: Vec<Action> = Action::ALL.into_iter().filter(|a| !matches!(a, Action::LevelFiner | Action::LevelCoarser | Action::SymmetryX)).collect();
+        let h = saved.with_new_defaults(&old);
+        assert_eq!(h.get(Action::LevelFiner), Some(Binding::plain(Key::D)));
+        assert_eq!(h.get(Action::LevelCoarser), Some(Binding { shift: true, ..Binding::plain(Key::D) }));
+        assert_eq!(h.get(Action::Group), None);
+        let mut cleared = h.clone();
+        cleared.0.remove(&Action::LevelFiner);
+        assert_eq!(cleared.with_new_defaults(&Action::ALL).get(Action::LevelFiner), None);
     }
 
     #[test]

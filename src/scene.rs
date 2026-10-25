@@ -47,6 +47,9 @@ pub enum Shape {
     Scatter,
     /// A kitbash part (bolt, vent, piston...), from `Object::part` (see `kitbash`).
     Part,
+    /// An imported triangle mesh, from `Object::mesh` (see `mesh_asset.rs`;
+    /// `import_mesh`, `to_clay` turns it into clay).
+    Mesh,
 }
 
 impl Shape {
@@ -78,6 +81,7 @@ impl Shape {
             Shape::Terrain => "Terrain",
             Shape::Scatter => "Scatter",
             Shape::Part => "Part",
+            Shape::Mesh => "Mesh",
         }
     }
 
@@ -87,7 +91,7 @@ impl Shape {
 
     /// Shapes whose mesh is built for the object itself (not a shared primitive).
     pub fn own_mesh(self) -> bool {
-        matches!(self, Shape::Clay | Shape::Eye | Shape::Hair | Shape::Cloth | Shape::Fire | Shape::Kit | Shape::Terrain | Shape::Part)
+        matches!(self, Shape::Clay | Shape::Eye | Shape::Hair | Shape::Cloth | Shape::Fire | Shape::Kit | Shape::Terrain | Shape::Part | Shape::Mesh)
     }
 }
 
@@ -171,6 +175,9 @@ pub struct Object {
     /// (shape, materials, attached parts) until unlinked (see `pose.rs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<crate::pose::Link>,
+    /// The triangles of a `Shape::Mesh` (an import).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<crate::mesh_asset::MeshAsset>,
 }
 
 impl Object {
@@ -212,11 +219,21 @@ const MAX_ID: u64 = 1 << 52;
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Scene {
+    /// Read within one inflate budget for all their grids.
+    #[serde(deserialize_with = "crate::clay::in_inflate_budget")]
     pub objects: Vec<Object>,
     pub next_id: u64,
     /// Materials defined for this scene; they override presets of the same name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub materials: Vec<Material>,
+    /// Alpha images for sculpt strokes, by name (`alpha import`); clays keep
+    /// copies of the ones their strokes use (see `brush::alpha`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty", deserialize_with = "crate::brush::alpha::library")]
+    pub alphas: std::collections::BTreeMap<String, crate::brush::alpha::Alpha>,
+    /// Brush presets saved in the scene (`brush_preset save`); the built-in
+    /// ones are compiled in (see `brush::preset`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty", deserialize_with = "crate::brush::preset::library")]
+    pub brushes: std::collections::BTreeMap<String, crate::brush::preset::Preset>,
     /// Time-slider frame that bone-attached objects follow (None = rest).
     /// Display state only: not saved and not compared, so it is never an edit.
     #[serde(skip)]
@@ -225,7 +242,7 @@ pub struct Scene {
 
 impl PartialEq for Scene {
     fn eq(&self, other: &Self) -> bool {
-        self.objects == other.objects && self.next_id == other.next_id && self.materials == other.materials
+        self.objects == other.objects && self.next_id == other.next_id && self.materials == other.materials && self.alphas == other.alphas && self.brushes == other.brushes
     }
 }
 
@@ -244,6 +261,7 @@ impl Scene {
             Shape::Terrain => self.unique_name("terrain"),
             Shape::Scatter => self.unique_name("scatter"),
             Shape::Part => self.unique_name("part"),
+            Shape::Mesh => self.unique_name("mesh"),
             _ => self.unique_name(&format!("p{}", shape.label())),
         };
         // Lift solids so they sit on the grid; a plane lies flat on it.
@@ -281,6 +299,7 @@ impl Scene {
             kitbash: None,
             follow: None,
             link: None,
+            mesh: None,
         });
         id
     }

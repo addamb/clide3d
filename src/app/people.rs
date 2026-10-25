@@ -113,6 +113,8 @@ impl ClideApp {
         let human = parse_human(current, args.get("human"))?;
         let human = parse_human(human, skin_patch(args).as_ref())?;
         let body = human.build()?;
+        let family: Vec<u64> = std::iter::once(body_id).chain(self.scene.descendants(body_id)).collect();
+        self.settle_clays(family)?;
         let mut touched = Vec::new();
         for oid in std::iter::once(body_id).chain(self.scene.descendants(body_id)) {
             let Some(o) = self.scene.get_mut(oid) else { continue };
@@ -241,8 +243,13 @@ impl ClideApp {
         let strength = args["strength"].as_f64().unwrap_or(1.0).clamp(0.0, 3.0) as f32;
         let cell = args["detail_cell"].as_f64().unwrap_or(0.00025) as f32;
         let mut clay = before.clone();
-        let note = if clay.detail.is_none() {
-            clay.set_detail_cell(cell)?;
+        // The new grid is made on the job, after any unchecked ledger
+        // settles against the head as it is (checked here).
+        let fresh = clay.detail.is_none();
+        let note = if fresh {
+            if !cell.is_finite() || cell < crate::clay::MIN_DETAIL_CELL {
+                return Err(format!("detail_cell must be at least {}", crate::clay::MIN_DETAIL_CELL));
+            }
             format!("detail_cell {cell}")
         } else {
             format!("the head already has sculpt detail at {:.5}; folds use that grid", clay.detail.as_ref().map_or(0.0, |d| d.voxel()))
@@ -250,7 +257,12 @@ impl ClideApp {
         let (lo, hi) = (shape.head_lo, shape.head_hi);
         let depth = face.lines.iter().map(|l| l.depth).fold(0.0f32, f32::max) * 2.0 * strength + 1e-5;
         let label = format!("Face detail on {head_name}");
+        let cache = self.replay_cache.clone();
         Ok(super::jobs::Started::Job(label, Box::new(move |progress| {
+            crate::ledger::settle_clay(&mut clay, Some(&cache))?;
+            if fresh {
+                clay.set_detail_cell(cell)?;
+            }
             progress.stage("sculpting folds", 0.1);
             let report = crate::sculpt::displace(&mut clay, lo, hi, depth, &|c, side| face.near_folds(c, side), &|p| {
                 let h = face.fold_height(p) * strength;
@@ -263,6 +275,9 @@ impl ClideApp {
                     return Err("the head changed while sculpting; nothing was applied, run face_detail again".into());
                 }
                 let bricks = clay.detail.as_ref().map(|d| d.grid().brick_count());
+                // The folds are an outside edit of the base layer's ledger.
+                let mut clay = clay;
+                crate::layers::sync_within_budget(&mut clay)?;
                 o.clay = Some(clay);
                 Ok(super::tools::text(json!({
                     "target": head_name,

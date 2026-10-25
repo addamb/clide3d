@@ -16,6 +16,8 @@ pub struct Look {
     pub camera: CameraOptions,
     /// Where to trace: the GPU when it can (auto), or only one of them.
     pub device: Device,
+    /// How the grain is removed (when the render denoises at all).
+    pub denoiser: Denoiser,
     bloom: f32,
     pub post: super::post::Post,
     bloom_threshold: f32,
@@ -70,11 +72,17 @@ enum ToneMap { Aces, Agx, Filmic }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Device { Auto, Gpu, Cpu }
 
+/// `Variance`: guided by each pixel's measured noise (the default);
+/// `Classic`: the filter before it, whose strength follows only the
+/// sample count.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Denoiser { Variance, Classic }
+
 impl Default for Look {
     fn default() -> Self {
         Self { environment: Arc::new(Environment::preset("studio").unwrap()),
             lights: super::LIGHTS.into_iter().map(|(direction, size, power)| Light::Sun { direction: direction.normalize(), size, power }).collect(),
-            background: false, fog: None, volumes: Vec::new(), camera: CameraOptions::default(), device: Device::Auto, post: super::post::Post::default(), bloom: 0.0, bloom_threshold: 1.0,
+            background: false, fog: None, volumes: Vec::new(), camera: CameraOptions::default(), device: Device::Auto, denoiser: Denoiser::Variance, post: super::post::Post::default(), bloom: 0.0, bloom_threshold: 1.0,
             vignette: 0.0, balance: Vec3::ONE, tonemap: ToneMap::Aces }
     }
 }
@@ -111,6 +119,12 @@ impl Look {
             Some("cpu") => Device::Cpu,
             _ => return Err("device must be auto, gpu or cpu".into()),
         };
+        look.denoiser = match args["denoiser"].as_str() {
+            None if args["denoiser"].is_null() => Denoiser::Variance,
+            Some("variance") => Denoiser::Variance,
+            Some("classic") => Denoiser::Classic,
+            _ => return Err("denoiser must be variance or classic".into()),
+        };
         look.post = super::post::Post::parse(args)?;
         look.bloom = match &args["bloom"] {
             Value::Bool(true) => 0.08,
@@ -141,6 +155,27 @@ impl Look {
             _ => return Err("tonemap must be aces, agx or filmic".into()),
         };
         Ok(look)
+    }
+
+    /// The finishing the viewport can preview live (`render::post`):
+    /// exposure, white balance, bloom, vignette, tonemap and grade. Lens
+    /// optics, streaks, dirt, grain and sharpening stay film-only.
+    pub fn view_look(&self) -> crate::render::post::ViewLook {
+        use crate::render::post::{Tone, ViewLook};
+        ViewLook {
+            enabled: true,
+            exposure: self.camera.exposure,
+            balance: self.balance,
+            tone: match self.tonemap {
+                ToneMap::Aces => Tone::Aces,
+                ToneMap::Agx => Tone::Agx,
+                ToneMap::Filmic => Tone::Filmic,
+            },
+            bloom: self.bloom,
+            bloom_threshold: self.bloom_threshold,
+            vignette: self.vignette,
+            grade: self.post.grade_params(),
+        }
     }
 
     pub fn finish(&self, mut color: Vec<Vec3>, w: usize, h: usize, exposure: f32) -> Vec<[u8; 3]> {

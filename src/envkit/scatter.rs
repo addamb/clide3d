@@ -40,6 +40,53 @@ pub struct Scatter {
     /// The settings the instances were placed with.
     #[serde(default)]
     pub settings: Settings,
+    /// What placed the instances when not `settings`: "array" for copies
+    /// made from an array blob by `instance_array` (scatter tools do not
+    /// place them again).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placed_by: Option<String>,
+}
+
+/// What `instance_array` made: the hidden one-copy clay, the scatter of
+/// its copies, and how many there are.
+pub struct Instanced {
+    pub unit: u64,
+    pub scatter: u64,
+    pub copies: usize,
+}
+
+/// Turns an array blob of a clay object into instances: a hidden clay
+/// holding one copy (under the object) and a scatter of its copies (under
+/// the object too, so they move with it), and removes the blob. The copy
+/// is meshed once and every copy draws, renders and exports as an instance
+/// of it (see `Clay::instancing` for when this is refused). `leaf` copies
+/// the innermost shape of nested arrays.
+pub fn instance_array(scene: &mut crate::scene::Scene, target: u64, blob: usize, leaf: bool, force: bool) -> Result<Instanced, String> {
+    use crate::scene::Shape;
+    let o = scene.get(target).ok_or("object vanished")?;
+    let clay = o.clay.as_ref().filter(|_| o.shape == Shape::Clay).ok_or_else(|| format!("{} is not a clay object", o.name))?;
+    if o.rig.as_ref().is_some_and(|r| !r.bones.is_empty()) {
+        return Err(format!("{} is rigged; instanced copies would not follow its bones", o.name));
+    }
+    if o.link.is_some() {
+        return Err(format!("{} is a linked mirror copy (its clay follows its source); instance the source, or unlink it first", o.name));
+    }
+    let inst = clay.instancing(blob, leaf, force)?;
+    let (name, color, material) = (o.name.clone(), o.color, o.material.clone());
+    let blob_name = clay.blobs[blob].name.clone();
+    let unit = scene.add(Shape::Clay);
+    let u = scene.get_mut(unit).expect("just added");
+    u.name = format!("{name}_{}", if blob_name.is_empty() { format!("blob{blob}") } else { blob_name.clone() });
+    (u.clay, u.color, u.material, u.visible, u.parent) = (Some(inst.unit), color, material, false, Some(target));
+    let sc = scene.add(Shape::Scatter);
+    let instances: Vec<Instance> = inst.copies.iter().map(|&(position, rotation)| Instance { source: 0, position, rotation, scale: 1.0 }).collect();
+    let copies = instances.len();
+    let s = scene.get_mut(sc).expect("just added");
+    s.name = format!("{name}_{}_copies", if blob_name.is_empty() { format!("blob{blob}") } else { blob_name });
+    s.parent = Some(target);
+    s.scatter = Some(Scatter { sources: vec![unit], instances, settings: Settings::default(), placed_by: Some("array".into()) });
+    scene.get_mut(target).and_then(|o| o.clay.as_mut()).expect("checked").remove_keeping_cell(blob);
+    Ok(Instanced { unit, scatter: sc, copies })
 }
 
 /// Where and how to place copies.

@@ -12,6 +12,8 @@ pub enum Icon {
     Select,
     Lasso,
     Paint,
+    /// A brush raising a mound (the Sculpt tool).
+    Sculpt,
     Move,
     Rotate,
     Scale,
@@ -109,6 +111,11 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, alpha: f32) {
         Icon::Paint => {
             shapes.push(seg((13.0, 2.0), (7.0, 9.0), line(2.0, mid)));
             shapes.push(Shape::circle_filled(p(5.0, 11.5), 3.2 * s, light));
+        }
+        Icon::Sculpt => {
+            shapes.push(Shape::convex_polygon(arc(8.0, 14.0, 6.5, std::f32::consts::PI, std::f32::consts::TAU), mid, Stroke::NONE));
+            shapes.push(seg((14.0, 1.5), (9.0, 6.5), line(1.8, light)));
+            shapes.push(Shape::circle_filled(p(8.0, 7.5), 1.6 * s, light));
         }
         Icon::Move => {
             shapes.push(seg((8.0, 1.5), (8.0, 14.5), line(1.4, light)));

@@ -5,6 +5,7 @@ use std::io::{BufRead, Cursor, Read};
 use glam::{Vec2, Vec3};
 use serde_json::Value;
 
+use super::sky::{self, Sky};
 use super::{Rng, shade};
 
 pub(super) struct GpuEnvironment<'a> {
@@ -17,6 +18,15 @@ pub(super) struct GpuEnvironment<'a> {
     pub rotate: f32,
     pub sun: Option<(Vec3, f32, Vec3)>,
     pub sun_chance: f32,
+}
+
+/// What `Environment::parts` lends out.
+pub(crate) struct EnvParts<'a> {
+    pub width: usize,
+    pub height: usize,
+    pub pixels: &'a [Vec3],
+    pub rotate: f32,
+    pub sun: Option<(Vec3, f32, Vec3)>,
 }
 
 pub struct Environment {
@@ -57,6 +67,7 @@ impl Environment {
     }
 
     pub fn preset(name: &str) -> Result<Self, String> {
+        if let Some(sky) = Sky::named(name) { return Ok(Self::sky(&sky)); }
         let (sky, ground, sun): (Vec3, Vec3, Option<(Vec3, f32, Vec3)>) = match name {
             "studio" => (Vec3::new(0.32, 0.34, 0.38), Vec3::new(0.06, 0.055, 0.05), None),
             "overcast" => (Vec3::new(0.9, 1.0, 1.15), Vec3::new(0.16, 0.17, 0.18), None),
@@ -65,7 +76,7 @@ impl Environment {
             "forest" => (Vec3::new(0.25, 0.45, 0.22), Vec3::new(0.07, 0.055, 0.025), Some((Vec3::new(0.5, 0.8, -0.3), 0.012, Vec3::new(2.8, 2.6, 1.8)))),
             "storm" => (Vec3::new(0.10, 0.16, 0.24), Vec3::new(0.025, 0.025, 0.03), None),
             "night" => (Vec3::new(0.008, 0.015, 0.04), Vec3::new(0.002, 0.003, 0.006), Some((Vec3::new(-0.6, 0.5, 0.5), 0.006, Vec3::new(0.035, 0.05, 0.09)))),
-            _ => return Err("environment must be studio, overcast, sunset, forest, golden_hour, night, storm or {preset or hdr, rotate, intensity}".into()),
+            _ => return Err("environment must be studio, overcast, sunset, forest, golden_hour, night, storm, physical, sky_noon, sky_afternoon, sky_golden, sky_sunset or {preset or hdr, rotate, intensity}".into()),
         };
         let (w, h) = if name=="storm" {(512,256)} else {(256,128)};
         let cloud_field=Fog {density:0.5,falloff:0.0,noise:1.0,noise_scale:1.0,seed:71,..Default::default()};
@@ -93,14 +104,25 @@ impl Environment {
                 pixels.push(c);
             }
         }
-        let mut env = Self::map(w, h, pixels, 0.0);
-        env.sun = sun.map(|(dir, size, power)| (dir.normalize(), size, power / (TAU * (1.0 - size.cos()))));
+        Ok(Self::map(w, h, pixels, 0.0).with_sun(sun))
+    }
+
+    /// A physical sun and sky (`sky.rs`).
+    pub fn sky(sky: &Sky) -> Self {
+        let baked = sky.bake();
+        Self::map(sky::WIDTH, sky::HEIGHT, baked.pixels.clone(), 0.0).with_sun(baked.sun.map(|e| (sky.sun_direction(), sky::SUN_RADIUS, e)))
+    }
+
+    /// The map with a sun disc (toward it, angular radius, irradiance on a
+    /// surface facing it).
+    fn with_sun(mut self, sun: Option<(Vec3, f32, Vec3)>) -> Self {
+        self.sun = sun.map(|(dir, size, power)| (dir.normalize(), size, power / (TAU * (1.0 - size.cos()))));
         // A separate disc distribution resolves even sub-texel suns.
-        if let Some((_, size, c)) = env.sun {
+        if let Some((_, size, c)) = self.sun {
             let flux = luminance(c) as f64 * (TAU * (1.0 - size.cos())) as f64;
-            env.sun_chance = (flux / (flux + env.total)).clamp(0.05, 0.95) as f32;
+            self.sun_chance = (flux / (flux + self.total)).clamp(0.05, 0.95) as f32;
         }
-        Ok(env)
+        self
     }
 
     pub fn parse(v: &Value) -> Result<Self, String> {
@@ -110,7 +132,13 @@ impl Environment {
             if !v["hdr"].is_null() {return Err("use environment.preset or hdr, not both".into());}
             let intensity=number(v,"intensity",1.0,0.0,10000.0)?;
             let rotate=number(v,"rotate",0.0,-36000.0,36000.0)?.to_radians();
-            let mut env=Self::preset(name)?;
+            let mut env=match Sky::named(name) {
+                Some(base)=>Self::sky(&Sky::parse(v,base)?),
+                None=>{
+                    if let Some(k)=sky::KEYS.iter().find(|k| !v[**k].is_null()) {return Err(format!("{k} is a physical sky setting: use it with preset physical (or sky_noon, sky_afternoon, sky_golden, sky_sunset)"));}
+                    Self::preset(name)?
+                }
+            };
             for c in &mut env.pixels {*c*=intensity;}
             for c in &mut env.cdf {*c*=intensity as f64;}
             env.total*=intensity as f64;
@@ -156,7 +184,13 @@ impl Environment {
         }
     }
 
-    fn direction(u: f32, cos: f64) -> Vec3 {
+    /// The map, its rotation (radians) and its sun disc (direction,
+    /// angular radius, radiance), for the viewport's lighting bake.
+    pub(crate) fn parts(&self) -> EnvParts<'_> {
+        EnvParts { width: self.width, height: self.height, pixels: &self.pixels, rotate: self.rotate, sun: self.sun }
+    }
+
+    pub(crate) fn direction(u: f32, cos: f64) -> Vec3 {
         let phi = TAU * u;
         let r = (1.0 - cos * cos).max(0.0).sqrt() as f32;
         Vec3::new(r * phi.cos(), cos as f32, r * phi.sin())
@@ -697,6 +731,71 @@ mod tests {
             if d.dot(sun) >= size.cos() { hits += 1; }
         }
         assert!((hits as f32 / 20_000.0 - env.sun_chance).abs() < 0.015);
+    }
+
+    /// Light falling on an upward-facing patch of ground (sun and sky),
+    /// summed over the map's texels.
+    fn horizontal_irradiance(env: &Environment) -> Vec3 {
+        let mut e = Vec3::ZERO;
+        for y in 0..env.height {
+            let solid = (std::f64::consts::TAU / env.width as f64 * ((std::f64::consts::PI * y as f64 / env.height as f64).cos() - (std::f64::consts::PI * (y + 1) as f64 / env.height as f64).cos())) as f32;
+            let up = (PI * (y as f32 + 0.5) / env.height as f32).cos().max(0.0);
+            e += env.pixels[y * env.width..(y + 1) * env.width].iter().sum::<Vec3>() * solid * up;
+        }
+        e + env.sun.map_or(Vec3::ZERO, |(d, size, c)| c * (TAU * (1.0 - size.cos())) * d.y.max(0.0))
+    }
+
+    /// A calibration, not a test of physics: `sky::SOLAR` is chosen so a
+    /// 30 degree physical sun (default haze and ground) lights the ground
+    /// as brightly as golden_hour does, so exposures carry over.
+    #[test]
+    fn physical_sky_matches_golden_hour_irradiance_at_30deg() {
+        let golden = horizontal_irradiance(&Environment::preset("golden_hour").unwrap());
+        let sky = horizontal_irradiance(&Environment::preset("physical").unwrap());
+        eprintln!("horizontal irradiance: golden_hour {golden} ({}), physical at 30 degrees {sky} ({})", luminance(golden), luminance(sky));
+        assert!((luminance(sky) / luminance(golden) - 1.0).abs() < 0.05, "physical {} vs golden_hour {}", luminance(sky), luminance(golden));
+    }
+
+    /// The physical sky goes through the same map, rotation, intensity and
+    /// sun sampling as the presets.
+    #[test]
+    fn physical_sky_samples_its_sun_and_map_like_a_preset() {
+        let base = Environment::parse(&serde_json::json!({"preset":"physical","sun_elevation":20,"sun_azimuth":0})).unwrap();
+        let (sun, size, power) = base.sun.unwrap();
+        assert!((sun - Vec3::new(0.0, 20f32.to_radians().sin(), 20f32.to_radians().cos())).length() < 1e-5, "{sun}");
+        assert_eq!(size, sky::SUN_RADIUS);
+        assert!(base.sun_chance > 0.05 && base.sun_chance < 0.95, "{}", base.sun_chance);
+        assert_eq!(Environment::parse(&serde_json::json!("physical")).unwrap().sun.unwrap().0, Sky::named("physical").unwrap().sun_direction());
+        // The disc is picked at its share of the light, and every sample's
+        // pdf is the one `pdf` gives.
+        let mut rng = Rng::new(41, 3);
+        let mut hits = 0;
+        let mut integral = 0.0;
+        for _ in 0..20_000 {
+            let (d, c, pdf) = base.sample(&mut rng);
+            assert!((pdf - base.pdf(d)).abs() <= 1e-4 * pdf.max(1.0) && c.is_finite());
+            if d.dot(sun) >= size.cos() { hits += 1; }
+            // The map's share integrates to its chance (the disc, a few
+            // millionths of the sphere, is left out).
+            let u = shade::sphere(rng.v2());
+            if u.dot(sun) < size.cos() { integral += base.pdf(u) * (4.0 * PI); }
+        }
+        assert!((hits as f32 / 20_000.0 - base.sun_chance).abs() < 0.015);
+        assert!((integral / 20_000.0 - (1.0 - base.sun_chance)).abs() < 0.03, "{}", integral / 20_000.0);
+        // Turned and dimmed as a preset would be.
+        let turned = Environment::parse(&serde_json::json!({"preset":"physical","sun_elevation":20,"sun_azimuth":0,"rotate":90,"intensity":0.5})).unwrap();
+        let (tsun, _, tpower) = turned.sun.unwrap();
+        let rotated = Vec3::new(-sun.z, sun.y, sun.x);
+        assert!((tsun - rotated).length() < 1e-5 && (tpower - power * 0.5).length() < 1e-4 * power.length());
+        let off_sun = Vec3::new(0.3, 0.5, -0.8).normalize();
+        assert!((turned.at(Vec3::new(-off_sun.z, off_sun.y, off_sun.x)) - base.at(off_sun) * 0.5).abs().max_element() < 1e-3);
+        // Sky settings belong to the physical presets only.
+        let err = Environment::parse(&serde_json::json!({"preset":"golden_hour","sun_elevation":10})).err().unwrap();
+        assert!(err.contains("sun_elevation"), "{err}");
+        assert!(Environment::parse(&serde_json::json!({"preset":"physical","turbidity":20})).err().unwrap().contains("turbidity must be a number in 1..10"));
+        // A sun below the horizon leaves a twilight sky and no disc.
+        let dusk = Environment::parse(&serde_json::json!({"preset":"physical","sun_elevation":-3})).unwrap();
+        assert!(dusk.sun.is_none() && dusk.sun_chance == 0.0 && dusk.total > 0.0);
     }
 
     #[test]

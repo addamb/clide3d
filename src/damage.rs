@@ -1698,7 +1698,7 @@ mod tests {
                 animations: false,
                 fps: 24.0,
                 file_stem: String::new(),
-                lods: false, atlas: true, texel_density: None,
+                lods: false, atlas: true, texel_density: None, gpu_instancing: false, blend_shapes: Vec::new(),
             },
         )
         .unwrap();
@@ -1923,7 +1923,7 @@ mod tests {
                 animations: false,
                 fps: 24.0,
                 file_stem: String::new(),
-                lods: false, atlas: true, texel_density: None,
+                lods: false, atlas: true, texel_density: None, gpu_instancing: false, blend_shapes: Vec::new(),
             },
         )
         .unwrap();

@@ -9,7 +9,8 @@
 <p align="center">
   <a href="LICENSE-MIT"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue"></a>
   <img alt="Rust 2024 edition" src="https://img.shields.io/badge/rust-2024%20edition-orange">
-  <img alt="MCP tools: 56" src="https://img.shields.io/badge/MCP%20tools-56-purple">
+  <img alt="MCP tools: 72" src="https://img.shields.io/badge/MCP%20tools-72-purple">
+  <a href="https://m8ven.ai/mcp/addamb-clide3d-2hsm3d?s=readme"><img alt="M8ven Score" src="https://m8ven.ai/badge/mcp/addamb-clide3d-2hsm3d?v=55db3abb2693ff403a9475a8d4cfa7e8"></a>
 </p>
 
 <p align="center">
@@ -24,7 +25,7 @@
 Most 3D tools are built for a person with a mouse. Clide3D is built for both:
 a familiar Maya-style desktop editor **and** a local
 [Model Context Protocol](https://modelcontextprotocol.io) server that exposes
-the whole editor as 56 typed tools. Point Claude Code (or any MCP client) at it
+the whole editor as 72 typed tools. Point Claude Code (or any MCP client) at it
 and the agent can build, inspect, render and export a scene while you watch
 the window update live, then take over with the mouse at any point. Every
 agent edit lands on the same undo stack as yours.
@@ -36,14 +37,17 @@ Everything is one native Rust binary: no Python runtime, no plugins, no cloud.
 | | |
 |---|---|
 | **Maya-style editor** | Menu sets, shelf, Outliner, Channel Box / Attribute Editor, four-view layout, time slider, hotkey editor, and a MEL command line (`polyCube -n box; move 0 2 0`). |
-| **Clay sculpting** | Signed-distance "blob" modelling (spheres, capsules, lathes, sweeps, extrusions, arrays, shells, bands) with smooth or sharp joins, plus brush sculpting, painting and decals on a fine detail layer. |
+| **Clay sculpting** | Signed-distance "blob" modelling (spheres, capsules, lathes, sweeps, extrusions, arrays, shells, bands) with smooth or sharp joins, plus brush sculpting, painting and decals on a fine detail layer; VDM stamps (Alpha 3D) captured from any clay and stamped back with their overhangs, and curve strokes whose control points can be moved after the fact (MoveCurve). |
+| **Interactive sculpting** | Sculpt, Paint, Mask and Groups brush tools with a live preview, a brush HUD (size, strength, falloff curve, alpha, symmetry, layers, Adjust Last, history) and pen pressure (touch force, an opt-in macOS tablet monitor, or pointer speed). Every stroke is a record in a stroke ledger that can be listed, disabled, edited, replayed or undone on its own; sculpt and paint layers with amounts, morphs exported as blend shapes, persistent masks and polygroups, detail levels that keep fine detail under coarse edits, and Sculptris Pro local refinement. |
+| **3D printing** | Import OBJ, STL, PLY, GLB and FBX meshes (`import_mesh`), turn any object into clay and combine objects with add / carve / intersect booleans (`to_clay`), then `export_print` to STL, OBJ, PLY or 3MF in millimeters, sized and optionally hollowed, with a watertight / non-manifold report. |
 | **Hard surface** | Chamfered panels, bolts, vents and cables (`kitbash`, `detail_pass`), forged armor plates, battle damage stamps and vehicle wear presets. |
 | **Characters** | A built-in human base (MakeHuman CC0 mesh, 600+ shape controls) with a full rig, face detail and facial hair, textured eyes, strand hair, and simulated, sewn garments. |
 | **Rigging and animation** | Bones, weight painting, keyframe clips with smooth/linear/step keys, and posing that carries props and armor along. |
 | **Smart materials** | Layered, Substance-style looks (worn iron, gold trim, old leather, dungeon stone…) over a CC0 scanned texture library, with dirt, rust, edge wear and cavity masks. |
 | **Environments** | A modular dungeon kit, heightfield terrain, scatter, torch/candle/brazier lights and simulated fire and smoke. |
-| **Film renderer** | A GPU path tracer (WGSL compute, with a CPU fallback) with soft studio lights, HDR skies, depth of field, motion blur, fog, bloom, film looks and denoising. |
-| **Game-ready output** | Bake clay to a triangle budget with UV unwrap and texture maps, then export glTF (`.glb`) or FBX 7.4 with rigs, animation and materials. |
+| **Film renderer** | A GPU path tracer (WGSL compute, with a CPU fallback) with soft studio lights, HDR skies, depth of field, motion blur, fog, bloom, film looks and denoising; render passes (depth, normal, albedo, AO, shadow, mask, emission) as PNG or EXR, and animations as PNG sequences or mp4 (through an installed `ffmpeg`). |
+| **Viewport graphics** | The live viewport is lit like the film renderer: key-light shadow maps (with optional contact-hardening soft shadows), screen-space ambient occlusion, image-based lighting from the environment, HDR bloom and ACES / AgX / filmic tonemapping, a physical sun and sky, matcaps, and instanced drawing of repeated geometry (`scatter`, `kitbash`, `instance_array`). |
+| **Game-ready output** | Bake clay to a triangle budget with UV unwrap, texture maps and displacement / vector-displacement maps (16-bit PNG or EXR), then export glTF (`.glb`) or FBX 7.4 with rigs, animation and materials. |
 
 ## Gallery
 
@@ -118,25 +122,37 @@ curl -s http://127.0.0.1:7878/mcp \
 ```
 
 <details>
-<summary><b>All 56 tools</b></summary>
+<summary><b>All 72 tools</b></summary>
 
 | Area | Tools |
 |---|---|
-| Scene | `get_scene`, `new_scene`, `open_scene`, `save_scene`, `undo`, `redo`, `run_mel` |
+| Scene | `get_scene`, `new_scene`, `open_scene`, `save_scene`, `undo`, `redo`, `history`, `run_mel` |
 | Objects | `create_object`, `update_object`, `delete_object`, `duplicate_object`, `select_object`, `group_objects`, `parent_objects`, `set_pivot`, `mirror_object` |
-| Clay and surfaces | `edit_clay`, `get_clay`, `sculpt`, `paint`, `decal`, `surface_point` |
+| Clay and surfaces | `edit_clay`, `get_clay`, `sculpt`, `paint`, `sculpt_layer`, `detail_level`, `morph`, `mask`, `group`, `brush_preset`, `alpha`, `decal`, `surface_point`, `to_clay` |
+| Stroke ledger | `stroke_log`, `stroke_edit`, `sculpt_diff`, `probe_clay` |
 | Reference images | `set_reference`, `compare_reference`, `project_reference` |
 | Materials and wear | `set_material`, `wear`, `damage` |
 | Hard surface | `kitbash`, `detail_pass` |
 | Characters | `create_human`, `set_human`, `human_controls`, `face_detail`, `face_hair`, `cloth` |
 | Rigging and animation | `rig`, `pose_bone`, `animate`, `playback` |
-| Environments | `kit`, `scatter`, `edit_terrain`, `fire` |
+| Environments | `kit`, `scatter`, `instance_array`, `edit_terrain`, `fire` |
 | Camera and view | `set_camera`, `frame_view`, `set_display`, `screenshot` |
 | Rendering | `render_film`, `render_views`, `render_animation`, `job_status` |
-| Output | `bake`, `export_glb`, `export_fbx`, `check_export` |
+| Import and output | `import_mesh`, `bake`, `export_glb`, `export_fbx`, `export_print`, `check_export` |
 
 Long work (renders, bakes, simulations, exports) runs as cancellable
 background jobs with a progress bar in the editor; `job_status` polls them.
+
+**Viewport lighting.** The viewport (and `render_views`,
+`render_animation`) is lit like `render_film`: by default its studio
+environment and studio lights, with key-light shadows, screen-space
+ambient occlusion and ACES finishing. `set_display` takes `lighting`
+(`"studio"`, an environment such as `"sunset"` or `"overcast"`, a look
+preset, `"film"` for the last `render_film`'s lighting, `"classic"` for the
+old fixed studio, or `{environment, lights, extra_lights, look}` as
+`render_film` takes them) and `ambient_occlusion` (`true`/`false` or
+`{radius, strength}`), so a film look can be previewed live; the
+Lighting menu offers the same. See `graphics_check/README.md`.
 
 </details>
 
@@ -155,6 +171,9 @@ background jobs with a progress bar in the editor; `job_status` polls them.
 | Frame selected / frame all | F / A |
 | Group · parent · unparent | Ctrl+G · P · Shift+P |
 | Hide / show | Ctrl+H / Shift+H |
+| Brush tools: finer / coarser detail level · X symmetry | D / Shift+D · X (instead of pivot and snap while a brush tool is on) |
+| Brush tools: size · strength · focal shift | Hold S · U · O and move the mouse sideways |
+| Brush tools: smooth · invert · mask · erase mask · lasso | Shift · Alt · Ctrl · Ctrl+Alt · Ctrl+Shift (RMB orbits) |
 | Play animation | Alt+V |
 | Undo / redo | ⌘Z / ⇧⌘Z |
 | Duplicate · delete | ⌘D · ⌫ |
@@ -171,7 +190,9 @@ Scenes are saved as `.json` files.
 
 The **[user guide](docs/GUIDE.md)** covers every feature in depth: sculpting
 from reference images, wing membranes, materials and eyes, hair, film
-renders, adaptive detail, environments, human bases and faces, animation,
+renders, adaptive detail, interactive sculpting (brushes, the HUD, the
+stroke ledger, layers, masks, detail levels, VDM stamps and curve strokes),
+3D printing, viewport graphics, render passes and movies, environments, human bases and faces, animation,
 garments, forged armor, kitbashing, mirroring and posing, fire and smoke,
 battle damage, photographic camera looks, and export.
 
@@ -185,14 +206,18 @@ src/
 ├── scene.rs           the saved scene model
 ├── clay.rs            signed-distance clay → adaptive meshes
 ├── hard_surface.rs    extrude / lathe / sweep / shell / array / band forms
-├── sculpt.rs, paint.rs, surface.rs, detail.rs, adaptive.rs
+├── brush/             strokes: spec, resolver, falloff and pressure curves, symmetry, alphas and VDM stamps
+├── sculpt/            the sculpt engine and brushes
+├── paint.rs, surface.rs, detail.rs, adaptive.rs
 ├── rig.rs, pose.rs    skeletons, skinning and posing
 ├── human.rs, face.rs, eyeball.rs, hair.rs, face_hair.rs
 ├── cloth.rs, fire.rs, damage.rs, weather.rs
 ├── material.rs, smart.rs   PBR materials and layered smart materials
 ├── render.rs          the real-time viewport renderer
 ├── film/              the path tracer: BVH, shading, lighting, dicing, denoise, GPU (trace.wgsl)
-├── bake.rs, export_atlas.rs   game-ready meshes, UVs (xatlas) and texture maps
+├── bake.rs, export_atlas.rs   game-ready meshes, UVs (xatlas), texture and displacement maps
+├── outputs.rs         16-bit PNG / EXR files and mp4 through an external ffmpeg
+├── mesh_import/, mesh_asset.rs, to_clay.rs   mesh import, print export, clay from any object
 └── gltf.rs, fbx.rs, glb_read.rs   export and re-import checks
 ```
 
@@ -209,9 +234,9 @@ share one scene, one selection and one undo history.
 cargo test --release
 ```
 
-This runs 303 fast unit and integration tests. Another 39 are
-`#[ignore]`d visual acceptance checks that render the pictures in the
-`*_check/` folders; each folder's `README.md` says what it verifies and how to
+This runs 659 fast unit and integration tests. Another 58 are
+`#[ignore]`d: visual acceptance checks that render the pictures in the
+`*_check/` folders, and timing reports; each folder's `README.md` says what it verifies and how to
 reproduce it, for example:
 
 ```sh

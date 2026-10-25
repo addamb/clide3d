@@ -1,0 +1,116 @@
+{
+  "ao": {
+    "after": {
+      "ambient_occlusion": {
+        "radius": 0.5,
+        "strength": 1.0
+      }
+    },
+    "before": {
+      "ambient_occlusion": false
+    },
+    "camera": {
+      "eye": [
+        3.200000047683716,
+        2.5999999046325684,
+        4.400000095367432
+      ],
+      "fov": 35.0,
+      "target": [
+        0.0,
+        0.5,
+        -0.20000000298023224
+      ]
+    },
+    "lighting": "studio"
+  },
+  "film_match": {
+    "camera": {
+      "eye": [
+        0.0,
+        1.2999999523162842,
+        3.4000000953674316
+      ],
+      "fov": 35.0,
+      "target": [
+        0.0,
+        1.0,
+        0.0
+      ]
+    },
+    "lighting": {
+      "lights": "none"
+    },
+    "render_film": {
+      "device": "cpu",
+      "floor": false,
+      "lights": "none",
+      "samples": 256
+    },
+    "rows": [
+      "overcast",
+      "sunset"
+    ],
+    "size": [
+      240,
+      180
+    ],
+    "viewport_post": {
+      "bloom": 0
+    }
+  },
+  "ibl_fixture": {
+    "after": {
+      "ambient_occlusion": {
+        "radius": 0.5,
+        "strength": 1.0
+      },
+      "lighting": "studio"
+    },
+    "before": {
+      "ambient_occlusion": false,
+      "lighting": "classic"
+    },
+    "camera": {
+      "eye": [
+        3.200000047683716,
+        2.5999999046325684,
+        4.400000095367432
+      ],
+      "fov": 35.0,
+      "target": [
+        0.0,
+        0.5,
+        -0.20000000298023224
+      ]
+    },
+    "post": "default (ACES, bloom 0.08)"
+  },
+  "ibl_studio": {
+    "after": {
+      "ambient_occlusion": true,
+      "lighting": "studio"
+    },
+    "before": {
+      "ambient_occlusion": false,
+      "lighting": "classic"
+    },
+    "camera": {
+      "eye": [
+        4.599999904632568,
+        3.5999999046325684,
+        5.599999904632568
+      ],
+      "fov": 35.0,
+      "target": [
+        0.0,
+        0.6000000238418579,
+        0.0
+      ]
+    }
+  },
+  "size": [
+    480,
+    360
+  ]
+}

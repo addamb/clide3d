@@ -117,6 +117,10 @@ impl Post {
         for ((c,b),g) in src.iter_mut().zip(bright).zip(halo) { *c += (g*correction - *b)*strength; }
         src
     }
+    /// The grade's settings, for the viewport's copy of `grade`.
+    pub(crate) fn grade_params(&self) -> crate::render::post::Grade {
+        crate::render::post::Grade { shadow: self.shadow, highlight: self.highlight, lift: self.lift, gamma: self.gamma, gain: self.gain, saturation: self.saturation, contrast: self.contrast }
+    }
     pub fn grade(&self, c: Vec3) -> Vec3 {
         let y = lum(c).clamp(0.0, 1.0);
         let c = c * self.shadow.lerp(self.highlight, y);
@@ -197,8 +201,8 @@ mod tests {
                 else { f32::from(p.length() > 13.0) }
             };
             let color: Vec<_> = (0..w*h).map(|i| dark.lerp(haze, coverage(i))).collect();
-            let guides: Vec<_> = (0..w*h).map(|i| (Vec3::ONE, Vec3::Z, if coverage(i)<0.5 {2.0} else {50.0})).collect();
-            let filtered = super::super::denoise::filter(&color, &guides, w, h, 256);
+            let guides: Vec<_> = (0..w*h).map(|i| (Vec3::ONE, Vec3::Z, if coverage(i)<0.5 {2.0} else {50.0}, 0.0)).collect();
+            let filtered = super::super::denoise::filter(&color, &guides, w, h, 256, true);
             for strength in [0.12, 1.0] {
                 // Keep the trailer tone/grade and glare, but remove intentional
                 // stochastic grain and position-dependent vignette for bounds.

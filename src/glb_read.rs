@@ -9,6 +9,9 @@ use crate::{film, material::Material, mesh::{ImportedMaterial, Mesh, Textures, V
 
 pub struct Loaded {
     pub items: Vec<film::Item>,
+    /// Per item: its node's transform (baked into the points) mirrors, so
+    /// its triangles wind inside out (`mesh_import` turns them back).
+    pub mirrored: Vec<bool>,
     pub summary: Value,
     pub bounds: (Vec3, Vec3),
 }
@@ -28,6 +31,14 @@ const MAX_MATERIALS: usize = 256;
 /// Vertices and triangles over every mesh instance (a mesh used by many
 /// nodes counts each time: each is expanded).
 const MAX_INSTANCED: usize = 20_000_000;
+/// Most placements one EXT_mesh_gpu_instancing node may carry.
+const MAX_INSTANCES: usize = 1_000_000;
+/// Most morph targets one primitive may carry.
+const MAX_TARGETS: usize = 64;
+/// Largest morph target weight, the file's or the caller's, either sign:
+/// shapes are made for 0..1, and past a few times that a target is a
+/// broken or hostile file, not a pose.
+pub const MAX_MORPH_WEIGHT: f32 = 10.0;
 
 struct Reader {
     doc: Value,
@@ -38,6 +49,8 @@ struct Reader {
     /// exports would not fit in memory: a check needs no full 8K maps).
     cap: u32,
     texture_cache: std::cell::RefCell<std::collections::HashMap<String,Arc<Textures>>>,
+    /// Morph target weights by name (extras.targetNames), over the file's own.
+    weights: std::collections::BTreeMap<String, f32>,
 }
 
 fn list<'a>(v: &'a Value, key: &str) -> &'a [Value] {
@@ -93,7 +106,7 @@ impl Reader {
         if list(&doc, "buffers").len() != 1 || !doc["buffers"][0]["uri"].is_null() { return Err("only a GLB's embedded buffer is supported".into()); }
         let len = index(&doc["buffers"][0]["byteLength"])?;
         if len > bin.len() || bin.len() - len > 3 { return Err("invalid embedded buffer length".into()); }
-        let mut r = Self { doc, bin: bin[..len].to_vec(), images: Vec::new(), warnings: Vec::new(), cap: 4096, texture_cache: Default::default() };
+        let mut r = Self { doc, bin: bin[..len].to_vec(), images: Vec::new(), warnings: Vec::new(), cap: 4096, texture_cache: Default::default(), weights: Default::default() };
         for ext in list(&r.doc, "extensionsRequired") {
             if !matches!(ext.as_str(), Some("KHR_materials_clearcoat" | "KHR_materials_sheen" | "KHR_materials_emissive_strength" | "KHR_materials_transmission" | "KHR_materials_ior")) {
                 return Err(format!("unsupported required extension: {ext}"));
@@ -202,6 +215,28 @@ impl Reader {
             }
         }
         Ok(out)
+    }
+
+    /// A node's EXT_mesh_gpu_instancing placements (None without it).
+    fn instances(&self, n: &Value) -> Result<Option<Vec<Mat4>>, String> {
+        let a = &n["extensions"]["EXT_mesh_gpu_instancing"]["attributes"];
+        if a.is_null() { return Ok(None); }
+        let read = |name: &str, width: usize| -> Result<Option<Attribute>, String> {
+            let Some(i) = a[name].as_u64() else { return Ok(None) };
+            let data = self.accessor(i as usize)?;
+            if data.iter().any(|v| v.len() != width || v.iter().any(|x| !x.is_finite())) { return Err(format!("EXT_mesh_gpu_instancing {name} has invalid shape")); }
+            Ok(Some(data))
+        };
+        let (t, r, s) = (read("TRANSLATION", 3)?, read("ROTATION", 4)?, read("SCALE", 3)?);
+        let count = [&t, &r, &s].iter().filter_map(|x| x.as_ref().map(Vec::len)).max().ok_or("EXT_mesh_gpu_instancing has no attributes")?;
+        if [&t, &r, &s].iter().any(|x| x.as_ref().is_some_and(|x| x.len() != count)) { return Err("EXT_mesh_gpu_instancing attributes differ in count".into()); }
+        if count > MAX_INSTANCES { return Err(format!("EXT_mesh_gpu_instancing has more than {MAX_INSTANCES} instances")); }
+        Ok(Some((0..count).map(|i| {
+            let tr = t.as_ref().map_or(Vec3::ZERO, |t| Vec3::from_slice(&t[i]));
+            let rot = r.as_ref().map_or(glam::Quat::IDENTITY, |r| glam::Quat::from_slice(&r[i]).normalize());
+            let sc = s.as_ref().map_or(Vec3::ONE, |s| Vec3::from_slice(&s[i]));
+            Mat4::from_scale_rotation_translation(sc, rot, tr)
+        }).collect()))
     }
 
     fn attribute(&self, p: &Value, name: &str, n: usize, widths: &[usize]) -> Result<Option<Attribute>, String> {
@@ -425,6 +460,7 @@ impl Reader {
         let materials = (0..material_count).map(|i| self.material(&json!({"material": i}))).collect::<Result<Vec<_>, _>>()?;
         let default_material = self.material(&json!({}))?;
         let mut items = Vec::new();
+        let mut mirrored = Vec::new();
         let mut lo = Vec3::splat(f32::MAX); let mut hi = Vec3::splat(f32::MIN);
         let mut counts = Vec::new();
         let (mut vertices, mut triangles) = (0, 0);
@@ -438,15 +474,43 @@ impl Reader {
             let skin = if n["skin"].is_null() { None } else { Some(index(&n["skin"])?) };
             if skin.is_some_and(|i| i >= skins.len()) { return Err("skin index out of range".into()); }
             if skin.is_some() && clips.is_empty() { self.warnings.push(format!("mesh {mi} is skinned but has no animation")); }
+            // EXT_mesh_gpu_instancing: the mesh at each of these places (in
+            // the node's space); its vertices stay in mesh space and every
+            // place becomes an item sharing them.
+            let places = self.instances(n)?;
+            if places.is_some() && skin.is_some() { return Err("a skinned mesh cannot be GPU-instanced".into()); }
+            let base = if places.is_some() { Mat4::IDENTITY } else { world[node].unwrap() };
+            let places: Vec<Mat4> = places.map_or_else(|| vec![Mat4::IDENTITY], |p| p.into_iter().map(|m| world[node].unwrap() * m).collect());
             let (mut nv, mut nt) = (0, 0);
             let mut counted = HashSet::new();
             for p in list(model, "primitives") {
                 if p["mode"].as_u64().unwrap_or(4) != 4 { return Err("only triangle primitives are supported".into()); }
-                if !list(p, "targets").is_empty() { self.warnings.push(format!("mesh {mi}: morph targets are not applied")); }
                 let pi = index(&p["attributes"]["POSITION"])?;
-                let positions = self.accessor(pi)?;
+                let mut positions = self.accessor(pi)?;
                 if positions.iter().any(|v| v.len() != 3) { return Err("POSITION must be VEC3".into()); }
                 let count = positions.len();
+                // Morph targets: POSITION offsets, at the node's (or mesh's)
+                // weights, or the caller's by target name.
+                let targets = list(p, "targets");
+                if targets.len() > MAX_TARGETS { return Err(format!("mesh {mi}: more than {MAX_TARGETS} morph targets")); }
+                if !targets.is_empty() {
+                    let names = list(&model["extras"], "targetNames");
+                    let defaults = if !n["weights"].is_null() { list(n, "weights") } else { list(model, "weights") };
+                    for (t, target) in targets.iter().enumerate() {
+                        let name = names.get(t).and_then(Value::as_str);
+                        let w = name.and_then(|n| self.weights.get(n).copied()).unwrap_or_else(|| defaults.get(t).map_or(0.0, |w| number(w, 0.0)));
+                        if !w.is_finite() || w.abs() > MAX_MORPH_WEIGHT {
+                            return Err(format!("mesh {mi}: morph target {} has weight {w}; morph weights must be finite and within -{MAX_MORPH_WEIGHT}..{MAX_MORPH_WEIGHT}", name.map_or_else(|| t.to_string(), str::to_string)));
+                        }
+                        if w == 0.0 || target["POSITION"].is_null() { continue; }
+                        let d = self.accessor(index(&target["POSITION"])?)?;
+                        if d.len() != count || d.iter().any(|v| v.len() != 3) { return Err(format!("mesh {mi}: a morph target's POSITION does not match the vertices")); }
+                        for (p, d) in positions.iter_mut().zip(&d) {
+                            for k in 0..3 { p[k] += w * d[k]; }
+                        }
+                        if positions.iter().flatten().any(|v| !v.is_finite()) { return Err(format!("mesh {mi}: morph target {t} moves vertices out of range")); }
+                    }
+                }
                 let normals = self.attribute(p, "NORMAL", count, &[3])?;
                 let colors = self.attribute(p, "COLOR_0", count, &[3, 4])?;
                 let uvs = self.attribute(p, "TEXCOORD_0", count, &[2])?;
@@ -484,7 +548,7 @@ impl Reader {
                             if w > 0.0 { mat += skins[skin][j as usize] * w; sum += w; used_joints[skin][j as usize] = true; }
                         }
                         if sum <= 1e-8 { zero_weights += 1; world[node].unwrap() } else { mat * (1.0 / sum) }
-                    } else { world[node].unwrap() };
+                    } else { base };
                     point = transform.transform_point3(point);
                     let basis = Mat3::from_mat4(transform);
                     if basis.determinant().abs() > 1e-12 { normal = basis.inverse().transpose() * normal; } else { normal = Vec3::ZERO; }
@@ -503,14 +567,24 @@ impl Reader {
                     self.warnings.push(format!("mesh {mi}: missing or zero normals; generated from triangles")); generate_normals(&mut mesh);
                 }
                 if mesh.textures.is_some() && tangents.is_none() { generate_tangents(&mut mesh); }
-                for v in &mesh.vertices { let p = Vec3::from(v.pos); lo = lo.min(p); hi = hi.max(p); }
-                if counted.insert(pi) { nv += count; }
-                nt += mesh.indices.len() / 3;
-                instanced = instanced.saturating_add(mesh.vertices.len() + mesh.indices.len() / 3);
+                // Check the budget before the per-place bounds loop below does vertices x places work.
+                instanced = instanced.saturating_add((mesh.vertices.len() + mesh.indices.len() / 3).saturating_mul(places.len()));
                 if instanced > MAX_INSTANCED { return Err(format!("the scene's mesh instances hold more than {MAX_INSTANCED} vertices and triangles")); }
-                items.push(film::Item { mesh: Arc::new(mesh), world: Mat4::IDENTITY, tint: [1.0; 3], surface: material.surface(), material });
+                for place in &places {
+                    for v in &mesh.vertices { let p = place.transform_point3(Vec3::from(v.pos)); lo = lo.min(p); hi = hi.max(p); }
+                }
+                if counted.insert(pi) { nv += count * places.len(); }
+                nt += mesh.indices.len() / 3 * places.len();
+                let mesh = Arc::new(mesh);
+                for &place in &places {
+                    items.push(film::Item { mesh: mesh.clone(), world: place, tint: [1.0; 3], surface: material.surface(), material: material.clone() });
+                    mirrored.push(skin.is_none() && Mat3::from_mat4(base).determinant() < 0.0);
+                }
             }
-            counts.push(json!({"mesh": mi, "node": node, "name": model["name"], "vertices": nv, "triangles": nt}));
+            let mut count = json!({"mesh": mi, "node": node, "name": model["name"], "vertices": nv, "triangles": nt});
+            if !model["extras"]["targetNames"].is_null() { count["morph_targets"] = model["extras"]["targetNames"].clone(); }
+            if !n["extensions"]["EXT_mesh_gpu_instancing"].is_null() { count["instances"] = json!(places.len()); }
+            counts.push(count);
             vertices += nv; triangles += nt;
         }
         if triangles == 0 { return Err("file's active scene has no triangles".into()); }
@@ -532,7 +606,7 @@ impl Reader {
         let image_summary: Vec<_> = self.images.iter().enumerate().map(|(i, img)| json!({"index": i, "width": img.width(), "height": img.height()})).collect();
         let skin_summary: Vec<_> = list(&self.doc, "skins").iter().enumerate().map(|(i, s)| json!({"index": i, "name": s["name"], "joints": list(s, "joints").len()})).collect();
         let summary = json!({"vertices": vertices, "triangles": triangles, "meshes": counts, "materials": material_summary, "images": image_summary, "textures": list(&self.doc, "textures"), "skins": skin_summary, "animations": anim_summary, "pose": chosen.map(|c| json!({"animation": c.0, "frame": frame.unwrap_or(0.0), "fps": c.1})), "bounds": {"min": lo.to_array(), "max": hi.to_array()}, "warnings": self.warnings});
-        Ok(Loaded { items, summary, bounds: (lo, hi) })
+        Ok(Loaded { items, mirrored, summary, bounds: (lo, hi) })
     }
 }
 
@@ -567,14 +641,25 @@ fn generate_tangents(mesh: &mut Mesh) {
     }
 }
 
-pub fn read(path: &Path, animation: Option<&str>, frame: Option<f32>) -> Result<Loaded, String> {
+/// `weights`: morph target weights by name, over the file's own.
+pub fn read(path: &Path, animation: Option<&str>, frame: Option<f32>, weights: &std::collections::BTreeMap<String, f32>) -> Result<Loaded, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    Reader::parse(&bytes)?.load(animation, frame)
+    let mut r = Reader::parse(&bytes)?;
+    r.weights = weights.clone();
+    r.load(animation, frame)
 }
 
-#[cfg(test)]
+/// `read` from bytes already in memory (`mesh_import` reads GLB this way).
 pub fn from_bytes(bytes: &[u8], animation: Option<&str>, frame: Option<f32>) -> Result<Loaded, String> {
     Reader::parse(bytes)?.load(animation, frame)
+}
+
+/// `from_bytes` with morph target weights by name.
+#[cfg(test)]
+pub fn from_bytes_morphed(bytes: &[u8], weights: &std::collections::BTreeMap<String, f32>) -> Result<Loaded, String> {
+    let mut r = Reader::parse(bytes)?;
+    r.weights = weights.clone();
+    r.load(None, None)
 }
 
 #[cfg(test)]
@@ -600,6 +685,25 @@ mod tests {
             "accessors": [{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3"}],
             "meshes": [{"primitives": [{"attributes": {"POSITION": 0}}]}],
             "nodes": [{"mesh": 0}], "scenes": [{"nodes": [0]}], "scene": 0}), bin)
+    }
+
+    #[test]
+    fn morph_weights_are_bounded() {
+        // One target (the positions again, as offsets), at the file's weight.
+        let (mut doc, bin) = triangle();
+        doc["meshes"][0]["primitives"][0]["targets"] = json!([{"POSITION": 0}]);
+        doc["meshes"][0]["extras"] = json!({"targetNames": ["up"]});
+        let at = |doc: &mut Value, w: f64| { doc["meshes"][0]["weights"] = json!([w]); from_bytes(&pack(doc, bin.clone()), None, None) };
+        let half = at(&mut doc, 0.5).unwrap();
+        assert_eq!(half.items[0].mesh.vertices[1].pos, [1.5, 0., 0.]);
+        for w in [1e6, -11.0, 1e30] {
+            let e = at(&mut doc, w).err().unwrap();
+            assert!(e.contains("weight") && e.contains("up") && e.contains("10"), "{e}");
+        }
+        // A caller's weight is held to the same bound.
+        doc["meshes"][0]["weights"] = json!([0.0]);
+        let e = from_bytes_morphed(&pack(&doc, bin.clone()), &[("up".to_string(), 50.0)].into_iter().collect()).err().unwrap();
+        assert!(e.contains("weight"), "{e}");
     }
 
     #[test]
@@ -703,7 +807,7 @@ mod tests {
     #[ignore]
     fn render_glb() {
         let path = std::path::PathBuf::from(std::env::var("GLB").expect("GLB=/absolute/path.glb"));
-        let rest = read(&path, None, None).unwrap();
+        let rest = read(&path, None, None, &Default::default()).unwrap();
         let animation = rest.summary["animations"].as_array().unwrap().first();
         let clip = animation.map(|a| a["name"].as_str().unwrap().to_string());
         let mid = animation.map_or(0.0, |a| (a["frames"][0].as_f64().unwrap() + a["frames"][1].as_f64().unwrap()) as f32 * 0.5);
@@ -711,7 +815,7 @@ mod tests {
         std::fs::create_dir_all(&out).unwrap();
         let stem = path.file_stem().unwrap().to_str().unwrap();
         for (label, frame) in [("frame0", 0.0), ("mid", mid)] {
-            let loaded = read(&path, clip.as_deref(), Some(frame)).unwrap();
+            let loaded = read(&path, clip.as_deref(), Some(frame), &Default::default()).unwrap();
             eprintln!("{stem} {label}: {}", loaded.summary);
             std::fs::write(out.join(format!("{stem}_{label}.json")), serde_json::to_vec_pretty(&loaded.summary).unwrap()).unwrap();
             let (lo, hi) = loaded.bounds;

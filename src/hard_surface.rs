@@ -701,7 +701,7 @@ impl Envelope {
 
 /// Duplicate coincident render vertices at dihedral creases. Positions and
 /// winding stay unchanged; smooth regions keep their field normals.
-pub(super) fn split_normals(mesh: &mut crate::mesh::Mesh, normal: impl Fn(Vec3) -> Vec3) {
+pub(super) fn split_normals(mesh: &mut crate::mesh::Mesh, normal: impl Fn(Vec3) -> Vec3 + Sync) {
     let original = mesh.vertices.len();
     let mut incident = vec![Vec::new(); original];
     let faces: Vec<Vec3> = mesh
@@ -719,37 +719,42 @@ pub(super) fn split_normals(mesh: &mut crate::mesh::Mesh, normal: impl Fn(Vec3) 
             (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero()
         })
         .collect();
-    for (v, triangles) in incident.iter().enumerate() {
-        if !triangles
-            .iter()
-            .any(|&a| triangles.iter().any(|&b| faces[a].dot(faces[b]) < 0.6))
-        {
-            continue;
-        }
-        let position = Vec3::from(mesh.vertices[v].pos);
-        let shading: Vec<_> = triangles
-            .iter()
-            .map(|&f| {
-                let center = mesh.indices[f * 3..f * 3 + 3]
+    // The shading groups around each crease vertex (the field normal
+    // samples) on any thread; splitting copies a vertex with its position,
+    // so the groups do not depend on the splits made before them.
+    let (vertices, indices) = (&mesh.vertices, &mesh.indices);
+    let mut groups: Vec<Vec<(Vec3, Vec<usize>)>> = vec![Vec::new(); original];
+    super::par_chunks(&mut groups, 256, |chunk, out| {
+        for (j, out) in out.iter_mut().enumerate() {
+            let v = chunk * 256 + j;
+            let triangles = &incident[v];
+            if !triangles
+                .iter()
+                .any(|&a| triangles.iter().any(|&b| faces[a].dot(faces[b]) < 0.6))
+            {
+                continue;
+            }
+            let position = Vec3::from(vertices[v].pos);
+            for &f in triangles {
+                let center = indices[f * 3..f * 3 + 3]
                     .iter()
-                    .map(|&j| Vec3::from(mesh.vertices[j as usize].pos))
+                    .map(|&j| Vec3::from(vertices[j as usize].pos))
                     .sum::<Vec3>()
                     / 3.0;
-                (f, normal(position.lerp(center, 0.25)))
-            })
-            .collect();
-        let mut groups: Vec<(Vec3, Vec<usize>)> = Vec::new();
-        for (f, n) in shading {
-            if let Some(g) = groups
-                .iter_mut()
-                .find(|g| g.0.normalize_or_zero().dot(n) > 0.707)
-            {
-                g.0 += n;
-                g.1.push(f);
-            } else {
-                groups.push((n, vec![f]));
+                let n = normal(position.lerp(center, 0.25));
+                if let Some(g) = out
+                    .iter_mut()
+                    .find(|g| g.0.normalize_or_zero().dot(n) > 0.707)
+                {
+                    g.0 += n;
+                    g.1.push(f);
+                } else {
+                    out.push((n, vec![f]));
+                }
             }
         }
+    });
+    for (v, groups) in groups.into_iter().enumerate() {
         if groups.len() < 2 {
             continue;
         }
@@ -771,6 +776,171 @@ pub(super) fn split_normals(mesh: &mut crate::mesh::Mesh, normal: impl Fn(Vec3) 
                         *slot = index;
                     }
                 }
+            }
+        }
+    }
+}
+
+/// The eight corners of a box.
+fn box_corners(a: Vec3, b: Vec3) -> [Vec3; 8] {
+    super::CORNERS.map(|(x, y, z)| Vec3::new(if x == 0 { a.x } else { b.x }, if y == 0 { a.y } else { b.y }, if z == 0 { a.z } else { b.z }))
+}
+
+/// Whether a form's distance is exact, so never less than the distance to
+/// its box (or to any shape holding it). Arrays of such forms are too.
+/// A mesh's is: the nearest triangle within the bound, exactly, and
+/// outside its box positive (with no winding pass; see
+/// `MeshField::distance_within`), so at least the box's distance. A
+/// missing asset is a speck, a sphere.
+/// Whether a form is or copies a mesh.
+fn holds_mesh(form: &Form) -> bool {
+    match form {
+        Form::Mesh { .. } => true,
+        Form::Array { source, .. } | Form::Shell { source, .. } => holds_mesh(source),
+        _ => false,
+    }
+}
+
+fn exact(form: &Form) -> bool {
+    match form {
+        Form::Sphere { .. } | Form::Box { .. } | Form::Extrude { .. } | Form::Lathe { .. } | Form::Torus { .. } | Form::Mesh { .. } => true,
+        Form::Array { source, .. } => exact(source),
+        _ => false,
+    }
+}
+
+/// How an array finds the copies near a point.
+pub(super) enum Copies {
+    /// Every copy (one copy, or a source whose distance is not exact).
+    All,
+    /// Copy i at `step * i`, unrotated; `span` is the source's extent
+    /// along `unit`.
+    Line { step: Vec3, unit: Vec3, span: (f32, f32) },
+    /// Copy i turned by TAU * i / count about the axis through `center`
+    /// (`radial` turns toward `side`).
+    Circle { center: Vec3, radial: Vec3, side: Vec3 },
+    /// Copies along a path, which can come back near itself.
+    Tree(CopyTree),
+}
+
+/// One array lookup: the best distance so far and the least lower bound
+/// of the copies skipped.
+struct Walk {
+    q: Vec3,
+    bound: f32,
+    best: f32,
+    floor: f32,
+    /// More than rounding can move a bound, so it never skips a copy
+    /// whose distance comes out (a few ulps) lower.
+    slack: f32,
+}
+
+impl Walk {
+    /// Whether copies at least `gap` away cannot change the result (then
+    /// `gap` is remembered as skipped).
+    fn skips(&mut self, gap: f32) -> bool {
+        let gap = gap - self.slack;
+        let skip = gap > self.best.min(self.bound).max(0.0);
+        if skip {
+            self.floor = self.floor.min(gap);
+        }
+        skip
+    }
+
+    /// Visits `start`, then the copies of both sides outward in turn. Along
+    /// a side `lower` (a lower bound of a copy's distance, told which side)
+    /// never decreases, so a side ends at its first copy out of reach.
+    fn sides(&mut self, start: usize, down: impl Iterator<Item = usize>, up: impl Iterator<Item = usize>, lower: impl Fn(usize, bool) -> f32, mut visit: impl FnMut(&mut Walk, usize)) {
+        visit(self, start);
+        let (mut down, mut up) = (Some(down), Some(up));
+        while down.is_some() || up.is_some() {
+            self.side(&mut down, false, &lower, &mut visit);
+            self.side(&mut up, true, &lower, &mut visit);
+        }
+    }
+
+    fn side(&mut self, side: &mut Option<impl Iterator<Item = usize>>, up: bool, lower: &impl Fn(usize, bool) -> f32, visit: &mut impl FnMut(&mut Walk, usize)) {
+        let Some(i) = side.as_mut().and_then(Iterator::next) else {
+            *side = None;
+            return;
+        };
+        if self.skips(lower(i, up)) {
+            *side = None;
+        } else {
+            visit(self, i);
+        }
+    }
+}
+
+/// Copy boxes in a tree (median splits, up to four copies a leaf), walked
+/// nearest box first.
+pub(super) struct CopyTree {
+    nodes: Vec<CopyNode>,
+    order: Vec<u32>,
+}
+
+/// A leaf holds `order[first..first + count]`; an inner node (count 0) has
+/// its children right after it and at `second`.
+struct CopyNode {
+    lo: Vec3,
+    hi: Vec3,
+    first: u32,
+    count: u32,
+    second: u32,
+}
+
+impl CopyTree {
+    fn new(boxes: &[(Vec3, Vec3)]) -> Self {
+        let mut tree = Self { nodes: Vec::new(), order: (0..boxes.len() as u32).collect() };
+        tree.build(boxes, 0, boxes.len());
+        tree
+    }
+
+    fn build(&mut self, boxes: &[(Vec3, Vec3)], first: usize, end: usize) -> u32 {
+        let ids = &mut self.order[first..end];
+        let (lo, hi) = ids.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(lo, hi), &i| (lo.min(boxes[i as usize].0), hi.max(boxes[i as usize].1)));
+        let node = self.nodes.len();
+        self.nodes.push(CopyNode { lo, hi, first: first as u32, count: (end - first) as u32, second: 0 });
+        if end - first > 4 {
+            let center = |i: u32| boxes[i as usize].0 + boxes[i as usize].1;
+            let (clo, chi) = ids.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(lo, hi), &i| (lo.min(center(i)), hi.max(center(i))));
+            let axis = (chi - clo).max_position();
+            let mid = (first + end) / 2;
+            ids.select_nth_unstable_by(mid - first, |&a, &b| center(a)[axis].total_cmp(&center(b)[axis]));
+            self.nodes[node].count = 0;
+            self.build(boxes, first, mid);
+            self.nodes[node].second = self.build(boxes, mid, end);
+        }
+        node as u32
+    }
+
+    fn walk(&self, walk: &mut Walk, mut visit: impl FnMut(&mut Walk, u32)) {
+        let q = walk.q;
+        let gap = |n: u32| {
+            let n = &self.nodes[n as usize];
+            (n.lo - q).max(q - n.hi).max(Vec3::ZERO).length()
+        };
+        // Balanced: at most 512 copies make 8 levels.
+        let mut stack = [(0u32, 0.0f32); 32];
+        stack[0] = (0, gap(0));
+        let mut top = 1;
+        while top > 0 {
+            top -= 1;
+            let (n, g) = stack[top];
+            if walk.skips(g) {
+                continue;
+            }
+            let node = &self.nodes[n as usize];
+            if node.count > 0 {
+                for &i in &self.order[node.first as usize..(node.first + node.count) as usize] {
+                    visit(walk, i);
+                }
+            } else {
+                let (a, b) = ((n + 1, gap(n + 1)), (node.second, gap(node.second)));
+                let (near, far) = if a.1 <= b.1 { (a, b) } else { (b, a) };
+                stack[top] = far;
+                stack[top + 1] = near;
+                top += 2;
             }
         }
     }
@@ -812,7 +982,17 @@ pub(super) enum Geometry {
     Array {
         source: Box<Geo>,
         transforms: Vec<(Vec3, Quat)>,
+        /// The source's box, when its distance is exact (so at least the
+        /// distance to that box); None evaluates every copy.
         source_bounds: Option<(Vec3, Vec3)>,
+        /// How copies near a point are found (with `source_bounds`).
+        copies: Copies,
+        /// The source holds a mesh, whose bounded lookup deep inside
+        /// gives the bound and not its depth: copies are asked with the
+        /// caller's bound, not the best so far, so the deepest one counts.
+        mesh: bool,
+        /// Radius of a ball about each copy's origin holding the copy.
+        reach: f32,
         lo: Vec3,
         hi: Vec3,
     },
@@ -824,7 +1004,7 @@ pub(super) enum Geometry {
     },
 }
 impl Geometry {
-    pub(super) fn new(form: &Form) -> Self {
+    pub(super) fn new(form: &Form, assets: &super::Assets) -> Self {
         match form {
             Form::Extrude {
                 profile,
@@ -923,7 +1103,7 @@ impl Geometry {
                 }
             }
             Form::Shell { source, thickness } => {
-                let (g, lo, hi) = Geo::new(source);
+                let (g, lo, hi) = Geo::new(source, assets);
                 Self::Shell {
                     source: Box::new(g),
                     lo,
@@ -939,67 +1119,49 @@ impl Geometry {
                 center,
                 axis,
                 points,
-                orient,
+                ..
             } => {
-                let (g, a, b) = Geo::new(source);
-                // Path orientation: each segment's turn from the first one,
-                // carried along (parallel transport), so a loop turns all
-                // the way around without flipping.
-                let turns = if *orient == Orient::Path { path_turns(points) } else { vec![Quat::IDENTITY; points.len().saturating_sub(1)] };
+                let (g, a, b) = Geo::new(source, assets);
                 let mut transforms = Vec::new();
+                let mut boxes = Vec::new();
                 let mut lo = Vec3::splat(f32::MAX);
                 let mut hi = -lo;
                 let axis = axis.normalize_or(Vec3::Y);
                 let radial = axis.any_orthonormal_vector();
-                let lengths: Vec<f32> = std::iter::once(0.0)
-                    .chain(points.windows(2).scan(0.0, |n, w| {
-                        *n += w[0].distance(w[1]);
-                        Some(*n)
-                    }))
-                    .collect();
-                for i in 0..*count {
-                    let fraction = i as f32 / (*count - 1).max(1) as f32;
-                    let (translation, rot) = if points.len() >= 2 {
-                        let distance = fraction * lengths.last().unwrap();
-                        let j = lengths
-                            .partition_point(|v| *v < distance)
-                            .saturating_sub(1)
-                            .min(points.len() - 2);
-                        let t = (distance - lengths[j]) / (lengths[j + 1] - lengths[j]).max(1e-9);
-                        (points[j].lerp(points[j + 1], t), turns[j])
-                    } else if *radius > 0.0 {
-                        let rot = Quat::from_axis_angle(
-                            axis,
-                            std::f32::consts::TAU * i as f32 / *count as f32,
-                        );
-                        (*center + rot * radial * *radius, rot)
-                    } else {
-                        (*step * i as f32, Quat::IDENTITY)
-                    };
-                    for &(x, y, z) in &super::CORNERS {
-                        let c = Vec3::new(
-                            if x == 0 { a.x } else { b.x },
-                            if y == 0 { a.y } else { b.y },
-                            if z == 0 { a.z } else { b.z },
-                        );
+                for (translation, rot) in placements(form) {
+                    let (mut copy_lo, mut copy_hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+                    for c in box_corners(a, b) {
                         let c = translation + rot * c;
-                        lo = lo.min(c);
-                        hi = hi.max(c);
+                        copy_lo = copy_lo.min(c);
+                        copy_hi = copy_hi.max(c);
                     }
+                    lo = lo.min(copy_lo);
+                    hi = hi.max(copy_hi);
+                    boxes.push((copy_lo, copy_hi));
                     transforms.push((translation, rot.inverse()));
                 }
+                let source_bounds = exact(source).then_some((a, b));
+                let copies = if source_bounds.is_none() || *count < 2 {
+                    Copies::All
+                } else if points.len() >= 2 {
+                    Copies::Tree(CopyTree::new(&boxes))
+                } else if *radius > 0.0 {
+                    Copies::Circle { center: *center, radial, side: axis.cross(radial) }
+                } else if step.length_squared() > 1e-12 {
+                    let unit = step.normalize();
+                    let span = box_corners(a, b).iter().fold((f32::MAX, f32::MIN), |(l, h), c| (l.min(c.dot(unit)), h.max(c.dot(unit))));
+                    Copies::Line { step: *step, unit, span }
+                } else {
+                    // Every copy in one place.
+                    Copies::Tree(CopyTree::new(&boxes))
+                };
                 Self::Array {
                     source: Box::new(g),
                     transforms,
-                    source_bounds: matches!(
-                        **source,
-                        Form::Sphere { .. }
-                            | Form::Box { .. }
-                            | Form::Extrude { .. }
-                            | Form::Lathe { .. }
-                            | Form::Torus { .. }
-                    )
-                    .then_some((a, b)),
+                    source_bounds,
+                    copies,
+                    mesh: holds_mesh(source),
+                    reach: box_corners(a, b).iter().map(|c| c.length()).fold(0.0, f32::max),
                     lo,
                     hi,
                 }
@@ -1107,6 +1269,12 @@ impl Geometry {
         }
     }
     pub(super) fn sdf(&self, q: Vec3) -> f32 {
+        self.sdf_within(q, f32::MAX)
+    }
+    /// `sdf` where it is below `bound`; elsewhere some value from `bound`
+    /// up to it (still a lower bound of the distance). Arrays use this to
+    /// skip copies that cannot come within the bound; other forms ignore it.
+    pub(super) fn sdf_within(&self, q: Vec3, bound: f32) -> f32 {
         match self {
             Self::Extrude {
                 p,
@@ -1136,20 +1304,68 @@ impl Geometry {
                 source,
                 transforms,
                 source_bounds,
-                ..
+                copies,
+                mesh,
+                reach,
+                lo,
+                hi,
             } => {
-                let mut distance = f32::MAX;
-                for (t, r) in transforms {
-                    let local = *r * (q - *t);
-                    if let Some((lo, hi)) = source_bounds {
-                        let gap = (*lo - local).max(local - *hi).max(Vec3::ZERO).length();
-                        if gap > distance.max(0.0) {
-                            continue;
-                        }
-                    }
-                    distance = distance.min(source.sdf(local));
+                #[cfg(test)]
+                if array_tests::BRUTE.get() {
+                    return transforms.iter().map(|(t, r)| source.sdf(*r * (q - *t))).fold(f32::MAX, f32::min);
                 }
-                distance
+                let Some((a, b)) = *source_bounds else {
+                    return transforms.iter().fold(f32::MAX, |d, (t, r)| d.min(source.sdf_within(*r * (q - *t), d.min(bound))));
+                };
+                // Copies are visited nearest first. One is skipped when a
+                // lower bound of its distance (its box, its ball, the slab
+                // of a line array) exceeds the best so far (or `bound`): the
+                // source is exact, so the min over copies is unchanged.
+                // `floor` keeps the least bound skipped, which is returned
+                // when nothing came within `bound`.
+                let size = q.abs().max(lo.abs()).max(hi.abs()).max_element() + reach;
+                let mut walk = Walk { q, bound, best: f32::MAX, floor: f32::MAX, slack: size * 1e-6 };
+                let visit = |walk: &mut Walk, i: usize| {
+                    let (t, r) = &transforms[i];
+                    let local = *r * (q - *t);
+                    let gap = (a - local).max(local - b).max(Vec3::ZERO).length();
+                    if walk.skips(gap) {
+                        return;
+                    }
+                    let d = source.sdf_within(local, if *mesh { bound } else { walk.best.min(bound) });
+                    walk.best = walk.best.min(d);
+                };
+                // A ball about a copy's origin bounds it, rotated or not; the
+                // bound grows monotonically with the index away from the
+                // start, so a side stops at its first copy out of reach.
+                let ball = |i: usize| (q - transforms[i].0).length() - reach;
+                let n = transforms.len();
+                match copies {
+                    Copies::All => (0..n).for_each(|i| visit(&mut walk, i)),
+                    Copies::Line { step, unit, span } => {
+                        // Line copies are never rotated: each lies in a slab
+                        // across the line, as well as in its ball.
+                        // Below the start a copy's slab ends farther behind
+                        // the point at each step; above it, starts farther ahead.
+                        let slab = |i: usize, up: bool| {
+                            let s = (q - transforms[i].0).dot(*unit);
+                            ball(i).max(if up { span.0 - s } else { s - span.1 })
+                        };
+                        let start = (q.dot(*step) / step.length_squared()).round().clamp(0.0, (n - 1) as f32) as usize;
+                        walk.sides(start, (0..start).rev(), start + 1..n, slab, visit);
+                    }
+                    Copies::Circle { center, radial, side } => {
+                        // The distance to a copy's origin grows with its angle
+                        // from the point's, up to half a turn either way.
+                        let v = q - *center;
+                        let angle = v.dot(*side).atan2(v.dot(*radial)).rem_euclid(std::f32::consts::TAU);
+                        let start = (angle * n as f32 / std::f32::consts::TAU).round() as usize % n;
+                        let up = n / 2;
+                        walk.sides(start, (1..n - up).map(|k| (start + n - k) % n), (1..=up).map(|k| (start + k) % n), |i, _| ball(i), visit);
+                    }
+                    Copies::Tree(tree) => tree.walk(&mut walk, |walk, i| visit(walk, i as usize)),
+                }
+                walk.best.min(walk.floor)
             }
             Self::Band {
                 points,
@@ -1293,6 +1509,68 @@ impl Geometry {
 }
 
 /// Smallest authored cross-section feature for the default regular grid.
+/// Where an array form puts each copy of its source: (translation,
+/// rotation), copy = translation + rotation * source. Empty for other
+/// forms.
+fn placements(form: &Form) -> Vec<(Vec3, Quat)> {
+    let Form::Array { count, step, radius, center, axis, points, orient, .. } = form else { return Vec::new() };
+    // Path orientation: each segment's turn from the first one,
+    // carried along (parallel transport), so a loop turns all
+    // the way around without flipping.
+    let turns = if *orient == Orient::Path { path_turns(points) } else { vec![Quat::IDENTITY; points.len().saturating_sub(1)] };
+    let axis = axis.normalize_or(Vec3::Y);
+    let radial = axis.any_orthonormal_vector();
+    let lengths: Vec<f32> = std::iter::once(0.0)
+        .chain(points.windows(2).scan(0.0, |n, w| {
+            *n += w[0].distance(w[1]);
+            Some(*n)
+        }))
+        .collect();
+    (0..*count)
+        .map(|i| {
+            let fraction = i as f32 / (*count - 1).max(1) as f32;
+            if points.len() >= 2 {
+                let distance = fraction * lengths.last().unwrap();
+                let j = lengths
+                    .partition_point(|v| *v < distance)
+                    .saturating_sub(1)
+                    .min(points.len() - 2);
+                let t = (distance - lengths[j]) / (lengths[j + 1] - lengths[j]).max(1e-9);
+                (points[j].lerp(points[j + 1], t), turns[j])
+            } else if *radius > 0.0 {
+                let rot = Quat::from_axis_angle(
+                    axis,
+                    std::f32::consts::TAU * i as f32 / *count as f32,
+                );
+                (*center + rot * radial * *radius, rot)
+            } else {
+                (*step * i as f32, Quat::IDENTITY)
+            }
+        })
+        .collect()
+}
+
+/// An array form's copies as separate placements of one source form, for
+/// drawing them as instances: the source and each copy's (translation,
+/// rotation), as the array places them. `leaf` goes through nested
+/// arrays to the innermost source, composing the placements. None for
+/// other forms.
+pub(crate) fn array_copies(form: &Form, leaf: bool) -> Option<(Form, Vec<(Vec3, Quat)>)> {
+    let Form::Array { source, .. } = form else { return None };
+    let outer = placements(form);
+    if leaf && let Some((unit, inner)) = array_copies(source, true) {
+        let copies = outer.iter().flat_map(|&(t, r)| inner.iter().map(move |&(ti, ri)| (t + r * ti, r * ri))).collect();
+        return Some((unit, copies));
+    }
+    Some(((**source).clone(), outer))
+}
+
+/// A form's bounds (before any blob offsets).
+pub(crate) fn form_bounds(form: &Form, assets: &super::Assets) -> (Vec3, Vec3) {
+    let (_, lo, hi) = Geo::new(form, assets);
+    (lo, hi)
+}
+
 pub(super) fn feature_size(form: &Form) -> Option<f32> {
     let section = |p: &[Corner]| {
         let lo = p
@@ -1493,6 +1771,8 @@ pub(super) fn validate(form: &Form) -> Result<(), String> {
                 if n>4096 {Err("nested arrays may contain at most 4096 copies".into())}else{Ok(n)}
             },
             Form::Band {width,normal,..} if !positive(*width) || !axis_ok(*normal) => Err("band needs positive width and nonzero normal".into()),
+            // Top level or copied by an array/shell alike.
+            Form::Mesh {asset,center,rotate,scale,..} if asset.is_empty() || asset.len()>64 || !asset.bytes().all(|c|c.is_ascii_hexdigit()) || !center.is_finite() || !rotate.is_finite() || !scale.is_finite() || !(1e-6..=1e6).contains(&scale.abs()) || center.abs().max_element()>crate::mesh_asset::MAX_COORD => Err("a mesh blob needs an asset hash, a finite center and rotate, and a scale of 1e-6..1e6".into()),
             _=>Ok(1),
         }
     }
@@ -1981,5 +2261,335 @@ mod tests {
         ];
         let v = feature_vertex(&hits, Vec3::splat(0.5));
         assert!(v.min_element() >= 0.0 && v.max_element() <= 1.0);
+    }
+}
+
+/// Array evaluation against the plain loop over every copy, and pins for
+/// meshes of nested arrays (a small tower: bands, posts around each floor,
+/// a ring of columns).
+#[cfg(test)]
+pub(crate) mod array_tests {
+    use super::*;
+    use crate::clay::Clay;
+    use crate::mesh::Mesh;
+    use serde_json::{Value, json};
+
+    thread_local! {
+        /// Evaluate arrays copy by copy (this thread only; with one mesher
+        /// thread, see `clay::with_threads`).
+        pub(super) static BRUTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// The reference: every copy at every level, no culling.
+    fn brute(g: &Geo, q: Vec3) -> f32 {
+        match g {
+            Geo::Hard(Geometry::Array { source, transforms, .. }) => transforms.iter().map(|(t, r)| brute(source, *r * (q - *t))).fold(f32::MAX, f32::min),
+            g => g.sdf(q),
+        }
+    }
+
+    fn form(v: Value) -> Form {
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// Seeded points: some anywhere in (padded) bounds, some near copies.
+    fn points(g: &Geo, lo: Vec3, hi: Vec3, n: usize, seed: u64) -> Vec<Vec3> {
+        let mut state = seed;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let pad = (hi - lo).max_element() * 0.25 + 0.2;
+        let (lo, hi) = (lo - pad, hi + pad);
+        let origins: Vec<Vec3> = match g {
+            Geo::Hard(Geometry::Array { transforms, .. }) => transforms.iter().map(|t| t.0).collect(),
+            _ => vec![(lo + hi) * 0.5],
+        };
+        (0..n)
+            .map(|i| {
+                let r = Vec3::new(next(), next(), next());
+                if i % 5 < 3 {
+                    lo + (hi - lo) * r
+                } else {
+                    let o = origins[(next() * origins.len() as f32) as usize % origins.len()];
+                    o + (r - 0.5) * pad
+                }
+            })
+            .collect()
+    }
+
+    /// Line, overlapping, circle (a ring much smaller than the query
+    /// distance, queries inside the ring, rotated copies), a zig-zag path
+    /// that comes back near itself, nested arrays, and an ellipsoid leaf.
+    fn cases() -> Vec<(&'static str, Form)> {
+        let post = json!({"type":"box","center":[0,0.1,0],"size":[0.04,0.2,0.04]});
+        let square = json!([[-0.6,0.4,-0.6],[0.6,0.4,-0.6],[0.6,0.4,0.6],[-0.6,0.4,0.6],[-0.6,0.4,-0.6]]);
+        let posts = json!({"type":"array","source":post,"count":24,"points":square,"orient":"path"});
+        vec![
+            ("line", form(json!({"type":"array","source":{"type":"box","center":[0,0,0],"size":[0.3,0.2,0.2]},"count":20,"step":[0.5,0,0]}))),
+            ("overlapping line", form(json!({"type":"array","source":{"type":"extrude","profile":[[-0.4,-0.1],[0.4,-0.1],[0.4,0.1],[-0.4,0.1]],"depth":0.3,"axis":[0.2,0.1,1]},"count":30,"step":[0.1,0.05,0.02]}))),
+            ("small ring", form(json!({"type":"array","source":{"type":"box","center":[0.02,0,0],"size":[0.3,0.1,0.05],"rotate":[0,20,0]},"count":24,"radius":0.05}))),
+            ("rotated ring", form(json!({"type":"array","source":{"type":"box","center":[0.3,0.1,0],"size":[0.4,0.1,0.2],"rotate":[0,30,10]},"count":16,"radius":1.0,"axis":[0.3,1,0.2],"center":[0.1,0.2,0]}))),
+            ("lathe ring", form(json!({"type":"array","source":{"type":"lathe","profile":[[0.05,-0.1],[0.15,-0.1],[0.15,0.1],[0.05,0.1]],"center":[0.2,0,0]},"count":7,"radius":0.4,"axis":[1,0,0]}))),
+            ("zig-zag path", form(json!({"type":"array","source":{"type":"box","center":[0,0,0],"size":[0.1,0.05,0.3],"rotate":[0,0,25]},"count":60,"points":[[0,0,0],[2,0,0],[0,0.2,0],[2,0.4,0],[0,0.6,0]],"orient":"path"}))),
+            ("fixed path", form(json!({"type":"array","source":{"type":"sphere","center":[0,0,0],"radius":0.08},"count":40,"points":[[0,0,0],[1,0,0],[1,0,1],[0,0,1],[0,0,0.05]]}))),
+            ("posts per floor", form(json!({"type":"array","source":posts,"count":12,"step":[0,0.3,0]}))),
+            ("floors of rings of lines", form(json!({"type":"array","source":{"type":"array","source":{"type":"array","source":{"type":"torus","center":[0,0,0],"radius":0.05,"thickness":0.015},"count":4,"step":[0.12,0,0]},"count":6,"radius":0.5},"count":5,"step":[0,0.25,0]}))),
+            ("ellipsoid leaf", form(json!({"type":"array","source":{"type":"array","source":{"type":"ellipsoid","center":[0,0,0],"radii":[0.2,0.05,0.1]},"count":6,"step":[0.3,0,0]},"count":4,"step":[0,0.2,0.05]}))),
+            ("single copy", form(json!({"type":"array","source":{"type":"box","center":[0,0,0],"size":[0.3,0.2,0.2]},"count":1,"step":[0.5,0,0]}))),
+            ("coincident copies", form(json!({"type":"array","source":{"type":"sphere","center":[0.1,0,0],"radius":0.2},"count":9}))),
+        ]
+    }
+
+    #[test]
+    fn array_sdf_matches_brute_force() {
+        for (name, f) in cases() {
+            let (g, lo, hi) = Geo::new(&f, &Default::default());
+            let (mut worst, mut exact) = (0.0f32, 0usize);
+            let samples = points(&g, lo, hi, 10_000, 7);
+            for &q in &samples {
+                let (a, b) = (g.sdf(q), brute(&g, q));
+                worst = worst.max((a - b).abs());
+                exact += usize::from(a.to_bits() == b.to_bits());
+            }
+            eprintln!("{name}: {exact}/{} bit-identical, worst {worst:e}", samples.len());
+            assert!(worst <= 1e-6, "{name}: differs from brute force by {worst}");
+        }
+    }
+
+    /// Bounded lookups: the distance where it is below the bound, else a
+    /// value from the bound up to the distance (never more: callers such
+    /// as far_side read it as a lower bound).
+    #[test]
+    fn bounded_array_sdf_keeps_its_contract() {
+        for (name, f) in cases() {
+            let (g, lo, hi) = Geo::new(&f, &Default::default());
+            for (i, &q) in points(&g, lo, hi, 4000, 11).iter().enumerate() {
+                let exact = brute(&g, q);
+                let bound = [-0.05, 0.0, 0.02, 0.1, 0.4][i % 5];
+                let d = g.sdf_within(q, bound);
+                if exact < bound {
+                    assert!((d - exact).abs() <= 1e-6, "{name}: {d} for {exact} below {bound}");
+                } else {
+                    assert!(d >= bound - 1e-6 && d <= exact + 1e-6, "{name}: {d} for {exact} at bound {bound}");
+                }
+            }
+        }
+    }
+
+    /// Meshes of every case come out the same, copy by copy or nearest
+    /// first (one mesher thread, so the brute switch reaches every sample).
+    #[test]
+    fn array_meshes_match_brute_force() {
+        for (name, f) in cases() {
+            let mut blob = serde_json::to_value(&f).unwrap();
+            blob["blend"] = json!(0);
+            let c: Clay = serde_json::from_value(json!({"blobs":[blob],"resolution":48})).unwrap();
+            let fast = crate::clay::with_threads(1, || c.build_mesh());
+            BRUTE.set(true);
+            let slow = crate::clay::with_threads(1, || c.build_mesh());
+            BRUTE.set(false);
+            assert!(!fast.indices.is_empty(), "{name}");
+            assert_eq!(hash(&fast), hash(&slow), "{name}");
+        }
+    }
+
+    /// The mesher's output does not depend on how many threads it had.
+    #[test]
+    fn meshes_do_not_depend_on_thread_count() {
+        let c = tower(3, 12, 0.02);
+        let one = crate::clay::with_threads(1, || (c.build_mesh(), c.build_fine(&[], "").unwrap()));
+        let three = crate::clay::with_threads(3, || (c.build_mesh(), c.build_fine(&[], "").unwrap()));
+        let all = (c.build_mesh(), c.build_fine(&[], "").unwrap());
+        assert_eq!((hash(&one.0), hash(&one.1)), (hash(&all.0), hash(&all.1)));
+        assert_eq!((hash(&three.0), hash(&three.1)), (hash(&all.0), hash(&all.1)));
+    }
+
+    pub(crate) fn hash(m: &Mesh) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |x: u32| { h ^= x as u64; h = h.wrapping_mul(0x0100_0000_01b3); };
+        for v in &m.vertices {
+            v.pos.iter().chain(&v.normal).chain(&v.color).for_each(|f| eat(f.to_bits()));
+        }
+        m.indices.iter().for_each(|&i| eat(i));
+        h
+    }
+
+    /// A tower: a core, `floors` slabs, posts around each floor's edge
+    /// (an array of a path array) and a ring of columns, with a dome
+    /// blended on top.
+    pub(crate) fn tower(floors: usize, posts: usize, detail_cell: f32) -> Clay {
+        let height = floors as f32 * 0.3;
+        let post = json!({"type":"box","center":[0,0.1,0],"size":[0.04,0.2,0.04]});
+        let square = json!([[-0.6,0.4,-0.6],[0.6,0.4,-0.6],[0.6,0.4,0.6],[-0.6,0.4,0.6],[-0.6,0.4,-0.6]]);
+        serde_json::from_value(json!({"blobs":[
+            {"type":"box","center":[0,height*0.5,0],"size":[0.6,height,0.6],"blend":0,"name":"core"},
+            {"type":"array","source":{"type":"extrude","profile":[[-0.65,-0.65],[0.65,-0.65],[0.65,0.65],[-0.65,0.65]],"depth":0.06,"axis":[0,1,0],"center":[0,0.25,0]},"count":floors,"step":[0,0.3,0],"blend":0,"name":"floors"},
+            {"type":"array","source":{"type":"array","source":post,"count":posts,"points":square,"orient":"path"},"count":floors,"step":[0,0.3,0],"blend":0,"name":"posts"},
+            {"type":"array","source":{"type":"box","center":[0,height*0.5,0],"size":[0.06,height,0.06]},"count":8,"radius":0.75,"blend":0,"name":"columns"},
+            {"type":"sphere","center":[0,height,0],"radius":0.35,"blend":0.05,"name":"dome"}
+        ],"detail_cell":detail_cell})).unwrap()
+    }
+
+    /// A closed icosphere of radius 0.2 and the same with a cap cut off
+    /// its top (an open cup, read by its winding number).
+    pub(crate) fn ball_assets() -> (crate::mesh_asset::MeshAsset, crate::mesh_asset::MeshAsset) {
+        let (p, t) = crate::mesh_asset::tests::icosphere(2, 0.2);
+        let cup: Vec<[u32; 3]> = t.iter().copied().filter(|f| f.iter().map(|&i| p[i as usize].y).sum::<f32>() / 3.0 < 0.15).collect();
+        (crate::mesh_asset::MeshAsset::new(p.clone(), t).unwrap(), crate::mesh_asset::MeshAsset::new(p, cup).unwrap())
+    }
+
+    /// Arrays of mesh blobs: a line, a ring of turned and scaled copies,
+    /// a shell of an array, nested arrays, closed and winding signs.
+    pub(crate) fn mesh_cases() -> Vec<(&'static str, Clay)> {
+        let (ball, cup) = ball_assets();
+        let mesh = |a: &crate::mesh_asset::MeshAsset, sign: &str| json!({"type":"mesh","asset":a.hash(),"sign":sign,"center":[0.01,0.02,0],"rotate":[10,20,30],"scale":0.9});
+        let forms = [
+            ("closed line", json!({"type":"array","source":mesh(&ball,"closed"),"count":6,"step":[0.45,0,0]})),
+            ("winding line", json!({"type":"array","source":mesh(&cup,"winding"),"count":6,"step":[0.45,0,0.1]})),
+            ("winding ring", json!({"type":"array","source":mesh(&cup,"winding"),"count":10,"radius":0.6,"axis":[0.2,1,0.1]})),
+            ("shell of a winding path", json!({"type":"shell","thickness":0.04,"source":{"type":"array","source":mesh(&cup,"winding"),"count":8,"points":[[0,0,0],[1,0,0],[1,0,1],[0,0.2,1]],"orient":"path"}})),
+            ("nested closed", json!({"type":"array","source":{"type":"array","source":mesh(&ball,"closed"),"count":3,"step":[0.5,0,0]},"count":3,"step":[0,0.5,0.1]})),
+        ];
+        forms.into_iter().map(|(name, mut blob)| {
+            blob["blend"] = json!(0);
+            let mut c: Clay = serde_json::from_value(json!({"blobs":[blob],"resolution":48})).unwrap();
+            for a in [&ball, &cup] {
+                c.assets.insert(a.hash().to_string(), a.clone());
+            }
+            (name, c)
+        }).collect()
+    }
+
+    /// Meshes of arrays of meshes, recorded before such arrays looked only
+    /// at the copies near a point (every copy, a winding pass each). The
+    /// shell's is brute force's: before, a point deep inside one copy and
+    /// nearer another's surface read that distance as its depth (the old
+    /// mesh was 0x3f63_d5fb_e932_0296, 36,708 tris).
+    #[test]
+    fn mesh_array_meshes_are_pinned() {
+        let pinned = [
+            ("closed line", 0x6eb5_7ecb_95f1_bda0, 1936),
+            ("winding line", 0xfa41_b648_deb9_b4e6, 5952),
+            ("winding ring", 0xbcba_5004_9f39_632e, 21964),
+            ("shell of a winding path", 0x6903_8f17_bbe9_8ce9, 36720),
+            ("nested closed", 0x04f9_de89_c4a5_ed44, 9796),
+        ];
+        for ((name, c), (pinned_name, h, tris)) in mesh_cases().into_iter().zip(pinned) {
+            assert_eq!(name, pinned_name);
+            let m = c.build_mesh();
+            eprintln!("{name}: {:#x} ({} tris)", hash(&m), m.indices.len() / 3);
+            assert_eq!((hash(&m), m.indices.len() / 3), (h, tris), "{name}");
+        }
+    }
+
+    /// Arrays of meshes come out the same copy by copy (one mesher
+    /// thread, so the brute switch reaches every sample).
+    #[test]
+    fn mesh_array_meshes_match_brute_force() {
+        for (name, c) in mesh_cases() {
+            let fast = crate::clay::with_threads(1, || c.build_mesh());
+            BRUTE.set(true);
+            let slow = crate::clay::with_threads(1, || c.build_mesh());
+            BRUTE.set(false);
+            assert!(!fast.indices.is_empty(), "{name}");
+            assert_eq!(hash(&fast), hash(&slow), "{name}");
+        }
+    }
+
+    /// 512 copies of a cup read by its winding number (a line, and 8 x 8 x
+    /// 8 nested), sampled around the copies: each sample looks at a few
+    /// copies (every copy before, 512 lookups and 512 winding passes) and
+    /// runs the winding pass only inside a copy's box, bit for bit as
+    /// every copy would give.
+    #[test]
+    fn mesh_arrays_look_at_the_copies_near_a_point() {
+        for (name, f, assets) in mesh_arrays_of_512() {
+            let (g, _, _) = Geo::new(&f, &assets);
+            let (_, leaves) = array_copies(&f, true).unwrap();
+            assert_eq!(leaves.len(), 512);
+            let mut state = 9u64;
+            let mut next = move || {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (state >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+            };
+            let samples: Vec<Vec3> = (0..4000).map(|i| leaves[i * 7919 % 512].0 + Vec3::new(next(), next(), next()) * 0.6).collect();
+            let reset = || crate::mesh_asset::tests::COUNTS.with(|c| c.replace((0, 0)));
+            reset();
+            let t = std::time::Instant::now();
+            let fast: Vec<f32> = samples.iter().map(|&q| g.sdf(q)).collect();
+            let fast_time = t.elapsed();
+            let (lookups, windings) = reset();
+            let t = std::time::Instant::now();
+            let slow: Vec<f32> = samples.iter().map(|&q| brute(&g, q)).collect();
+            let slow_time = t.elapsed();
+            let (brute_lookups, brute_windings) = reset();
+            let n = samples.len() as f64;
+            let same = fast.iter().zip(&slow).filter(|(a, b)| a.to_bits() == b.to_bits()).count();
+            eprintln!("{name}: {:.2} lookups and {:.2} winding passes per sample ({fast_time:.1?} for {n}); every copy: {:.0} and {:.2} ({slow_time:.1?}); {same}/{n} bit-identical",
+                lookups as f64 / n, windings as f64 / n, brute_lookups as f64 / n, brute_windings as f64 / n);
+            assert_eq!(same, samples.len(), "{name}");
+            assert_eq!(brute_lookups, 512 * samples.len() as u64);
+            assert!(lookups as f64 / n < 16.0, "{name}: {lookups} lookups");
+            // A winding pass only where a copy's box holds the sample.
+            assert!(windings > 0 && windings == brute_windings, "{name}: {windings} winding passes, {brute_windings} for every copy");
+        }
+    }
+
+    /// The 512-copy arrays above, with their cup.
+    fn mesh_arrays_of_512() -> Vec<(&'static str, Form, super::super::Assets)> {
+        let (_, cup) = ball_assets();
+        let mesh = json!({"type":"mesh","asset":cup.hash(),"sign":"winding","rotate":[10,20,30]});
+        let assets = super::super::Assets::from([(cup.hash().to_string(), cup.clone())]);
+        vec![
+            ("line of 512", form(json!({"type":"array","source":mesh,"count":512,"step":[0.45,0,0]})), assets.clone()),
+            ("8 x 8 x 8", form(json!({"type":"array","source":{"type":"array","source":{"type":"array","source":mesh,"count":8,"step":[0.45,0,0]},"count":8,"step":[0,0.45,0]},"count":8,"step":[0,0,0.45]})), assets),
+        ]
+    }
+
+    /// Mesh build times of the 512-copy arrays:
+    /// `cargo test --release time_mesh_arrays -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn time_mesh_arrays() {
+        for (name, f, assets) in mesh_arrays_of_512() {
+            for res in [48u32, 256] {
+                let mut blob = serde_json::to_value(&f).unwrap();
+                blob["blend"] = json!(0);
+                let mut c: Clay = serde_json::from_value(json!({"blobs":[blob],"resolution":res})).unwrap();
+                c.assets = assets.clone();
+                let t = std::time::Instant::now();
+                let m = c.build_mesh();
+                eprintln!("{name}: res {res} mesh in {:.2}s, {} tris, {:#x}", t.elapsed().as_secs_f32(), m.indices.len() / 3, hash(&m));
+            }
+        }
+    }
+
+    /// Meshes of a small tower, recorded before array evaluation was
+    /// accelerated and the mesher parallelized; neither may change them.
+    #[test]
+    fn nested_array_meshes_are_pinned() {
+        let c = tower(6, 16, 0.0125);
+        let regular = c.build_mesh();
+        let fine = c.build_fine(&[], "").unwrap();
+        eprintln!("regular {:#x} ({} tris) fine {:#x} ({} tris)", hash(&regular), regular.indices.len() / 3, hash(&fine), fine.indices.len() / 3);
+        assert_eq!((hash(&regular), hash(&fine)), (TOWER_REGULAR, TOWER_FINE));
+    }
+    const TOWER_REGULAR: u64 = 0xe999_41d6_b669_9bb3;
+    const TOWER_FINE: u64 = 0xbd86_3c41_7e93_ffa7;
+
+    /// Regular and fine build times of a 48-floor tower:
+    /// `cargo test --release time_tower -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn time_tower() {
+        let floors = std::env::var("FLOORS").ok().and_then(|f| f.parse().ok()).unwrap_or(48);
+        let c = tower(floors, 40, 0.02);
+        let t = std::time::Instant::now();
+        let regular = c.build_mesh();
+        eprintln!("regular {:.2}s, {} tris, {:#x}", t.elapsed().as_secs_f32(), regular.indices.len() / 3, hash(&regular));
+        let t = std::time::Instant::now();
+        let fine = c.build_fine(&[], "").unwrap();
+        eprintln!("fine {:.2}s, {} tris, {:#x}", t.elapsed().as_secs_f32(), fine.indices.len() / 3, hash(&fine));
     }
 }

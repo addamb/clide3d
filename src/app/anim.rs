@@ -373,24 +373,46 @@ impl ClideApp {
             .filter_map(|o| o.rig.as_ref()?.active_clip())
             .filter_map(|c| c.range().map(|(a, b)| (a, b, c.looped)))
             .collect();
+        let output = Output::parse(args)?;
+        let most = if output.is_some() { MAX_SEQUENCE_FRAMES } else { 16 };
         let frames: Vec<f32> = match &args["frames"] {
-            Value::Array(list) => list.iter().map(|f| f.as_f64().filter(|f| f.is_finite()).map(|f| f as f32).ok_or("frames must be numbers")).collect::<Result<_, _>>()?,
+            Value::Array(list) => {
+                if list.len() > most {
+                    return Err(format!("pass 1 to {most} frames"));
+                }
+                list.iter().map(|f| f.as_f64().filter(|f| f.is_finite() && f.abs() < 1e6).map(|f| f as f32).ok_or("frames must be numbers")).collect::<Result<_, _>>()?
+            }
             other => {
-                let count = other.as_u64().unwrap_or(8).clamp(2, 16) as usize;
                 let (a, b) = ranges.iter().fold((f32::MAX, f32::MIN), |(a, b), r| (a.min(r.0), b.max(r.1)));
                 if a > b {
                     return Err("no clip is playing; make one with animate, or pick one with playback or clip".into());
                 }
                 // A loop's last frame repeats its first, so leave it out.
                 let looped = ranges.iter().all(|r| r.2);
+                // A movie or sequence: every whole frame of the clips.
+                let whole = ((b - a).round() as usize + usize::from(!looped)).clamp(2, MAX_SEQUENCE_FRAMES);
+                let count = match other.as_u64() {
+                    Some(n) => (n as usize).clamp(2, most),
+                    None if output.is_some() => whole,
+                    None => 8,
+                };
                 let span = if looped { (b - a) / count as f32 } else { (b - a) / (count - 1) as f32 };
                 (0..count).map(|i| ((a + span * i as f32) * 10.0).round() / 10.0).collect()
             }
         };
-        if frames.is_empty() || frames.len() > 16 {
-            return Err("pass 1 to 16 frames".into());
+        if frames.is_empty() || frames.len() > most {
+            return Err(format!("pass 1 to {most} frames"));
         }
-        let size = args["size"].as_u64().unwrap_or(256).clamp(64, 512) as usize;
+        // Movie frames are even sized (yuv420p halves the color).
+        let size = match output {
+            Some(_) => (args["size"].as_u64().unwrap_or(512).clamp(64, 1024) as usize) & !1,
+            None => args["size"].as_u64().unwrap_or(256).clamp(64, 512) as usize,
+        };
+        let fps = match args["fps"].as_f64() {
+            Some(f) if f.is_finite() && (1.0..=120.0).contains(&f) => f as f32,
+            Some(_) => return Err("fps must be 1..120".into()),
+            None => self.timeline.fps,
+        };
         let view = args.get("view").cloned().filter(|v| !v.is_null()).unwrap_or_else(|| Value::from("three_quarter"));
         Shot::framing(&view, Vec3::ZERO, 1.0)?;
         let bones = args["show_bones"].as_bool().unwrap_or(false);
@@ -412,7 +434,7 @@ impl ClideApp {
         self.meshes.sync(&self.scene);
         let meshes = self.meshes.clone();
         self.set_frame(keep);
-        let job = AnimJob { frames, size, view, bones, center, radius, save, lead: self.lead(), fps: self.timeline.fps };
+        let job = AnimJob { frames, size, view, bones, center, radius, save, lead: self.lead(), fps, shadows: self.shadows, post: self.view_look, lighting: self.view_lighting.clone(), ao: self.ao, output };
         let label = format!("Render animation ({} frames)", job.frames.len());
         Ok(super::jobs::Started::Job(label, animation_job(scene, meshes, self.render_state.clone(), job)))
     }
@@ -717,13 +739,114 @@ pub(super) struct AnimJob {
     pub save: Option<std::path::PathBuf>,
     pub lead: Option<u64>,
     pub fps: f32,
+    /// The viewport's shadow and HDR settings when the job started.
+    pub shadows: crate::render::Shadows,
+    pub post: crate::render::post::ViewLook,
+    pub lighting: std::sync::Arc<crate::view_light::ViewLighting>,
+    pub ao: crate::render::Ao,
+    /// Every frame as a file too (a PNG sequence or an mp4).
+    pub output: Option<Output>,
+}
+
+/// Most frames a sequence or movie may have (frames go to disk one at a
+/// time; the reply's sheet shows at most 16 of them).
+const MAX_SEQUENCE_FRAMES: usize = 1200;
+
+/// Where `render_animation` writes every frame (`format`, `path`).
+pub(super) enum Output {
+    /// PNG files `frame_00000.png ..` in this folder.
+    Sequence(std::path::PathBuf),
+    /// An mp4 at `path`, encoded by ffmpeg (`ffmpeg`, found when the call
+    /// was made) from frames written to `frames`, a folder next to it;
+    /// without ffmpeg the frames stay there, with a warning.
+    Movie { path: std::path::PathBuf, frames: std::path::PathBuf, ffmpeg: Option<std::path::PathBuf> },
+}
+
+impl Output {
+    fn parse(args: &Value) -> Result<Option<Output>, String> {
+        match args["format"].as_str() {
+            None if args["format"].is_null() => Ok(None),
+            Some("png_sequence") => Ok(Some(Output::Sequence(crate::outputs::folder(&args["path"], "path")?))),
+            Some("mp4") => {
+                let path = std::path::PathBuf::from(args["path"].as_str().ok_or("path (an absolute .mp4 path) is required with format mp4")?);
+                if !path.is_absolute() || path.extension().and_then(|e| e.to_str()) != Some("mp4") {
+                    return Err("path must be an absolute .mp4 path".into());
+                }
+                crate::outputs::writable(&path, crate::outputs::Kind::Mp4)?;
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("movie");
+                let frames = path.with_file_name(format!("{}_frames", crate::outputs::file_stem(stem)));
+                let frames = crate::outputs::folder(&json!(frames.to_str().ok_or("path must be valid text")?), "path")?;
+                Ok(Some(Output::Movie { path, frames, ffmpeg: crate::outputs::find_ffmpeg() }))
+            }
+            _ => Err("format must be png_sequence or mp4".into()),
+        }
+    }
+
+    /// Makes the folder frames go to (when the job starts: a call refused
+    /// while it is read leaves no folder behind).
+    fn prepare(&self) -> Result<(), String> {
+        crate::outputs::make_folder(self.frames())
+    }
+
+    /// The folder frames are written to.
+    fn frames(&self) -> &std::path::Path {
+        match self {
+            Output::Sequence(dir) => dir,
+            Output::Movie { frames, .. } => frames,
+        }
+    }
+
+    /// Writes frame `i` (refusing to overwrite anything but a PNG).
+    fn write(&self, i: usize, img: &ColorImage) -> Result<(), String> {
+        let path = self.frames().join(crate::outputs::frame_name(i));
+        crate::outputs::writable(&path, crate::outputs::Kind::Png)?;
+        let rgb: Vec<u8> = img.pixels.iter().flat_map(|p| [p.r(), p.g(), p.b()]).collect();
+        let bytes = crate::outputs::png8(img.size[0], img.size[1], 3, &rgb)?;
+        std::fs::write(&path, bytes).map_err(|e| format!("could not write {}: {e}", path.display()))
+    }
+
+    /// After the `count` frames are written: the movie (when ffmpeg is
+    /// there; its frames are then removed) and what the reply says.
+    fn finish(&self, count: usize, fps: f32, progress: &crate::progress::Progress) -> Result<Value, String> {
+        let frames = self.frames();
+        // A folder reused from an earlier, longer run keeps its tail: drop
+        // it, so the folder (and any movie) holds just these frames.
+        crate::outputs::clear_frames_from(frames, count);
+        let listed = json!({ "folder": frames.display().to_string(), "pattern": "frame_%05d.png", "count": count });
+        match self {
+            Output::Sequence(_) => Ok(json!({ "format": "png_sequence", "frames": listed })),
+            Output::Movie { path, ffmpeg: None, .. } => Ok(json!({
+                "format": "png_sequence", "frames": listed, "video": null,
+                "warning": format!("no ffmpeg found (PATH, /opt/homebrew/bin, /usr/local/bin or CLIDE_FFMPEG), so {} was not made: the frames are a PNG sequence instead", path.display()),
+            })),
+            Output::Movie { path, ffmpeg: Some(ffmpeg), .. } => {
+                progress.stage("encoding the movie (ffmpeg)", 0.97);
+                let t = std::time::Instant::now();
+                match crate::outputs::encode_mp4(ffmpeg, frames, count, fps, path, progress) {
+                    Ok(codec) => {
+                        // The frames were only for ffmpeg: remove them (and
+                        // their folder when nothing else is in it).
+                        for i in 0..count {
+                            let _ = std::fs::remove_file(frames.join(crate::outputs::frame_name(i)));
+                        }
+                        let _ = std::fs::remove_dir(frames);
+                        Ok(json!({ "format": "mp4", "video": path.display().to_string(), "codec": codec, "frames": count, "encode_seconds": (t.elapsed().as_secs_f32() * 100.0).round() / 100.0 }))
+                    }
+                    Err(e) if e == "cancelled" => Err(e),
+                    Err(e) => Ok(json!({ "format": "png_sequence", "frames": listed, "video": null, "warning": format!("{e}; the frames are a PNG sequence instead") })),
+                }
+            }
+        }
+    }
 }
 
 /// The work of a `render_animation` job: poses a snapshot of the scene at
 /// each frame and renders it off screen (any thread).
 pub(super) fn animation_job(mut scene: crate::scene::Scene, mut meshes: crate::mesh::MeshLib, rs: egui_wgpu::RenderState, job: AnimJob) -> super::jobs::Work {
     Box::new(move |progress| {
-        let AnimJob { frames, size, view, bones, center, radius, save, lead, fps } = job;
+        let AnimJob { frames, size, view, bones, center, radius, save, lead, fps, shadows, post, lighting, ao, output } = job;
+        // The sheet shows at most 16 frames, spread over the sequence.
+        let shown: Vec<usize> = if frames.len() <= 16 { (0..frames.len()).collect() } else { (0..16).map(|k| k * (frames.len() - 1) / 15).collect() };
         let n = frames.len() as f32;
         let at = |scene: &mut crate::scene::Scene, meshes: &mut crate::mesh::MeshLib, f: f32| {
             scene.frame = Some(f);
@@ -748,29 +871,58 @@ pub(super) fn animation_job(mut scene: crate::scene::Scene, mut meshes: crate::m
             }
         };
         let shot = Shot::framing(&view, center, radius)?;
+        if let Some(output) = &output {
+            output.prepare()?;
+        }
         let mut tiles = Vec::new();
         for (i, &f) in frames.iter().enumerate() {
             progress.check()?;
             progress.set(0.3 + i as f32 / n * 0.7);
             at(&mut scene, &mut meshes, f);
             let view_proj = shot.view_proj(size, size);
-            let cb = super::eyes::scene_callback_of(&scene, &meshes, view_proj, shot.eye, false, false);
+            let mut cb = super::eyes::scene_callback_of(&scene, &meshes, view_proj, shot.eye, false, false);
+            cb.shadows = shadows;
+            cb.post = post;
+            cb.lighting = lighting.clone();
+            cb.ao = ao;
             let mut img = crate::render::render_image(&rs, &cb, size as u32, size as u32, super::eyes::BACKGROUND)?;
             if bones {
                 draw_bones_on(&mut img, view_proj, &world_bones_of(&scene, Some(f), lead));
             }
-            tiles.push(img);
+            if let Some(output) = &output {
+                output.write(i, &img)?;
+            }
+            if shown.contains(&i) {
+                tiles.push(if output.is_some() { super::tools::downscale(&img, 256) } else { img });
+            }
         }
-        let cols = frames.len().min(4);
+        let written = match &output {
+            Some(output) => Some(output.finish(frames.len(), fps, progress)?),
+            None => None,
+        };
+        let cols = tiles.len().min(4);
         let sheet = contact_sheet(&tiles, cols);
         let png = super::tools::encode_png(&sheet)?;
-        let mut out = text(json!({
+        let mut reply = json!({
             "view": shot.name,
             "frames": frames,
             "layout": format!("{cols} per row, left to right, top to bottom, in frame order"),
             "fps": fps,
             "saved": save.as_ref().map(|p| p.display().to_string()),
-        }));
+            "device": super::eyes::raster_device(&rs),
+        });
+        if let Some(written) = written {
+            if let Some(w) = written.get("warning") {
+                reply["warnings"] = json!([w]);
+            }
+            // A long sequence: the frame list is in the files, the sheet's in the reply.
+            if frames.len() > 16 {
+                reply["frames"] = json!({ "count": frames.len(), "first": frames[0], "last": frames[frames.len() - 1] });
+            }
+            reply["sheet_frames"] = json!(shown.iter().map(|&i| frames[i]).collect::<Vec<_>>());
+            reply["output"] = written;
+        }
+        let mut out = text(reply);
         if let Some(p) = &save {
             let bytes = super::tools::encode_png_bytes(&sheet)?;
             std::fs::write(p, bytes).map_err(|e| format!("could not save {}: {e}", p.display()))?;
@@ -783,41 +935,64 @@ pub(super) fn animation_job(mut scene: crate::scene::Scene, mut meshes: crate::m
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egui_wgpu::wgpu;
-
-    fn block_on<F: std::future::Future>(future: F) -> F::Output {
-        struct Wake(std::thread::Thread);
-        impl std::task::Wake for Wake {
-            fn wake(self: std::sync::Arc<Self>) {
-                self.0.unpark();
-            }
-        }
-        let waker = std::task::Waker::from(std::sync::Arc::new(Wake(std::thread::current())));
-        let mut cx = std::task::Context::from_waker(&waker);
-        let mut future = std::pin::pin!(future);
-        loop {
-            if let std::task::Poll::Ready(v) = future.as_mut().poll(&mut cx) {
-                return v;
-            }
-            std::thread::park_timeout(std::time::Duration::from_millis(1));
-        }
-    }
-
-    /// A render state without a window (None where there is no GPU).
-    fn headless() -> Option<egui_wgpu::RenderState> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor { backends: wgpu::Backends::PRIMARY, ..Default::default() });
-        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
-        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;
-        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
-        let renderer = egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
-        let rs = egui_wgpu::RenderState { adapter, available_adapters: Vec::new(), device, queue, target_format: format, renderer: std::sync::Arc::new(egui::mutex::RwLock::new(renderer)) };
-        crate::render::init(&rs, crate::mesh::MeshLib::new().prims());
-        Some(rs)
-    }
 
     #[test]
     fn render_animation_job_renders_eight_frames() {
-        let Some(rs) = headless() else {
+        use crate::render::test_support;
+        for format in test_support::FORMATS {
+            let Some(rs) = test_support::headless_with(format) else {
+                eprintln!("no GPU adapter: skipped");
+                return;
+            };
+            let mut scene = crate::scene::Scene::default();
+            let id = scene.add(Shape::Clay);
+            let o = scene.get_mut(id).unwrap();
+            o.clay = Some(serde_json::from_value(json!({ "blobs": [{ "type": "capsule", "a": [0, 0, 0], "b": [0, 1, 0], "radius": 0.15 }], "resolution": 24 })).unwrap());
+            o.rig = Some(serde_json::from_value(json!({
+                "bones": [{ "name": "root", "head": [0, 0, 0], "tail": [0, 0.5, 0] }, { "name": "top", "parent": "root", "head": [0, 0.5, 0], "tail": [0, 1, 0] }],
+                "clips": [{ "name": "fire", "tracks": [{ "bone": "top", "keys": [{ "frame": 0 }, { "frame": 12, "rotate": [0, 0, 60] }, { "frame": 24 }] }] }],
+                "active": "fire", "split": false,
+            })).unwrap());
+            let mut meshes = crate::mesh::MeshLib::new();
+            meshes.sync(&scene);
+            let frames: Vec<f32> = (0..8).map(|i| i as f32 * 3.0).collect();
+            let job = AnimJob { frames, size: 64, view: json!("front"), bones: true, center: None, radius: None, save: None, lead: None, fps: 24.0, shadows: Default::default(), post: Default::default(), lighting: crate::view_light::ViewLighting::studio_default(), ao: Default::default(), output: None };
+            let progress = crate::progress::Progress::default();
+            let finish = test_support::checked(&rs, || animation_job(scene, meshes, rs.clone(), job)(&progress)).unwrap_or_else(|e| panic!("{format:?}: {e}"));
+            assert!(finish.is_ok(), "{format:?}: {:?}", finish.err());
+            assert!(progress.fraction() > 0.9);
+        }
+    }
+
+    /// Reading `format` and `path` makes no folder (the job does, when it
+    /// starts), and an existing mp4 that is no mp4 is refused, saying how
+    /// to go on; an empty one (an encode cut short) is not.
+    #[test]
+    fn output_paths_are_checked_without_making_folders() {
+        let dir = std::env::temp_dir().join(format!("clide-anim-parse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let seq = dir.join("seq");
+        let out = Output::parse(&json!({ "format": "png_sequence", "path": seq.to_str().unwrap() })).unwrap().unwrap();
+        let movie = dir.join("clip.mp4");
+        Output::parse(&json!({ "format": "mp4", "path": movie.to_str().unwrap() })).unwrap().unwrap();
+        assert!(!dir.exists(), "parsing made no folder");
+        out.prepare().unwrap();
+        assert!(seq.is_dir());
+        std::fs::write(&movie, b"").unwrap();
+        Output::parse(&json!({ "format": "mp4", "path": movie.to_str().unwrap() })).unwrap().unwrap();
+        std::fs::write(&movie, b"not a movie").unwrap();
+        let e = Output::parse(&json!({ "format": "mp4", "path": movie.to_str().unwrap() })).err().unwrap();
+        assert!(e.contains("refusing") && e.contains("delete it"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Stage 8b: `format: png_sequence` writes every frame (N files), and
+    /// `format: mp4` makes a movie when ffmpeg is there (else the frames
+    /// stay as a sequence, with a warning). Needs a GPU, like the sheet.
+    #[test]
+    fn render_animation_writes_a_sequence_and_a_movie() {
+        use crate::render::test_support;
+        let Some(rs) = test_support::headless() else {
             eprintln!("no GPU adapter: skipped");
             return;
         };
@@ -827,16 +1002,53 @@ mod tests {
         o.clay = Some(serde_json::from_value(json!({ "blobs": [{ "type": "capsule", "a": [0, 0, 0], "b": [0, 1, 0], "radius": 0.15 }], "resolution": 24 })).unwrap());
         o.rig = Some(serde_json::from_value(json!({
             "bones": [{ "name": "root", "head": [0, 0, 0], "tail": [0, 0.5, 0] }, { "name": "top", "parent": "root", "head": [0, 0.5, 0], "tail": [0, 1, 0] }],
-            "clips": [{ "name": "fire", "tracks": [{ "bone": "top", "keys": [{ "frame": 0 }, { "frame": 12, "rotate": [0, 0, 60] }, { "frame": 24 }] }] }],
-            "active": "fire", "split": false,
+            "clips": [{ "name": "wave", "tracks": [{ "bone": "top", "keys": [{ "frame": 0 }, { "frame": 12, "rotate": [0, 0, 60] }, { "frame": 24 }] }] }],
+            "active": "wave", "split": false,
         })).unwrap());
-        let mut meshes = crate::mesh::MeshLib::new();
-        meshes.sync(&scene);
-        let frames: Vec<f32> = (0..8).map(|i| i as f32 * 3.0).collect();
-        let job = AnimJob { frames, size: 64, view: json!("front"), bones: true, center: None, radius: None, save: None, lead: None, fps: 24.0 };
-        let progress = crate::progress::Progress::default();
-        let finish = animation_job(scene, meshes, rs, job)(&progress);
-        assert!(finish.is_ok(), "{:?}", finish.err());
-        assert!(progress.fraction() > 0.9);
+        let dir = std::env::temp_dir().join(format!("clide-anim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let run = |args: Value| {
+            let output = Output::parse(&args).unwrap().unwrap();
+            let mut meshes = crate::mesh::MeshLib::new();
+            meshes.sync(&scene);
+            let frames: Vec<f32> = (0..20).map(|i| i as f32).collect();
+            let job = AnimJob { frames, size: 96, view: json!("front"), bones: false, center: None, radius: None, save: None, lead: None, fps: 24.0, shadows: Default::default(), post: Default::default(), lighting: crate::view_light::ViewLighting::studio_default(), ao: Default::default(), output: Some(output) };
+            let progress = crate::progress::Progress::default();
+            let t = std::time::Instant::now();
+            let finish = test_support::checked(&rs, || animation_job(scene.clone(), meshes, rs.clone(), job)(&progress)).unwrap().unwrap();
+            eprintln!("render_animation {}: 20 frames in {:.2} s", args["format"], t.elapsed().as_secs_f32());
+            let (mut app, _tx) = ClideApp::headless(rs.clone());
+            let out = finish(&mut app).unwrap();
+            serde_json::from_str::<Value>(out[0]["text"].as_str().unwrap()).unwrap()
+        };
+        // Frames left by an earlier, longer run must not stay counted (nor
+        // reach a movie).
+        let stale = |folder: &std::path::Path| {
+            std::fs::create_dir_all(folder).unwrap();
+            for i in 20..25 {
+                std::fs::write(folder.join(crate::outputs::frame_name(i)), crate::outputs::png8(2, 2, 3, &[0; 12]).unwrap()).unwrap();
+            }
+        };
+        let seq = dir.join("seq");
+        stale(&seq);
+        let reply = run(json!({ "format": "png_sequence", "path": seq.to_str().unwrap() }));
+        let files = std::fs::read_dir(&seq).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().starts_with("frame_")).count();
+        assert_eq!((files, reply["output"]["frames"]["count"].as_u64()), (20, Some(20)));
+        assert_eq!(reply["sheet_frames"].as_array().unwrap().len(), 16);
+        let movie = dir.join("clip.mp4");
+        stale(&dir.join("clip_frames"));
+        let reply = run(json!({ "format": "mp4", "path": movie.to_str().unwrap() }));
+        if crate::outputs::find_ffmpeg().is_some() {
+            assert_eq!(reply["output"]["format"], "mp4", "{reply}");
+            assert!(movie.is_file());
+            // Its frames were only for ffmpeg.
+            assert!(!dir.join("clip_frames").exists());
+        } else {
+            eprintln!("skipped the mp4 half: no ffmpeg on this machine");
+            assert_eq!(reply["output"]["format"], "png_sequence");
+            assert!(reply["warnings"][0].as_str().unwrap().contains("no ffmpeg"));
+            assert_eq!(std::fs::read_dir(dir.join("clip_frames")).unwrap().count(), 20);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

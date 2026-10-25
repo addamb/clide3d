@@ -23,7 +23,7 @@ use crate::render::{self, Instance, ViewportCallback};
 const REF_MAX: u32 = 1024;
 /// Comparison images are at most this on the long side.
 const COMPARE_MAX: usize = 512;
-pub(super) const BACKGROUND: [u8; 3] = [96, 100, 106];
+pub(crate) const BACKGROUND: [u8; 3] = [96, 100, 106];
 
 pub(super) struct Reference {
     pub image: egui::ColorImage,
@@ -129,12 +129,16 @@ impl Shot {
 const FOV: f32 = 30.0;
 
 /// Extra things an off-screen render can show.
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 pub(super) struct Extras {
     /// Draw the skeletons on top.
     pub bones: bool,
     /// (object, bone): color that object by the bone's skin weights.
     pub weights: Option<(u64, usize)>,
+    /// Lighting and ambient occlusion for this render only (else the
+    /// viewport's).
+    pub lighting: Option<std::sync::Arc<crate::view_light::ViewLighting>>,
+    pub ao: Option<crate::render::Ao>,
 }
 
 /// Direction from the target to the camera, yaw/pitch in degrees.
@@ -226,6 +230,11 @@ impl ClideApp {
     pub(super) fn render_shot_extras(&self, shot: &Shot, w: usize, h: usize, mask: bool, grid: bool, ex: Extras) -> Result<egui::ColorImage, String> {
         let view_proj = shot.view_proj(w, h);
         let mut cb = self.scene_callback(view_proj, shot.eye, mask, grid);
+        cb.shadows = self.shadows;
+        cb.post = self.view_look;
+        cb.lighting = ex.lighting.clone().unwrap_or_else(|| self.view_lighting.clone());
+        cb.ao = ex.ao.unwrap_or(self.ao);
+        cb.matcap = self.matcap.clone();
         // Weight view: one bone's skin weights as colors, on a white object.
         if let Some((id, bone)) = ex.weights
             && let Some(o) = self.scene.get(id)
@@ -323,7 +332,12 @@ impl ClideApp {
         let size = args["size"].as_u64().unwrap_or(384).clamp(64, 1024) as usize;
         let grid = args["grid"].as_bool().unwrap_or(false);
         let with_ref = args["include_reference"].as_bool().unwrap_or(true) && self.reference.is_some();
-        let extras = Extras { bones: args["show_bones"].as_bool().unwrap_or(false), weights: self.weight_target(&args["weights"])? };
+        let extras = Extras {
+            bones: args["show_bones"].as_bool().unwrap_or(false),
+            weights: self.weight_target(&args["weights"])?,
+            lighting: args.get("lighting").filter(|v| !v.is_null()).map(|v| self.parse_lighting(v)).transpose()?,
+            ao: args.get("ambient_occlusion").filter(|v| !v.is_null()).map(|v| super::tools::parse_ao(v, self.ao)).transpose()?,
+        };
 
         let (mut center, mut radius) = self.scene_sphere();
         // Close-ups: frame a chosen point instead of the whole scene.
@@ -343,7 +357,7 @@ impl ClideApp {
         }
         for v in &views {
             let shot = Shot::framing(v, center, radius)?;
-            tiles.push(self.render_shot_extras(&shot, size, size, false, grid, extras)?);
+            tiles.push(self.render_shot_extras(&shot, size, size, false, grid, extras.clone())?);
             names.push(shot.name);
         }
         let cols = (tiles.len() as f32).sqrt().ceil() as usize;
@@ -355,6 +369,7 @@ impl ClideApp {
             "framed_radius": radius,
             "frame": self.meshes.frame,
             "fine_mesh_errors": self.fine_errors_json(),
+            "device": raster_device(&self.render_state),
         }));
         out.extend(super::tools::encode_png(&sheet)?);
         Ok(out)
@@ -546,7 +561,9 @@ impl ClideApp {
         let painted = samples.len();
         let obj = self.scene.get_mut(id).expect("checked");
         let mut clay = obj.clay.clone().unwrap_or_default();
+        crate::ledger::settle_clay(&mut clay, None)?;
         crate::paint::splat(&mut clay, &samples)?;
+        crate::layers::sync_within_budget(&mut clay)?;
         obj.clay = Some(clay);
         self.meshes.sync(&self.scene);
 
@@ -823,13 +840,12 @@ fn fit(img: &egui::ColorImage, w: usize, h: usize) -> egui::ColorImage {
 /// Lays images out in rows of `cols`, separated by thin dark gaps.
 /// A callback that draws every visible mesh of a scene (any thread: an
 /// off-screen job renders a snapshot). `mask` draws flat white.
-pub(super) fn scene_callback_of(scene: &crate::scene::Scene, meshes: &MeshLib, view_proj: Mat4, eye: Vec3, mask: bool, grid: bool) -> ViewportCallback {
+pub(crate) fn scene_callback_of(scene: &crate::scene::Scene, meshes: &MeshLib, view_proj: Mat4, eye: Vec3, mask: bool, grid: bool) -> ViewportCallback {
     let eval = scene.evaluate();
-    let mut fills: Vec<_> = crate::envkit::scatter::draws(scene, &eval)
-        .iter()
-        .filter(|d| d.object.shape.is_mesh())
-        .map(|d| (MeshLib::key(d.object), Instance::new(d.world, if mask { [1.0; 3] } else { d.object.color }).with_material(&scene.material_of(d.object))))
-        .collect();
+    let mut fills = Vec::new();
+    for d in crate::envkit::scatter::draws(scene, &eval).iter().filter(|d| d.object.shape.is_mesh()) {
+        push_fills(&mut fills, meshes, d.object, Instance::new(d.world, if mask { [1.0; 3] } else { d.object.color }).with_material(&scene.material_of(d.object)));
+    }
     fills.sort_by_key(|(k, _)| *k);
     ViewportCallback {
         slot: 0,
@@ -842,10 +858,38 @@ pub(super) fn scene_callback_of(scene: &crate::scene::Scene, meshes: &MeshLib, v
         show_grid: grid && !mask,
         flat: mask,
         lights: if mask { Vec::new() } else { crate::envkit::light::view_lights(scene, &eval, eye) },
+        shadows: render::Shadows::default(),
+        lighting: crate::view_light::ViewLighting::studio_default(),
+        ao: render::Ao::default(),
+        shadow_focus: None,
+        post: render::post::ViewLook::default(),
+        pane: None,
+        frame: 0,
+        background: [egui::Color32::from_rgb(BACKGROUND[0], BACKGROUND[1], BACKGROUND[2]); 2],
+        chunks: meshes.sculpt_chunks(),
+        matcap: None,
+        freeze_shadows: false,
+        cursor: None,
     }
 }
 
-pub(super) fn contact_sheet(tiles: &[egui::ColorImage], cols: usize) -> egui::ColorImage {
+/// An object's fills: its mesh, or each of its chunks while it is drawn
+/// in chunks (a sculpt session; with the mask and group overlay).
+pub(crate) fn push_fills(fills: &mut Vec<(crate::mesh::MeshKey, Instance)>, meshes: &MeshLib, o: &crate::scene::Object, instance: Instance) {
+    match meshes.chunk_keys(o) {
+        Some(keys) => fills.extend(keys.into_iter().map(|k| (k, instance.with_overlay(meshes.overlay)))),
+        None => fills.push((meshes.key_of(o), instance)),
+    }
+}
+
+/// The reply's `device` for viewport renders (render_views,
+/// render_animation): always the window's GPU rasterizer, never the tracer.
+pub(super) fn raster_device(rs: &egui_wgpu::RenderState) -> Value {
+    let info = rs.adapter.get_info();
+    json!({ "used": "gpu", "gpu": format!("{} ({:?})", info.name, info.backend), "fallback_reason": null, "renderer": "viewport" })
+}
+
+pub(crate) fn contact_sheet(tiles: &[egui::ColorImage], cols: usize) -> egui::ColorImage {
     const GAP: usize = 4;
     let cols = cols.max(1);
     let rows = tiles.len().div_ceil(cols);

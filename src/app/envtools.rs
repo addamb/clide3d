@@ -239,7 +239,11 @@ impl ClideApp {
             Some(t) => {
                 let id = self.resolve(t)?;
                 let o = self.scene.get(id).ok_or("object vanished")?;
-                Some((id, o.scatter.clone().ok_or_else(|| format!("{} is not a scatter", o.name))?))
+                let sc = o.scatter.clone().ok_or_else(|| format!("{} is not a scatter", o.name))?;
+                if sc.placed_by.as_deref() == Some("array") {
+                    return Err(format!("{} holds the copies of an array (instance_array); move or delete it, but it is not placed again", o.name));
+                }
+                Some((id, sc))
             }
             None => None,
         };
@@ -434,12 +438,32 @@ impl ClideApp {
         let eval = self.scene.evaluate();
         let draws = scatter::draws(&self.scene, &eval);
         let triangles: usize = draws.iter().filter(|d| d.object.shape.is_mesh()).filter_map(|d| self.meshes.get(d.object)).map(|m| m.indices.len() / 3).sum();
-        let unique: usize = self.scene.objects.iter().filter(|o| o.shape.is_mesh()).filter_map(|o| self.meshes.get(o)).map(|m| m.indices.len() / 3).sum();
+        // Objects showing the same mesh (identical clay) count it once.
+        let mut seen = std::collections::HashSet::new();
+        let unique: usize = self.scene.objects.iter().filter(|o| o.shape.is_mesh()).filter_map(|o| self.meshes.get(o)).filter(|m| seen.insert(std::sync::Arc::as_ptr(m))).map(|m| m.indices.len() / 3).sum();
+        let shared = self.scene.objects.iter().filter(|o| o.shape.is_mesh() && self.meshes.key_of(o) != crate::mesh::MeshLib::key(o)).count();
+        // Arrays with many copies, and whether instance_array takes them.
+        let mut arrays = Vec::new();
+        let mut hints = Vec::new();
+        for o in self.scene.objects.iter().filter(|o| o.shape == Shape::Clay) {
+            let Some(clay) = &o.clay else { continue };
+            for (blob, copies, nested) in clay.arrays().into_iter().filter(|a| a.1 >= 8) {
+                if arrays.len() >= 32 { break; }
+                let ok = clay.instancing(blob, false, false).is_ok();
+                arrays.push(json!({ "object": o.name, "blob": blob, "copies": copies, "nested": nested, "instanceable": ok }));
+                if ok && o.rig.as_ref().is_none_or(|r| r.bones.is_empty()) {
+                    hints.push(format!("{} blob {blob} repeats {copies} copies; instance_array meshes one copy and draws the rest as instances", o.name));
+                }
+            }
+        }
         json!({
             "triangles_drawn": triangles,
             "unique_triangles": unique,
             "copies": draws.iter().filter(|d| d.scattered).count(),
+            "shared_meshes": shared,
             "lights": draws.iter().filter(|d| d.object.light.is_some()).count(),
+            "arrays": arrays,
+            "hints": hints,
         })
     }
 }

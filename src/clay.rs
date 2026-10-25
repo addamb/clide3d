@@ -16,6 +16,7 @@
 //! Blob coordinates are in the owning object's own space.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine;
@@ -31,8 +32,14 @@ use crate::paint::Paint;
 mod membrane;
 #[path = "hard_surface.rs"]
 mod hard_surface;
+pub(crate) mod base_cache;
+pub(crate) mod chunks;
+pub(crate) mod sculptris;
 #[cfg(test)]
 pub(crate) use hard_surface::path_turns;
+pub(crate) use hard_surface::Corner;
+#[cfg(test)]
+pub(crate) use hard_surface::array_tests::tower;
 
 pub const MIN_RESOLUTION: u32 = 16;
 pub const MAX_RESOLUTION: u32 = 512;
@@ -47,6 +54,14 @@ enum Block {
     Out,
     In,
     Data(Box<[f32]>),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Meshes this thread built whole with marching tetrahedra because
+    /// one surface-nets edge joined more than two quads (see
+    /// `build_window_cells`; the Stage 0 triangle-count finding).
+    pub(crate) static TETRA_FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Offsets of a cube's 8 corners.
@@ -84,6 +99,23 @@ pub struct Clay {
     /// Feature-preserving placement; false is useful for comparison renders.
     #[serde(default = "yes")]
     pub sharp: bool,
+    /// The stroke ledgers behind `detail` and `paint` (see `ledger.rs`):
+    /// every stroke as a replayable record. The grids stay where they
+    /// are; a clay sculpted before ledgers existed has none until its
+    /// next stroke.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sculpt: Option<crate::ledger::SculptStack>,
+    /// The persistent sculpt mask (see `mask.rs`; not `masks`, the smart
+    /// materials' channels): brushes move each point by 1 - mask.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sculpt_mask: Option<crate::mask::SculptMask>,
+    /// Polygroups (see `groups.rs`), with their names and visibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub groups: Option<crate::groups::Groups>,
+    /// The triangle meshes its `Form::Mesh` blobs name, by content hash
+    /// (see `mesh_asset.rs`), so the clay saves and replays on its own.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty", deserialize_with = "crate::mesh_asset::library")]
+    pub assets: std::collections::BTreeMap<String, crate::mesh_asset::MeshAsset>,
 }
 
 /// Smallest `Clay::detail_cell`.
@@ -97,7 +129,7 @@ const MAX_FINE_BLOCKS: usize = 4_000_000;
 
 impl Default for Clay {
     fn default() -> Self {
-        Self { blobs: Vec::new(), resolution: DEFAULT_RESOLUTION, detail: None, paint: None, masks: Default::default(), decals: Vec::new(), detail_cell: None, shell: None, sharp: true }
+        Self { blobs: Vec::new(), resolution: DEFAULT_RESOLUTION, detail: None, paint: None, masks: Default::default(), decals: Vec::new(), detail_cell: None, shell: None, sharp: true, sculpt: None, sculpt_mask: None, groups: None, assets: Default::default() }
     }
 }
 
@@ -119,6 +151,9 @@ pub enum Op {
     Plate,
     Engrave,
     Emboss,
+    /// Keep only what is inside both this blob and everything before it
+    /// (a smooth max over `blend`): booleans across objects (`to_clay`).
+    Intersect,
 }
 
 /// How much thicker than its mesh a human blob is (0.6 mm).
@@ -262,6 +297,30 @@ pub enum Form {
         #[serde(default)]
         part: HumanPart,
     },
+    /// A triangle mesh (`mesh_asset.rs`) by content hash, kept in the
+    /// clay's `assets`: imports, `to_clay` and InsertMesh. Placed at
+    /// `center`, turned by `rotate` (degrees XYZ) and scaled uniformly.
+    /// `sign: winding` reads open meshes (holes close).
+    Mesh {
+        asset: String,
+        #[serde(default)]
+        sign: crate::mesh_asset::Sign,
+        #[serde(default)]
+        center: Vec3,
+        #[serde(default)]
+        rotate: Vec3,
+        #[serde(default = "one")]
+        scale: f32,
+    },
+}
+
+/// One array blob as copies of a single shape (see `Clay::instancing`).
+#[derive(Debug)]
+pub struct Instancing {
+    /// The shape alone: the blob with the array's source as its form.
+    pub unit: Clay,
+    /// Where each copy goes in the clay's space: (translation, rotation).
+    pub copies: Vec<(Vec3, glam::Quat)>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -315,7 +374,31 @@ pub struct Blob {
 }
 
 impl Blob {
+    /// A plain blob of `form` (no blend, the defaults otherwise).
+    pub fn of(form: Form, op: Op, color: [f32; 3]) -> Blob {
+        Blob { name: String::new(), form, op, blend: 0.0, color, mirror: false, flip: false, material: String::new(), bone: String::new(), offset: default_offset(), smooth: 0.0, join: Default::default(), join_size: None, wall: default_offset(), rim: 0.0, ridge: 0.0, flare: 0.0, color_blend: None }
+    }
+
+    /// The mesh assets a blob names: its own `Form::Mesh`, or one an
+    /// array or shell copies (the clay must keep those too).
+    pub fn mesh_assets(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut form = &self.form;
+        loop {
+            match form {
+                Form::Mesh { asset, .. } => out.push(asset.as_str()),
+                Form::Array { source, .. } | Form::Shell { source, .. } => {
+                    form = source;
+                    continue;
+                }
+                _ => {}
+            }
+            return out;
+        }
+    }
+
     pub(crate) fn validate(&self) -> Result<(), String> {
+        // Mesh forms (nested ones too) are checked in `hard_surface::validate`.
         hard_surface::validate(&self.form)?;
         if !self.ridge.is_finite() || self.ridge < 0.0 || !self.flare.is_finite() || self.flare < 0.0 { return Err("ridge and flare must be finite and nonnegative".into()); }
         if !self.wall.is_finite() || self.wall <= 0.0 || !self.rim.is_finite() || self.rim < 0.0 || self.join_size.is_some_and(|v| !v.is_finite() || v < 0.0) {
@@ -395,6 +478,10 @@ struct Prim {
     hi: Vec3,
 }
 
+/// A clay's mesh assets by content hash (`Clay::assets`): all its
+/// geometry reads.
+pub(crate) type Assets = std::collections::BTreeMap<String, crate::mesh_asset::MeshAsset>;
+
 enum Geo {
     Hard(hard_surface::Geometry),
     Chain { beads: Vec<Geo>, core: Vec<Geo> },
@@ -406,14 +493,18 @@ enum Geo {
     Torus { c: Vec3, big: f32, small: f32, inv: Quat },
     /// A mesh's exact distance, kept above `above` and below `below` (y).
     Mesh { sdf: Arc<crate::human::Shape>, above: f32, below: f32 },
+    /// A `Form::Mesh`: the asset's field, placed.
+    Imported { field: Arc<crate::mesh_asset::MeshField>, sign: crate::mesh_asset::Sign, c: Vec3, inv: Quat, scale: f32 },
 }
 
 impl Geo {
-    fn new(form: &Form) -> (Geo, Vec3, Vec3) {
+    /// A form's geometry and box; `Form::Mesh` reads its asset from
+    /// `assets` (the clay's own) and nothing else.
+    fn new(form: &Form, assets: &Assets) -> (Geo, Vec3, Vec3) {
         let pos = |v: f32| v.abs().max(1e-4);
         match *form {
             Form::Extrude { .. } | Form::Lathe { .. } | Form::Sweep { .. } | Form::Shell { .. } | Form::Array { .. } | Form::Band { .. } => {
-                let g = hard_surface::Geometry::new(form);
+                let g = hard_surface::Geometry::new(form, assets);
                 let (lo, hi) = g.bounds();
                 (Geo::Hard(g), lo, hi)
             },
@@ -493,6 +584,27 @@ impl Geo {
                 };
                 (Geo::Mesh { sdf: shape, above, below }, lo, hi)
             }
+            Form::Mesh { ref asset, sign, center, rotate, scale } => {
+                // The clay's own assets only (`Clay::assets`), so its
+                // geometry depends on the clay alone; a blob naming one it
+                // does not keep is a speck. Only field-sized assets
+                // (`adopt_assets` and file reads keep to that).
+                let Some(asset) = assets.get(asset).filter(|a| a.tris().len() <= crate::mesh_asset::MAX_FIELD_TRIANGLES) else {
+                    return (Geo::Sphere { c: Vec3::ZERO, r: 1e-4 }, Vec3::splat(-1e-4), Vec3::splat(1e-4));
+                };
+                let field = asset.field();
+                let scale = if scale.is_finite() { scale.abs().max(1e-6) } else { 1.0 };
+                let rot = rotation(rotate);
+                let (flo, fhi) = (field.lo, field.hi);
+                let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+                for (x, y, z) in CORNERS {
+                    let q = Vec3::new(if x == 0 { flo.x } else { fhi.x }, if y == 0 { flo.y } else { fhi.y }, if z == 0 { flo.z } else { fhi.z });
+                    let p = center + rot * (q * scale);
+                    lo = lo.min(p);
+                    hi = hi.max(p);
+                }
+                (Geo::Imported { field, sign, c: center, inv: rot.inverse(), scale }, lo, hi)
+            }
             Form::Sphere { center, radius } => {
                 let r = pos(radius);
                 (Geo::Sphere { c: center, r }, center - r, center + r)
@@ -539,6 +651,16 @@ impl Geo {
         }
     }
 
+    /// `sdf` where it is below `bound`; elsewhere a value from `bound` up
+    /// to it (see `hard_surface::Geometry::sdf_within`).
+    fn sdf_within(&self, p: Vec3, bound: f32) -> f32 {
+        match self {
+            Geo::Hard(g) => g.sdf_within(p, bound),
+            Geo::Imported { field, sign, c, inv, scale } => field.distance_within(*inv * (p - *c) / *scale, bound / *scale, *sign) * *scale,
+            _ => self.sdf(p),
+        }
+    }
+
     fn sdf(&self, p: Vec3) -> f32 {
         match *self {
             Geo::Hard(ref g) => g.sdf(p),
@@ -576,6 +698,7 @@ impl Geo {
                     + if above > f32::MIN { HEAD_OVERLAP_INSET * 0.35 * (1.0 - smooth_ramp((p.y - above) / 0.025)) } else { 0.0 };
                 (sdf.sdf.distance(p) - HUMAN_SKIN + inset).max(above - p.y).max(p.y - below)
             }
+            Geo::Imported { ref field, sign, c, inv, scale } => field.distance(inv * (p - c) / scale, sign) * scale,
         }
     }
 }
@@ -628,6 +751,9 @@ pub(crate) struct Field {
     keep: Option<Vec<bool>>,
     shell: Option<f32>,
     damage: Vec<crate::smart::Decal>,
+    /// The blob field memoized on a lattice (see `base_cache.rs`), when a
+    /// caller attached one: lattice reads then cost a lookup.
+    base: Option<Arc<base_cache::BaseCache>>,
 }
 
 impl Field {
@@ -639,7 +765,7 @@ impl Field {
         let names = clay.material_names();
         for blob in clay.blobs.iter().take(MAX_BLOBS) {
             let mat = names.iter().position(|n| *n == blob.material).unwrap_or(0) as u16;
-            let (mut geo, mut lo, mut hi) = Geo::new(&blob.form);
+            let (mut geo, mut lo, mut hi) = Geo::new(&blob.form, &clay.assets);
             if let Geo::Hard(ref mut g) = geo { g.band_depth(blob.wall); (lo,hi)=g.bounds(); }
             let size = blob.join_size.unwrap_or(blob.blend);
             let k = if blob.join == hard_surface::Join::Sharp { 0.0 } else if size.is_finite() { size.max(0.0) } else { 0.0 };
@@ -652,7 +778,7 @@ impl Field {
             let color = Vec3::from(blob.color).clamp(Vec3::ZERO, Vec3::ONE);
             let (mlo, mhi) = (Vec3::new(-hi.x, lo.y, lo.z), Vec3::new(-lo.x, hi.y, hi.z));
             if blob.mirror {
-                let (mut geo2, _, _) = Geo::new(&blob.form);
+                let (mut geo2, _, _) = Geo::new(&blob.form, &clay.assets);
                 if let Geo::Hard(ref mut g) = geo2 { g.band_depth(blob.wall); }
                 let (a, b) = if blob.flip { (lo, hi) } else { (mlo, mhi) };
                 prims.push(Prim { geo: geo2, op: blob.op, k, ck, offset, smooth, join: blob.join, wall: blob.wall.abs().max(1e-4), rim: blob.rim.max(0.0), ridge: blob.ridge, flare: blob.flare, envelope: None, name: blob.name.clone(), color, mat, bone: crate::rig::mirror_name(&blob.bone).unwrap_or_else(|| blob.bone.clone()), flip: !blob.flip, lo: a, hi: b });
@@ -660,14 +786,16 @@ impl Field {
             let (a, b) = if blob.flip { (mlo, mhi) } else { (lo, hi) };
             prims.push(Prim { geo, op: blob.op, k, ck, offset, smooth, join: blob.join, wall: blob.wall.abs().max(1e-4), rim: blob.rim.max(0.0), ridge: blob.ridge, flare: blob.flare, envelope: None, name: blob.name.clone(), color, mat, bone: blob.bone.clone(), flip: blob.flip, lo: a, hi: b });
         }
-        let detail = clay.detail.clone();
+        // Every enabled sculpt layer (`layers.rs`; the clay's own grid
+        // without any).
+        let detail = crate::layers::composed_detail(clay);
         // With a detail layer the limit must not depend on the mesh grid.
         let base = match &detail {
             Some(d) => 4.0 * d.voxel(),
             None => 2.0 * voxel,
         };
         // Covers read the field up to their offset away from the surface.
-        let mut field = Field { prims, max_k, limit: base + clay.decals.iter().map(|d|crate::damage::depth(d).abs()*3.0 + if d.hinge.is_some() {d.size*0.5*d.angle.to_radians().sin().abs()}else{0.0}).fold(0.0,f32::max) + 2.0 * max_k + max_offset + max_smooth + clay.shell.unwrap_or(0.0) + clay.blobs.iter().filter(|b| matches!(b.op, Op::Plate | Op::Engrave | Op::Emboss)).map(|b| b.wall).fold(0.0, f32::max), detail, keep: None, shell: clay.shell, damage: clay.decals.iter().filter(|d|d.shape.code()>=5 && (crate::damage::depth(d)!=0.0 || d.hinge.is_some())).cloned().collect() };
+        let mut field = Field { prims, max_k, limit: base + clay.decals.iter().map(|d|crate::damage::depth(d).abs()*3.0 + if d.hinge.is_some() {d.size*0.5*d.angle.to_radians().sin().abs()}else{0.0}).fold(0.0,f32::max) + 2.0 * max_k + max_offset + max_smooth + clay.shell.unwrap_or(0.0) + clay.blobs.iter().filter(|b| matches!(b.op, Op::Plate | Op::Engrave | Op::Emboss)).map(|b| b.wall).fold(0.0, f32::max), detail, keep: None, shell: clay.shell, damage: clay.decals.iter().filter(|d|d.shape.code()>=5 && (crate::damage::depth(d)!=0.0 || d.hinge.is_some())).cloned().collect(), base: None };
         // Cache the large fitting filter once; fine meshing must not issue
         // dozens of human-distance queries for every grid point.
         for i in 0..field.prims.len() {
@@ -697,6 +825,52 @@ impl Field {
             field.prims[i].envelope = Some(envelope);
         }
         field
+    }
+
+    /// Swaps the detail layer the field adds (the sculpt engine's next dab
+    /// reads the grid the last one wrote). `limit` stays: it depends only on
+    /// whether there is a detail layer, and both have one.
+    pub(crate) fn set_detail(&mut self, detail: Detail) {
+        debug_assert!(self.detail.as_ref().is_none_or(|d| d.voxel() == detail.voxel()));
+        self.detail = Some(detail);
+    }
+
+    /// Lets go of the detail layer (until `set_detail`), so the sculpt
+    /// engine can write the grid without copying it.
+    pub(crate) fn take_detail(&mut self) -> Option<Detail> {
+        self.detail.take()
+    }
+
+    pub(crate) fn detail_mut(&mut self) -> Option<&mut Detail> {
+        self.detail.as_mut()
+    }
+
+    pub(crate) fn detail(&self) -> Option<&Detail> {
+        self.detail.as_ref()
+    }
+
+    /// Reads the blob field at lattice points through `cache` (made for
+    /// this field: `base_cache::for_clay`).
+    pub(crate) fn with_base(mut self, cache: Arc<base_cache::BaseCache>) -> Field {
+        self.base = Some(cache);
+        self
+    }
+
+    /// `sample_base` at lattice points `(i0 + (x, y, z)) * voxel`, x
+    /// fastest, into `out`: from the attached cache when it has this
+    /// lattice, else worked out with `near` (the same values either way).
+    pub(crate) fn base_block(&self, i0: glam::IVec3, n: glam::IVec3, voxel: f32, near: &[u32], out: &mut [f32]) {
+        if let Some(c) = self.base.as_ref().filter(|c| c.voxel == voxel && self.keep.is_none()) {
+            return c.block(self, i0, n, out);
+        }
+        let (nx, ny) = (n.x as usize, n.y as usize);
+        par_chunks(out, nx * ny, |z, layer| {
+            for y in 0..ny {
+                for x in 0..nx {
+                    layer[x + nx * y] = self.sample_base((i0 + glam::IVec3::new(x as i32, y as i32, z as i32)).as_vec3() * voxel, near).0;
+                }
+            }
+        });
     }
 
     /// Restricts the surface to the prims marked true.
@@ -758,11 +932,25 @@ impl Field {
         (0..self.prims.len() as u32)
             .filter(|&i| {
                 let p = &self.prims[i as usize];
-                // Box-to-box gap.
+                // Box-to-box gap. An intersect blob matters everywhere:
+                // far from it nothing is left.
                 let gap = (p.lo - hi).max(lo - p.hi).max(Vec3::ZERO).length();
-                gap <= reach
+                gap <= reach || p.op == Op::Intersect
             })
             .collect()
+    }
+
+    /// `near(lo, hi)` into `out`, testing only `from` (a `near` list of a
+    /// box holding lo..hi, so a superset in the same order): the same list
+    /// `near` gives, without walking every prim or allocating.
+    pub(crate) fn near_from(&self, lo: Vec3, hi: Vec3, from: &[u32], out: &mut Vec<u32>) {
+        let reach = self.reach();
+        out.clear();
+        out.extend(from.iter().copied().filter(|&i| {
+            let p = &self.prims[i as usize];
+            let gap = (p.lo - hi).max(lo - p.hi).max(Vec3::ZERO).length();
+            gap <= reach || p.op == Op::Intersect
+        }));
     }
 
     fn has_detail(&self, lo: Vec3, hi: Vec3) -> bool {
@@ -797,11 +985,13 @@ impl Field {
             }
             let prim = &self.prims[i as usize];
             // `lo`/`hi` are already mirrored for flipped prims, so test `p` itself.
-            if prim.op != Op::Carve && box_distance(p, prim.lo, prim.hi) > limit + prim.k {
+            if !matches!(prim.op, Op::Carve | Op::Intersect) && box_distance(p, prim.lo, prim.hi) > limit + prim.k {
                 continue;
             }
             let q = if prim.flip { Vec3::new(-p.x, p.y, p.z) } else { p };
-            let db = prim.geo.sdf(q);
+            // Every op below leaves `d` (within +-limit) as it is once the
+            // blob is limit + k away, so nearer than that is all that counts.
+            let db = prim.geo.sdf_within(q, limit + prim.k);
             let k = prim.k;
             match prim.op {
                 Op::Add => {
@@ -836,6 +1026,15 @@ impl Field {
                     } else {
                         let h = (0.5 - 0.5 * (d + db) / k).clamp(0.0, 1.0);
                         d = if prim.join == hard_surface::Join::Chamfer { d.max(-db).max((d - db + k) * std::f32::consts::FRAC_1_SQRT_2) } else { d * (1.0 - h) - db * h + k * h * (1.0 - h) };
+                    }
+                }
+                Op::Intersect => {
+                    if k <= 1e-6 {
+                        d = d.max(db);
+                    } else {
+                        // Smooth max (as carve's, with the blob not inverted).
+                        let h = (0.5 - 0.5 * (db - d) / k).clamp(0.0, 1.0);
+                        d = if prim.join == hard_surface::Join::Chamfer { d.max(db).max((d + db + k) * std::f32::consts::FRAC_1_SQRT_2) } else { db * (1.0 - h) + d * h + k * h * (1.0 - h) };
                     }
                 }
                 Op::Engrave => { d = d.max((d + prim.wall).min(-db)); }
@@ -924,7 +1123,9 @@ impl Field {
             }
             let prim = &self.prims[i as usize];
             let q = if prim.flip { Vec3::new(-p.x, p.y, p.z) } else { p };
-            let d = prim.geo.sdf(q);
+            // Only whether a blob is within far + k matters (a little more,
+            // so a value of at least the bound still counts as beyond it).
+            let d = prim.geo.sdf_within(q, (far + prim.k) * 1.001 + 1e-6);
             match prim.op {
                 Op::Add => {
                     nearest = nearest.min(d - prim.k);
@@ -934,6 +1135,11 @@ impl Field {
                 Op::Cover | Op::Plate | Op::Emboss => nearest = nearest.min(d - prim.k),
                 // A carve within reach could open the inside to the surface.
                 Op::Carve | Op::Engrave => carve_near |= d < far + prim.k,
+                // Outside it nothing stays; inside, its surface may cut.
+                Op::Intersect => {
+                    nearest = nearest.min(d - prim.k);
+                    carve_near = true;
+                }
             }
         }
         if self.shell.is_some() || list.iter().any(|&i| matches!(self.prims[i as usize].op, Op::Plate | Op::Engrave | Op::Emboss)) { return None; }
@@ -983,6 +1189,12 @@ impl Field {
         self.shell.map_or(d, |t| (d + t * 0.5).abs() - t * 0.5)
     }
 
+    /// `sample` without the clamp to a few cells: the unclamped blobs
+    /// plus sculpt detail (curvature over a footprint wider than the band).
+    pub(crate) fn surface_distance(&self, p: Vec3, list: &[u32]) -> f32 {
+        self.wear_distance(p, list) + self.detail.as_ref().map_or(0.0, |g| g.grid().offset(p))
+    }
+
     /// Ownership follows CSG and blending, so buried blobs and cover
     /// bounding shapes cannot steal a mask from the visible surface.
     pub(crate) fn nearest_named(&self, p: Vec3, names: &[String]) -> bool {
@@ -991,6 +1203,28 @@ impl Field {
         // Ownership must also exist outside the clamped band: raised folds
         // and stretched tips need permission at their destination points.
         self.prefix_full(p, &list, true, true, f32::MAX / 1024.0).3.is_some_and(|i| names.contains(&self.prims[i].name))
+    }
+
+    /// The name (or index) of the blob that makes the surface nearest
+    /// `p`, as masks see ownership (`nearest_named`).
+    pub(crate) fn owner_name(&self, p: Vec3) -> Option<String> {
+        let mut list = self.near(p - self.limit, p + self.limit);
+        if list.is_empty() { list.extend(0..self.prims.len() as u32); }
+        let i = self.prefix_full(p, &list, true, true, f32::MAX / 1024.0).3?;
+        Some(if self.prims[i].name.is_empty() { i.to_string() } else { self.prims[i].name.clone() })
+    }
+
+    /// The prim that makes the surface nearest `p` (ownership as
+    /// `owner_name` sees it).
+    pub(crate) fn owner_index(&self, p: Vec3) -> Option<usize> {
+        let mut list = self.near(p - self.limit, p + self.limit);
+        if list.is_empty() { list.extend(0..self.prims.len() as u32); }
+        self.prefix_full(p, &list, true, true, f32::MAX / 1024.0).3
+    }
+
+    /// A prim's blob name (mirrored copies of a blob share it).
+    pub(crate) fn prim_name(&self, i: usize) -> String {
+        self.prims.get(i).map(|p| p.name.clone()).unwrap_or_default()
     }
 
     /// Lower bound of `blob_distance` (distance to the blob's box) and the box volume.
@@ -1013,20 +1247,57 @@ impl Field {
     }
 }
 
-/// Runs `f` on every chunk of `data` using all CPU cores.
+/// Helper threads running `par_chunks` work, over all callers: builds of
+/// several objects at once share the cores instead of each taking them all.
+static PAR_HELPERS: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// Most threads a `par_chunks` call made on this thread may use.
+    static PAR_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// Runs `f` with `par_chunks` calls made on this thread limited to `n`
+/// threads (1: no other thread). Results never depend on the count.
+#[cfg(test)]
+pub(crate) fn with_threads<R>(n: usize, f: impl FnOnce() -> R) -> R {
+    let old = PAR_LIMIT.replace(n.max(1));
+    let r = f();
+    PAR_LIMIT.set(old);
+    r
+}
+
+/// Runs `f` on every chunk of `data` (with its index), on this thread and
+/// as many helpers as there are free cores. What `f` does to a chunk must
+/// not depend on which thread runs it.
 pub(crate) fn par_chunks<T: Send>(data: &mut [T], chunk: usize, f: impl Fn(usize, &mut [T]) + Sync) {
-    let work = Mutex::new(data.chunks_mut(chunk.max(1)).enumerate());
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
-    std::thread::scope(|s| {
-        for _ in 0..threads {
-            s.spawn(|| {
-                loop {
-                    let next = work.lock().expect("no panics while locked").next();
-                    let Some((i, c)) = next else { break };
-                    f(i, c);
-                }
-            });
+    let chunk = chunk.max(1);
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let wanted = cores.min(data.len().div_ceil(chunk)).min(PAR_LIMIT.get()).saturating_sub(1);
+    // Take what other calls leave free (this thread is already running).
+    let mut helpers = 0;
+    let _ = PAR_HELPERS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |busy| {
+        helpers = wanted.min(cores.saturating_sub(busy + 1));
+        Some(busy + helpers)
+    });
+    /// Gives the helpers back, even when `f` panics.
+    struct Release(usize);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            PAR_HELPERS.fetch_sub(self.0, Ordering::AcqRel);
         }
+    }
+    let _release = Release(helpers);
+    let work = Mutex::new(data.chunks_mut(chunk).enumerate());
+    let run = || loop {
+        let next = work.lock().expect("no panics while locked").next();
+        let Some((i, c)) = next else { break };
+        f(i, c);
+    };
+    std::thread::scope(|s| {
+        for _ in 0..helpers {
+            s.spawn(run);
+        }
+        run();
     });
 }
 
@@ -1043,6 +1314,9 @@ impl Clay {
         }
         c.detail = self.detail.as_ref().map(Detail::mirrored_x);
         c.paint = self.paint.as_ref().map(crate::paint::Paint::mirrored_x);
+        c.sculpt_mask = self.sculpt_mask.as_ref().map(crate::mask::SculptMask::mirrored_x);
+        c.groups = self.groups.as_ref().map(crate::groups::Groups::mirrored_x);
+        c.sculpt = self.sculpt.as_ref().map(|s| s.mirrored_x(&c));
         c.masks = self.masks.iter().map(|(k, v)| (k.clone(), v.mirrored_x())).collect();
         for d in &mut c.decals {
             crate::pose::mirror_decal_x(d);
@@ -1085,6 +1359,7 @@ impl Clay {
         if !cell.is_finite() || cell < MIN_DETAIL_CELL {
             return Err(format!("detail_cell must be at least {MIN_DETAIL_CELL}"));
         }
+        let old_base = self.detail.clone();
         if let Some(d) = &self.detail {
             let grid = d.grid().resampled(cell)?;
             self.detail = Some(Detail(Arc::new(grid)));
@@ -1096,7 +1371,8 @@ impl Clay {
             *m = m.resampled(cell)?;
         }
         self.detail_cell = Some(cell);
-        Ok(())
+        // The layers above follow (their ledgers record it).
+        crate::layers::relayout(self, Some(cell), old_base)
     }
 
     /// The refined detail regions (see `Region`).
@@ -1115,11 +1391,12 @@ impl Clay {
             Some(d) => d.voxel(),
             None => self.detail_cell.or_else(|| self.cell_size()).ok_or("add blobs before detail regions")?,
         };
+        let old_base = self.detail.clone();
         let mut detail = self.detail.clone().unwrap_or_else(|| Detail::new(coarse));
         detail.grid_mut().set_regions(regions)?;
         self.detail = Some(detail);
         self.detail_cell = Some(self.detail_cell.unwrap_or(coarse));
-        Ok(())
+        crate::layers::relayout(self, None, old_base)
     }
 
     /// A mesh with cells of `detail_cell`, so fine sculpting shows. Errs
@@ -1253,6 +1530,96 @@ impl Clay {
         self.build_part(None, library, fallback)
     }
 
+    /// An array blob as separate copies of one shape (see `Instancing`):
+    /// what `instance_array` meshes once and draws as instances. Refused
+    /// when the copies would not look the same apart: the blob is not a
+    /// plain added array, or (unless `force`) other blobs blend with, cut
+    /// into or cover the copies, or sculpt, paint or decals would be lost.
+    pub fn instancing(&self, blob: usize, leaf: bool, force: bool) -> Result<Instancing, String> {
+        let b = self.blobs.get(blob).ok_or_else(|| format!("no blob {blob} (the clay has {})", self.blobs.len()))?;
+        let (unit, copies) = hard_surface::array_copies(&b.form, leaf).ok_or_else(|| format!("blob {blob} is not an array"))?;
+        if b.op != Op::Add {
+            return Err(format!("blob {blob} is {:?}; only added arrays become instances", b.op).to_lowercase());
+        }
+        if b.mirror || b.flip {
+            return Err(format!("blob {blob} is mirrored; turn mirror off or instance each side"));
+        }
+        if self.shell.is_some() {
+            return Err("the clay is hollowed (shell); its copies cannot be hollowed apart".into());
+        }
+        // Every copy's box, at the innermost level (nested rings of posts
+        // are checked post by post, not ring by ring).
+        let (leaf_form, leaves) = hard_surface::array_copies(&b.form, true).expect("an array");
+        let (a, c) = hard_surface::form_bounds(&leaf_form, &self.assets);
+        let corners: Vec<Vec3> = (0..8).map(|i| Vec3::new(if i & 1 == 0 { a.x } else { c.x }, if i & 2 == 0 { a.y } else { c.y }, if i & 4 == 0 { a.z } else { c.z })).collect();
+        let boxes: Vec<(Vec3, Vec3)> = leaves.iter().map(|&(t, r)| corners.iter().map(|&p| t + r * p).fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(lo, hi), p| (lo.min(p), hi.max(p)))).collect();
+        let join = |x: &Blob| if x.join == hard_surface::Join::Sharp { 0.0 } else { x.join_size.unwrap_or(x.blend).max(0.0) };
+        let own = join(b);
+        if !force {
+            for (j, other) in self.blobs.iter().enumerate().filter(|(j, _)| *j != blob) {
+                let k = join(other);
+                // Plain added blobs only meet the copies with a hard edge
+                // (a union), which separate meshes give too; the array's
+                // own blend reaches blobs before it.
+                let plain = other.op == Op::Add && k <= 1e-6;
+                if plain && (own <= 1e-6 || j > blob) {
+                    continue;
+                }
+                let (lo, hi) = hard_surface::form_bounds(&other.form, &self.assets);
+                let (lo, hi) = if other.mirror || other.flip { (lo.min(Vec3::new(-hi.x, lo.y, lo.z)), hi.max(Vec3::new(-lo.x, hi.y, hi.z))) } else { (lo, hi) };
+                let pad = k + own + other.offset.max(0.0) + other.smooth.max(0.0) + other.wall.max(0.0) + other.rim.max(0.0) + other.ridge.max(0.0) + other.flare.max(0.0);
+                if boxes.iter().any(|(a, c)| a.cmple(hi + pad).all() && c.cmpge(lo - pad).all()) {
+                    let name = if other.name.is_empty() { String::new() } else { format!(" ({})", other.name) };
+                    return Err(format!("blob {j}{name} blends with, cuts into or covers the copies; separate copies would not join it the same way (force: true instances anyway)"));
+                }
+            }
+            if self.detail.is_some() || self.paint.is_some() || self.sculpt.is_some() || !self.masks.is_empty() || !self.decals.is_empty() {
+                return Err("the clay has sculpt, paint, masks or decals, which stay on it and would not show on the copies (force: true instances anyway)".into());
+            }
+        }
+        let mut blob = b.clone();
+        // A lone box or extrude would get the exact planar mesh single
+        // primitives get, far denser than the field mesh it had in the
+        // array: as a one-copy array it meshes the way it did there.
+        blob.form = if matches!(unit, Form::Array { .. }) { unit } else {
+            Form::Array { source: Box::new(unit), count: 1, step: Vec3::ZERO, radius: 0.0, center: Vec3::ZERO, axis: Vec3::Y, points: Vec::new(), orient: Default::default() }
+        };
+        let mut clay = Clay { blobs: vec![blob], resolution: self.resolution, detail: None, paint: None, masks: Default::default(), decals: Vec::new(), detail_cell: self.detail_cell, shell: None, sharp: self.sharp, sculpt: None, sculpt_mask: None, groups: None, assets: self.assets.clone() };
+        // The copy meshes at the clay's own cell size, so it looks the same.
+        if let Some(cell) = self.cell_size() {
+            clay.keep_cell(cell);
+        }
+        Ok(Instancing { unit: clay, copies })
+    }
+
+    /// Removes blob `i`; the rest keeps meshing at the cell size it had
+    /// (removing the finest part would otherwise coarsen an automatic
+    /// resolution).
+    pub fn remove_keeping_cell(&mut self, i: usize) {
+        let cell = self.cell_size();
+        self.blobs.remove(i);
+        if let Some(cell) = cell {
+            self.keep_cell(cell);
+        }
+    }
+
+    /// Sets the resolution that meshes these blobs at about `cell`.
+    fn keep_cell(&mut self, cell: f32) {
+        let Some((lo, hi)) = Field::new(self, 0.0).bounds() else { return };
+        let res = (((hi - lo).max_element() / cell).round() as u32).clamp(MIN_RESOLUTION, MAX_RESOLUTION);
+        // The default resolution means "pick one" for hard surfaces.
+        self.resolution = if res == DEFAULT_RESOLUTION { res + 1 } else { res };
+    }
+
+    /// Array blobs: (index, copies at the innermost level, nested).
+    pub fn arrays(&self) -> Vec<(usize, usize, bool)> {
+        self.blobs.iter().enumerate().filter_map(|(i, b)| {
+            let Form::Array { source, .. } = &b.form else { return None };
+            let copies = hard_surface::array_copies(&b.form, true)?.1.len();
+            Some((i, copies, matches!(**source, Form::Array { .. })))
+        }).collect()
+    }
+
     /// Every distinct blob material name, in order of first use ("" is the
     /// object's material). Never empty, so clay meshes always carry materials.
     pub fn material_names(&self) -> Vec<String> {
@@ -1303,7 +1670,7 @@ impl Clay {
         let voxel = extent.max_element() / res;
         if self.sharp && window.is_none() && self.blobs.len()==1 && !self.blobs[0].mirror && !self.blobs[0].flip && self.blobs[0].op==Op::Add && self.shell.is_none() && self.detail.is_none() && self.paint.is_none() && self.decals.is_empty() && !palette.iter().any(crate::smart::layered) && keep.as_ref().is_none_or(|k|k.len()==1 && k[0])
             && let Some(mut mesh)=hard_surface::planar_mesh(&self.blobs[0].form,voxel) {
-                let (geo,_,_)=Geo::new(&self.blobs[0].form);
+                let (geo,_,_)=Geo::new(&self.blobs[0].form, &self.assets);
                 let normal=|p:Vec3,e:f32| {let g=|a:Vec3|geo.sdf(p+a*e)-geo.sdf(p-a*e);Vec3::new(g(Vec3::X),g(Vec3::Y),g(Vec3::Z)).normalize_or(Vec3::Y)};
                 mesh.materials=palette;
                 for v in &mut mesh.vertices {
@@ -1353,34 +1720,36 @@ impl Clay {
         let timer = std::time::Instant::now();
         let lap = |what: &str| if std::env::var("MESH_TIMES").is_ok() { eprintln!("mesh {what}: {:.2}s", timer.elapsed().as_secs_f32()) };
         let mut bricks: Vec<Block> = vec![Block::Out; bnx * bny * bnz];
-        par_chunks(&mut bricks, bnx * bny, |bz, layer| {
-            let z0 = bz * BRICK;
-            for by in 0..bny {
-                for bx in 0..bnx {
-                    let (x0, y0) = (bx * BRICK, by * BRICK);
-                    let (x1, y1, z1) = ((x0 + BRICK).min(nx), (y0 + BRICK).min(ny), (z0 + BRICK).min(nz));
-                    let (blo, bhi) = (point(x0, y0, z0) - voxel, point(x1, y1, z1) + voxel);
-                    let near = field.near(blo, bhi);
-                    let detail = field.has_detail(blo, bhi);
-                    if near.is_empty() && !detail {
-                        continue;
-                    }
-                    if !detail && clip((blo+bhi)*0.5).abs()>far && let Some(inside) = field.far_side((blo + bhi) * 0.5, &near, far) {
-                        layer[by * bnx + bx] = if inside { Block::In } else { Block::Out };
-                        continue;
-                    }
-                    let mut b = vec![field.limit; BRICK * BRICK * BRICK];
-                    for z in z0..z1 {
-                        for y in y0..y1 {
-                            for x in x0..x1 {
-                                b[(x - x0) + BRICK * ((y - y0) + BRICK * (z - z0))] = sample(point(x, y, z), &near).0;
-                            }
+        // A row of blocks at a time: z slabs alone would leave cores idle
+        // on flat or small grids.
+        par_chunks(&mut bricks, bnx, |row, line| {
+            let (by, bz) = (row % bny, row / bny);
+            let (y0, z0) = (by * BRICK, bz * BRICK);
+            for bx in 0..bnx {
+                let x0 = bx * BRICK;
+                let (x1, y1, z1) = ((x0 + BRICK).min(nx), (y0 + BRICK).min(ny), (z0 + BRICK).min(nz));
+                let (blo, bhi) = (point(x0, y0, z0) - voxel, point(x1, y1, z1) + voxel);
+                let near = field.near(blo, bhi);
+                let detail = field.has_detail(blo, bhi);
+                if near.is_empty() && !detail {
+                    continue;
+                }
+                if !detail && clip((blo+bhi)*0.5).abs()>far && let Some(inside) = field.far_side((blo + bhi) * 0.5, &near, far) {
+                    line[bx] = if inside { Block::In } else { Block::Out };
+                    continue;
+                }
+                let mut b = vec![field.limit; BRICK * BRICK * BRICK];
+                for z in z0..z1 {
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            b[(x - x0) + BRICK * ((y - y0) + BRICK * (z - z0))] = sample(point(x, y, z), &near).0;
                         }
                     }
-                    layer[by * bnx + bx] = Block::Data(b.into_boxed_slice());
                 }
+                line[bx] = Block::Data(b.into_boxed_slice());
             }
         });
+        lap("blocks");
         let brick = |x: usize, y: usize, z: usize| x / BRICK + bnx * (y / BRICK + bny * (z / BRICK));
         let at = |x: usize, y: usize, z: usize| match &bricks[brick(x, y, z)] {
             Block::Data(b) => b[x % BRICK + BRICK * (y % BRICK + BRICK * (z % BRICK))],
@@ -1406,20 +1775,19 @@ impl Clay {
                 data || (inside && outside)
             })
             .collect();
-        // Cells (x, y, z < n - 1) of live blocks, in a fixed order.
-        let cells_in_live_blocks = || {
-            (0..bricks.len()).filter(|&i| live[i]).flat_map(move |i| {
-                let (bx, by, bz) = (i % bnx, (i / bnx) % bny, i / (bnx * bny));
-                let (x0, y0, z0) = (bx * BRICK, by * BRICK, bz * BRICK);
-                let (x1, y1, z1) = ((x0 + BRICK).min(nx - 1), (y0 + BRICK).min(ny - 1), (z0 + BRICK).min(nz - 1));
-                (z0..z1).flat_map(move |z| (y0..y1).flat_map(move |y| (x0..x1).map(move |x| (x, y, z))))
-            })
+        // Cells (x, y, z < n - 1) of one block, in a fixed order.
+        let cells_of = move |i: usize| {
+            let (bx, by, bz) = (i % bnx, (i / bnx) % bny, i / (bnx * bny));
+            let (x0, y0, z0) = (bx * BRICK, by * BRICK, bz * BRICK);
+            let (x1, y1, z1) = ((x0 + BRICK).min(nx - 1), (y0 + BRICK).min(ny - 1), (z0 + BRICK).min(nz - 1));
+            (z0..z1).flat_map(move |z| (y0..y1).flat_map(move |y| (x0..x1).map(move |x| (x, y, z))))
         };
+        let live_blocks: Vec<usize> = (0..bricks.len()).filter(|&i| live[i]).collect();
+        // Cells of live blocks, block by block, in a fixed order.
+        let cells_in_live_blocks = || live_blocks.iter().flat_map(|&i| cells_of(i));
 
         // Smooth-only clay keeps the original fast surface-net path.
-        let sharp = self.sharp && (self.shell.is_some() || self.blobs.iter().any(|b|
-            !matches!(b.form, Form::Sphere { .. } | Form::Ellipsoid { .. } | Form::Capsule { .. } | Form::Human { .. } | Form::Torus { .. } | Form::Chain { .. } | Form::Membrane { .. })
-            || matches!(b.op, Op::Plate | Op::Engrave | Op::Emboss) || b.join == hard_surface::Join::Chamfer));
+        let sharp = self.sharp_features();
         // With detail regions: adaptive surface nets, each coarse cell near
         // the surface cut down to the cell the detail there needs (see
         // `adaptive::Nets`).
@@ -1470,62 +1838,73 @@ impl Clay {
             let mut positions = Vec::new();
             const EDGES: [(usize, usize); 12] =
                 [(0, 1), (2, 3), (4, 5), (6, 7), (0, 2), (1, 3), (4, 6), (5, 7), (0, 4), (1, 5), (2, 6), (3, 7)];
-            for (x, y, z) in cells_in_live_blocks() {
-                let f = CORNERS.map(|(dx, dy, dz)| at(x + dx, y + dy, z + dz));
-                let inside = f.iter().filter(|v| **v < 0.0).count();
-                if inside == 0 || inside == 8 {
-                    continue;
-                }
-                let (mut sum, mut n) = (Vec3::ZERO, 0.0);
-                let mut hits = [(Vec3::ZERO,Vec3::ZERO);12];
-                let mut crossing_edges = [(0usize,0usize);12];
-                let origin = point(x,y,z);
-                for (a,b) in EDGES {
-                    if (f[a]<0.0)!=(f[b]<0.0) {
-                        let t=f[a]/(f[a]-f[b]);
-                        let pa=Vec3::new(CORNERS[a].0 as f32,CORNERS[a].1 as f32,CORNERS[a].2 as f32);
-                        let pb=Vec3::new(CORNERS[b].0 as f32,CORNERS[b].1 as f32,CORNERS[b].2 as f32);
-                        let hit=pa+(pb-pa)*t;
+            // Each block's vertices on any thread; numbered in block order
+            // after, so the mesh is the same however the work was split.
+            let mut found: Vec<Vec<(usize, Vec3)>> = vec![Vec::new(); live_blocks.len()];
+            par_chunks(&mut found, 4, |chunk, outs| {
+                for (j, out) in outs.iter_mut().enumerate() {
+                    for (x, y, z) in cells_of(live_blocks[chunk * 4 + j]) {
+                        let f = CORNERS.map(|(dx, dy, dz)| at(x + dx, y + dy, z + dz));
+                        let inside = f.iter().filter(|v| **v < 0.0).count();
+                        if inside == 0 || inside == 8 {
+                            continue;
+                        }
+                        let (mut sum, mut n) = (Vec3::ZERO, 0.0);
+                        let mut hits = [(Vec3::ZERO,Vec3::ZERO);12];
+                        let mut crossing_edges = [(0usize,0usize);12];
+                        let origin = point(x,y,z);
+                        for (a,b) in EDGES {
+                            if (f[a]<0.0)!=(f[b]<0.0) {
+                                let t=f[a]/(f[a]-f[b]);
+                                let pa=Vec3::new(CORNERS[a].0 as f32,CORNERS[a].1 as f32,CORNERS[a].2 as f32);
+                                let pb=Vec3::new(CORNERS[b].0 as f32,CORNERS[b].1 as f32,CORNERS[b].2 as f32);
+                                let hit=pa+(pb-pa)*t;
+                                if sharp {
+                                    // Cheap trilinear gradients identify candidate bends
+                                    // without extra field evaluations on planar cells.
+                                    hits[n as usize]=(hit,Vec3::ZERO);
+                                    crossing_edges[n as usize]=(a,b);
+                                }
+                                sum+=hit; n+=1.0;
+                            }
+                        }
+                        let mean=sum/n;
+                        let mut position=mean;
+                        let corner_normals = if sharp { hard_surface::corner_normals(&f) } else { [(Vec3::ZERO,Vec3::ZERO);8] };
+                        if sharp && hard_surface::bent(&corner_normals,0.98) {
+                            let near=field.near(origin-voxel,origin+2.0*voxel);
+                            for (i,&(a,b)) in crossing_edges[..n as usize].iter().enumerate() {
+                                let pa=Vec3::new(CORNERS[a].0 as f32,CORNERS[a].1 as f32,CORNERS[a].2 as f32);
+                                let pb=Vec3::new(CORNERS[b].0 as f32,CORNERS[b].1 as f32,CORNERS[b].2 as f32);
+                                let (mut left,mut right)=(0.0,1.0);
+                                for _ in 0..16 {
+                                    let mid=(left+right)*0.5;
+                                    let value=sample(origin+(pa+(pb-pa)*mid)*voxel,&near).0;
+                                    if (value<0.0)==(f[a]<0.0) {left=mid;}else{right=mid;}
+                                }
+                                let hit=pa+(pb-pa)*((left+right)*0.5);
+                                hits[i]=(hit,normal(origin+hit*voxel,&near,voxel*0.01));
+                            }
+                            // Even a planar cell beside a corner needs the refined
+                            // crossings: its corner distances are nonlinear outside the
+                            // solid, so the original linear mean can sit off the face.
+                            let refined_mean=hits[..n as usize].iter().map(|(p,_)|*p).sum::<Vec3>()/n;
+                            position=hard_surface::feature_vertex(&hits[..n as usize],refined_mean);
+                        }
                         if sharp {
-                            // Cheap trilinear gradients identify candidate bends
-                            // without extra field evaluations on planar cells.
-                            hits[n as usize]=(hit,Vec3::ZERO);
-                            crossing_edges[n as usize]=(a,b);
+                            let near=field.near(origin-voxel,origin+2.0*voxel);
+                            position=(field.project_planar(origin+position*voxel,origin,origin+voxel,&near,voxel)-origin)/voxel;
                         }
-                        sum+=hit; n+=1.0;
+                        if sharp { position=position.clamp(Vec3::splat(1e-3),Vec3::splat(1.0-1e-3)); }
+                        out.push((cell(x,y,z),origin+position*voxel));
                     }
                 }
-                let mean=sum/n;
-                let mut position=mean;
-                let corner_normals = if sharp { hard_surface::corner_normals(&f) } else { [(Vec3::ZERO,Vec3::ZERO);8] };
-                if sharp && hard_surface::bent(&corner_normals,0.98) {
-                    let near=field.near(origin-voxel,origin+2.0*voxel);
-                    for (i,&(a,b)) in crossing_edges[..n as usize].iter().enumerate() {
-                        let pa=Vec3::new(CORNERS[a].0 as f32,CORNERS[a].1 as f32,CORNERS[a].2 as f32);
-                        let pb=Vec3::new(CORNERS[b].0 as f32,CORNERS[b].1 as f32,CORNERS[b].2 as f32);
-                        let (mut left,mut right)=(0.0,1.0);
-                        for _ in 0..16 {
-                            let mid=(left+right)*0.5;
-                            let value=sample(origin+(pa+(pb-pa)*mid)*voxel,&near).0;
-                            if (value<0.0)==(f[a]<0.0) {left=mid;}else{right=mid;}
-                        }
-                        let hit=pa+(pb-pa)*((left+right)*0.5);
-                        hits[i]=(hit,normal(origin+hit*voxel,&near,voxel*0.01));
-                    }
-                    // Even a planar cell beside a corner needs the refined
-                    // crossings: its corner distances are nonlinear outside the
-                    // solid, so the original linear mean can sit off the face.
-                    let refined_mean=hits[..n as usize].iter().map(|(p,_)|*p).sum::<Vec3>()/n;
-                    position=hard_surface::feature_vertex(&hits[..n as usize],refined_mean);
-                }
-                if sharp {
-                    let near=field.near(origin-voxel,origin+2.0*voxel);
-                    position=(field.project_planar(origin+position*voxel,origin,origin+voxel,&near,voxel)-origin)/voxel;
-                }
-                cell_vertex.insert(cell(x,y,z),positions.len() as u32);
-                if sharp { position=position.clamp(Vec3::splat(1e-3),Vec3::splat(1.0-1e-3)); }
-                positions.push(origin+position*voxel);
+            });
+            for (c, p) in found.into_iter().flatten() {
+                cell_vertex.insert(c, positions.len() as u32);
+                positions.push(p);
             }
+            lap("vertices");
 
             // One quad per grid edge the surface crosses, joining the 4 cells around it.
             let mut indices = Vec::new();
@@ -1566,31 +1945,48 @@ impl Clay {
                 }
             }
 
-            for (q,direction,start,end) in quads {
-                let [a,b,c,d]=q;
-                match hard_surface::quad_diagonal(q,direction,&positions) {
-                    Some(true)=>indices.extend_from_slice(&[a,b,d,b,c,d]),
-                    Some(false)=>indices.extend_from_slice(&[a,b,c,a,c,d]),
-                    None=> {
-                        // A primal-edge intersection is inside all four projected
-                        // cell quadrants. A fan around it preserves winding while
-                        // retaining sharp QEF vertices, instead of rounding an
-                        // entire row back to surface-net positions.
-                        let near=field.near(start-voxel,end+voxel);
-                        let inside=sample(start,&near).0<0.0;
-                        let (mut left,mut right)=(0.0,1.0);
-                        for _ in 0..16 {
-                            let t=(left+right)*0.5;
-                            if (sample(start.lerp(end,t),&near).0<0.0)==inside {left=t;} else {right=t;}
+            lap("quads");
+            // Split each quad: Ok(diagonal), or Err(a fan center), found on
+            // any thread and added in quad order.
+            let mut splits: Vec<(([u32;4],Vec3,Vec3,Vec3),Result<bool,Vec3>)> = quads.into_iter().map(|q| (q,Ok(false))).collect();
+            par_chunks(&mut splits, 1024, |_, chunk| {
+                for ((q,direction,start,end),split) in chunk {
+                    *split = match hard_surface::quad_diagonal(*q,*direction,&positions) {
+                        Some(diagonal)=>Ok(diagonal),
+                        None=> {
+                            // A primal-edge intersection is inside all four projected
+                            // cell quadrants. A fan around it preserves winding while
+                            // retaining sharp QEF vertices, instead of rounding an
+                            // entire row back to surface-net positions.
+                            let (start,end)=(*start,*end);
+                            let near=field.near(start-voxel,end+voxel);
+                            let inside=sample(start,&near).0<0.0;
+                            let (mut left,mut right)=(0.0,1.0);
+                            for _ in 0..16 {
+                                let t=(left+right)*0.5;
+                                if (sample(start.lerp(end,t),&near).0<0.0)==inside {left=t;} else {right=t;}
+                            }
+                            Err(start.lerp(end,((left+right)*0.5).clamp(0.001,0.999)))
                         }
+                    };
+                }
+            });
+            for (([a,b,c,d],..),split) in splits {
+                match split {
+                    Ok(true)=>indices.extend_from_slice(&[a,b,d,b,c,d]),
+                    Ok(false)=>indices.extend_from_slice(&[a,b,c,a,c,d]),
+                    Err(p)=> {
                         let center=positions.len() as u32;
-                        positions.push(start.lerp(end,((left+right)*0.5).clamp(0.001,0.999)));
+                        positions.push(p);
                         indices.extend_from_slice(&[a,b,center,b,c,center,c,d,center,d,a,center]);
                     }
                 }
             }
 
             if ambiguous {
+                lap("ambiguous quads: marching tetrahedra instead");
+                #[cfg(test)]
+                TETRA_FALLBACKS.with(|n| n.set(n.get() + 1));
                 let mut tetra=hard_surface::TetraMesh::default();
                 for (x,y,z) in cells_in_live_blocks() {
                     let values=CORNERS.map(|(dx,dy,dz)|at(x+dx,y+dy,z+dz));
@@ -1676,6 +2072,21 @@ impl Clay {
         Ok(mesh)
     }
 
+    /// Whether meshes place vertices on sharp features (hard forms, plates,
+    /// chamfers, a shell); smooth-only clay keeps plain surface nets.
+    pub(crate) fn sharp_features(&self) -> bool {
+        self.sharp && (self.shell.is_some() || self.blobs.iter().any(|b|
+            !matches!(b.form, Form::Sphere { .. } | Form::Ellipsoid { .. } | Form::Capsule { .. } | Form::Human { .. } | Form::Torus { .. } | Form::Chain { .. } | Form::Membrane { .. })
+            || matches!(b.op, Op::Plate | Op::Engrave | Op::Emboss) || b.join == hard_surface::Join::Chamfer))
+    }
+
+    /// Whether the regular mesh is the exact planar mesh of one hard blob
+    /// (`build_window_cells`), which no sampled mesh may replace.
+    pub(crate) fn exact_planar(&self) -> bool {
+        self.sharp && self.blobs.len()==1 && !self.blobs[0].mirror && !self.blobs[0].flip && self.blobs[0].op==Op::Add && self.shell.is_none() && self.detail.is_none() && self.paint.is_none() && self.decals.is_empty()
+            && hard_surface::planar_mesh(&self.blobs[0].form, 1.0).is_some()
+    }
+
     /// The face of a human head blob (whole body or head part), if its
     /// skin detail is on.
     pub fn face(&self) -> Option<crate::face::Face> {
@@ -1693,7 +2104,7 @@ impl Clay {
         self.cell_size().unwrap_or(0.01) * 2.5
     }
 
-    fn mesh_resolution(&self) -> u32 {
+    pub(crate) fn mesh_resolution(&self) -> u32 {
         let hard = self.shell.is_some() || self.blobs.iter().any(|b| matches!(b.form, Form::Box {..} | Form::Extrude {..} | Form::Lathe {..} | Form::Sweep {..} | Form::Shell {..} | Form::Array {..} | Form::Band {..}) || matches!(b.op, Op::Plate | Op::Engrave | Op::Emboss));
         // A uniform refinement preserves shared connectivity at feature cells.
         // Explicit fine meshes still use detail_cell without this floor.
@@ -1717,6 +2128,11 @@ impl Clay {
     pub fn sanitize(&mut self) {
         self.blobs.truncate(MAX_BLOBS);
         self.blobs.retain(|b| b.validate().is_ok());
+        // Mesh blobs need their asset in the file; assets no blob names go.
+        let assets = std::mem::take(&mut self.assets);
+        self.blobs.retain(|b| b.mesh_assets().iter().all(|h| assets.contains_key(*h)));
+        self.assets = assets;
+        self.prune_assets();
         self.shell = self.shell.filter(|t| t.is_finite() && *t > 0.0);
         self.resolution = self.resolution.clamp(MIN_RESOLUTION, MAX_RESOLUTION);
         if self.detail.as_ref().is_some_and(|d| !d.is_sane()) {
@@ -1724,6 +2140,15 @@ impl Clay {
         }
         if self.paint.as_ref().is_some_and(|p| !p.is_sane()) {
             self.paint = None;
+        }
+        if self.sculpt.as_ref().is_some_and(|s| !s.is_sane()) {
+            self.sculpt = None;
+        }
+        if self.sculpt_mask.as_ref().is_some_and(|m| !m.is_sane()) {
+            self.sculpt_mask = None;
+        }
+        if self.groups.as_ref().is_some_and(|g| !g.is_sane()) {
+            self.groups = None;
         }
         self.masks.retain(|name, m| m.is_sane() && !name.trim().is_empty() && name.len() <= 64);
         while self.masks.len() > crate::smart::MAX_CHANNELS {
@@ -1741,6 +2166,35 @@ impl Clay {
         }
     }
 
+    /// Drops the mesh assets no blob names (after blobs went). Never
+    /// adds one, so it cannot fail; `adopt_assets` takes new ones.
+    pub fn prune_assets(&mut self) {
+        let named: std::collections::BTreeSet<&str> = self.blobs.iter().flat_map(Blob::mesh_assets).collect();
+        self.assets.retain(|h, _| named.contains(h.as_str()));
+    }
+
+    /// Keeps exactly the mesh assets its blobs name (see `Form::Mesh`):
+    /// one it does not hold yet comes from those this process made
+    /// (`MeshAsset::lookup`); a blob naming one found nowhere is an error.
+    pub fn adopt_assets(&mut self) -> Result<(), String> {
+        let mut assets = std::collections::BTreeMap::new();
+        for h in self.blobs.iter().flat_map(Blob::mesh_assets) {
+            if assets.contains_key(h) {
+                continue;
+            }
+            let a = self.assets.get(h).cloned().or_else(|| crate::mesh_asset::MeshAsset::lookup(h)).ok_or_else(|| format!("no mesh asset {h} (import_mesh or to_clay makes them)"))?;
+            assets.insert(h.to_string(), a);
+        }
+        if assets.len() > crate::mesh_asset::MAX_ASSETS {
+            return Err(format!("a clay may keep at most {} mesh assets", crate::mesh_asset::MAX_ASSETS));
+        }
+        // A blob may name any asset made in this process (a 4M-triangle
+        // mesh object's too): only field-sized ones become clay.
+        crate::mesh_asset::check_clay_assets(assets.values())?;
+        self.assets = assets;
+        Ok(())
+    }
+
     /// Finds a blob by index (number) or name (string).
     pub fn find(&self, key: &serde_json::Value) -> Option<usize> {
         match key {
@@ -1754,6 +2208,9 @@ impl Clay {
 /// Detail-layer grid points per brick side.
 const DB: i32 = 8;
 pub(crate) const BRICK_VALUES: usize = (DB * DB * DB) as usize;
+/// A detail grid's bricks by key (a quick hash: grids are read point by
+/// point while meshing).
+pub(crate) type Bricks = base_cache::KeyMap<Arc<[f32; BRICK_VALUES]>>;
 /// More detail bricks than this in one level are refused (and dropped
 /// from loaded files).
 pub const MAX_BRICKS: usize = 131_072;
@@ -1862,12 +2319,40 @@ fn band_for(coarse: f32, region: &Region) -> f32 {
 #[derive(Clone, Debug)]
 pub struct Detail(Arc<DetailGrid>);
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct DetailGrid {
     pub voxel: f32,
-    bricks: HashMap<[i32; 3], Arc<[f32; BRICK_VALUES]>>,
+    bricks: Bricks,
     /// Finer levels, coarsest first; finer ones win where they overlap.
     levels: Vec<Level>,
+    /// `solid_bounds`, once worked out (it reads every brick; every frame
+    /// asks for a clay's bounds). Any change forgets it.
+    solid: std::sync::OnceLock<Option<(Vec3, Vec3)>>,
+    /// Known to hold no brick that `prune` would drop (set by a full prune,
+    /// kept by `write`, which drops the bricks it leaves at zero; anything
+    /// else that changes bricks clears it). A stroke's first `write` then
+    /// skips the full prune it would otherwise run: the result is the same.
+    clean: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static GRID_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many `DetailGrid`s (levels count one each) this thread has copied:
+/// the sculpt engine's tests bound it per stroke.
+#[cfg(test)]
+pub(crate) fn grid_copies() -> usize {
+    GRID_COPIES.with(|c| c.get())
+}
+
+impl Clone for DetailGrid {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        GRID_COPIES.with(|c| c.set(c.get() + 1));
+        DetailGrid { voxel: self.voxel, bricks: self.bricks.clone(), levels: self.levels.clone(), solid: self.solid.clone(), clean: self.clean }
+    }
 }
 
 impl PartialEq for Detail {
@@ -1877,13 +2362,236 @@ impl PartialEq for Detail {
 }
 
 impl Detail {
+    /// The grid's identity, as `==` compares it (cheap to hash).
+    pub fn addr(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+}
+
+/// Grid arithmetic for the stroke ledger (see `ledger.rs`): Adjust Last
+/// blends a stroke's before and after, outside edits become deltas.
+impl Detail {
+    /// `before + t x (after - before)` point by point (`before` None:
+    /// zeros); t = 1 is `after` itself and t = 0 `before`.
+    pub(crate) fn blend(before: Option<&Detail>, after: &Detail, t: f32) -> Result<Detail, String> {
+        let empty = Detail::new(after.voxel());
+        let before_grid = before.unwrap_or(&empty);
+        if t == 1.0 {
+            return Ok(after.clone());
+        }
+        if !before_grid.0.same_layout(&after.0) && before.is_some() {
+            return Err("the detail cell or regions changed since the stroke; it cannot be scaled".into());
+        }
+        if t == 0.0 {
+            return Ok(before.cloned().unwrap_or(empty));
+        }
+        let b = if before.is_some() { &before_grid.0 } else { &DetailGrid { voxel: after.voxel(), bricks: Bricks::default(), levels: after.0.levels.iter().map(|l| Level { region: l.region.clone(), band: l.band, grid: DetailGrid { voxel: l.grid.voxel, ..Default::default() } }).collect(), solid: Default::default(), clean: false } };
+        Ok(Detail(Arc::new(b.zip_levels(&after.0, |a| Some(a.clone()), &|b, a| b + t * (a - b)))))
+    }
+
+    /// `after - before` when both have the same cell and regions (None:
+    /// no shared layout, so the change can only be kept whole).
+    pub(crate) fn delta(before: Option<&Detail>, after: &Detail) -> Option<Detail> {
+        let b = before?;
+        b.0.same_layout(&after.0).then(|| Detail(Arc::new(after.0.zip_levels(&b.0, |_| None, &|a, b| a - b))))
+    }
+
+    /// `base + delta` (same layout as `delta` was taken with).
+    pub(crate) fn add(base: &Detail, delta: &Detail) -> Result<Detail, String> {
+        if !base.0.same_layout(&delta.0) {
+            return Err("an outside edit no longer lines up with the detail grid".into());
+        }
+        Ok(Detail(Arc::new(base.0.zip_levels(&delta.0, |a| Some(Arc::new(a.map(|v| v + v))), &|a, d| a + d))))
+    }
+
+    /// Same cell and same regions as `other` (layers compose point by point).
+    pub(crate) fn same_layout(&self, other: &Detail) -> bool {
+        self.0.same_layout(&other.0)
+    }
+
+    /// An empty grid with this one's cell and regions.
+    pub(crate) fn empty_like(&self) -> Detail {
+        let g = &self.0;
+        let levels = g.levels.iter().map(|l| Level { region: l.region.clone(), band: l.band, grid: DetailGrid { voxel: l.grid.voxel, ..Default::default() } }).collect();
+        Detail(Arc::new(DetailGrid { voxel: g.voxel, bricks: Bricks::default(), levels, solid: Default::default(), clean: false }))
+    }
+
+    /// `sum(amount x grid)` point by point, the parts in order (sculpt
+    /// layers composed: `layers.rs`). Every part must share the first's
+    /// layout. A brick only one part has at amount 1 is shared, not
+    /// copied, so one part at amount 1 is that grid itself. Bricks are
+    /// summed independently (in parallel), always in the parts' order, so
+    /// the result never depends on the thread count.
+    pub(crate) fn compose(parts: &[(&Detail, f32)]) -> Result<Detail, String> {
+        let Some((first, a0)) = parts.first() else { return Err("nothing to compose".into()) };
+        if parts.len() == 1 && *a0 == 1.0 {
+            return Ok((*first).clone());
+        }
+        if parts.iter().any(|(d, _)| !d.0.same_layout(&first.0)) {
+            return Err("sculpt layers no longer line up (their detail cell or regions differ)".into());
+        }
+        fn level(grids: &[(&DetailGrid, f32)]) -> Bricks {
+            let mut keys: Vec<[i32; 3]> = grids.iter().flat_map(|(g, _)| g.bricks.keys().copied()).collect();
+            keys.sort_unstable();
+            keys.dedup();
+            sum_keys(grids, keys).into_iter().filter(|(_, b)| b.iter().any(|x| *x != 0.0)).collect()
+        }
+        let coarse: Vec<(&DetailGrid, f32)> = parts.iter().map(|(d, a)| (&d.0 as &DetailGrid, *a)).collect();
+        let g = &first.0;
+        let levels = g
+            .levels
+            .iter()
+            .enumerate()
+            .map(|(k, l)| {
+                let grids: Vec<(&DetailGrid, f32)> = parts.iter().map(|(d, a)| (&d.0.levels[k].grid, *a)).collect();
+                Level { region: l.region.clone(), band: l.band, grid: DetailGrid { voxel: l.grid.voxel, bricks: level(&grids), levels: Vec::new(), solid: Default::default(), clean: false } }
+            })
+            .collect();
+        Ok(Detail(Arc::new(DetailGrid { voxel: g.voxel, bricks: level(&coarse), levels, solid: Default::default(), clean: false })))
+    }
+
+    /// `compose` again after one part (`touched`) changed: only the bricks
+    /// it has are summed again, the rest are shared with `old` (the
+    /// composite before, of the same layout). Point for point what
+    /// `compose` gives.
+    pub(crate) fn recompose_keys(parts: &[(&Detail, f32)], old: &Detail, touched: &Detail) -> Result<Detail, String> {
+        let Some((first, _)) = parts.first() else { return Err("nothing to compose".into()) };
+        if parts.iter().any(|(d, _)| !d.0.same_layout(&first.0)) || !old.0.same_layout(&first.0) || !touched.0.same_layout(&first.0) {
+            return Err("sculpt layers no longer line up (their detail cell or regions differ)".into());
+        }
+        fn level(grids: &[(&DetailGrid, f32)], old: &DetailGrid, touched: &DetailGrid) -> Bricks {
+            let mut out = old.bricks.clone();
+            let mut keys: Vec<[i32; 3]> = touched.bricks.keys().copied().collect();
+            keys.sort_unstable();
+            for (k, b) in keys.iter().zip(sum_keys(grids, keys.clone()).into_iter().map(|(_, b)| b)) {
+                out.insert(*k, b);
+            }
+            out
+        }
+        let coarse: Vec<(&DetailGrid, f32)> = parts.iter().map(|(d, a)| (&d.0 as &DetailGrid, *a)).collect();
+        let g = &old.0;
+        let levels = g
+            .levels
+            .iter()
+            .enumerate()
+            .map(|(k, l)| {
+                let grids: Vec<(&DetailGrid, f32)> = parts.iter().map(|(d, a)| (&d.0.levels[k].grid, *a)).collect();
+                Level { region: l.region.clone(), band: l.band, grid: DetailGrid { voxel: l.grid.voxel, bricks: level(&grids, &l.grid, &touched.0.levels[k].grid), levels: Vec::new(), solid: Default::default(), clean: false } }
+            })
+            .collect();
+        let mut out = DetailGrid { voxel: g.voxel, bricks: level(&coarse, g, &touched.0), levels, solid: Default::default(), clean: false };
+        // Bricks that sum to zero are left out, as `compose` leaves them.
+        out.bricks.retain(|_, b| b.iter().any(|x| *x != 0.0));
+        for l in &mut out.levels {
+            l.grid.bricks.retain(|_, b| b.iter().any(|x| *x != 0.0));
+        }
+        Ok(Detail(Arc::new(out)))
+    }
+
+    /// Every stored value through `f(object-space point, value)`, on every
+    /// level (`split_by_mask` weighs a layer by the mask).
+    pub(crate) fn map_points(&self, f: impl Fn(Vec3, f32) -> f32) -> Detail {
+        fn level(g: &DetailGrid, f: &dyn Fn(Vec3, f32) -> f32) -> Bricks {
+            let mut out = Bricks::default();
+            for (key, b) in &g.bricks {
+                let mut v = **b;
+                for (i, x) in v.iter_mut().enumerate() {
+                    let l = [i as i32 % DB, i as i32 / DB % DB, i as i32 / (DB * DB)];
+                    let p = Vec3::new((key[0] * DB + l[0]) as f32, (key[1] * DB + l[1]) as f32, (key[2] * DB + l[2]) as f32) * g.voxel;
+                    *x = f(p, *x);
+                }
+                if v.iter().any(|x| x.abs() > 1e-7) {
+                    out.insert(*key, Arc::new(v));
+                }
+            }
+            out
+        }
+        let g = &self.0;
+        let levels = g.levels.iter().map(|l| Level { region: l.region.clone(), band: l.band, grid: DetailGrid { voxel: l.grid.voxel, bricks: level(&l.grid, &f), levels: Vec::new(), solid: Default::default(), clean: false } }).collect();
+        Detail(Arc::new(DetailGrid { voxel: g.voxel, bricks: level(g, &f), levels, solid: Default::default(), clean: false }))
+    }
+
+    /// A grid that passes the checks a file's grids get.
+    pub(crate) fn sane(&self) -> bool {
+        self.is_sane()
+    }
+
+    /// `grid + (after - before) / amount` where `before` and `after` differ
+    /// (bricks compared by address; `grid` None: zeros with `before`'s
+    /// layout): a stroke made on the composed layers (`before` to `after`)
+    /// folded back into the one layer it writes, at that layer's amount.
+    pub(crate) fn fold_change(grid: Option<&Detail>, before: &Detail, after: &Detail, amount: f32) -> Result<Detail, String> {
+        let empty;
+        let grid = match grid {
+            Some(g) => g,
+            None => {
+                empty = before.empty_like();
+                &empty
+            }
+        };
+        if !grid.0.same_layout(&before.0) || !before.0.same_layout(&after.0) {
+            return Err("the layer no longer lines up with the others (its detail cell or regions differ)".into());
+        }
+        fn level(g: &DetailGrid, b: &DetailGrid, a: &DetailGrid, amount: f32) -> Bricks {
+            let zero = [0.0f32; BRICK_VALUES];
+            let mut out = g.bricks.clone();
+            let mut keys: Vec<&[i32; 3]> = a.bricks.keys().chain(b.bricks.keys()).collect();
+            keys.sort_unstable();
+            keys.dedup();
+            for key in keys {
+                let (x, y) = (b.bricks.get(key), a.bricks.get(key));
+                if let (Some(x), Some(y)) = (x, y)
+                    && Arc::ptr_eq(x, y)
+                {
+                    continue;
+                }
+                let (x, y) = (x.map_or(&zero, |x| &**x), y.map_or(&zero, |y| &**y));
+                let mut v = g.bricks.get(key).map_or(zero, |b| **b);
+                for i in 0..BRICK_VALUES {
+                    v[i] += (y[i] - x[i]) / amount;
+                }
+                if v.iter().any(|x| x.abs() > 1e-7) {
+                    out.insert(*key, Arc::new(v));
+                } else {
+                    out.remove(key);
+                }
+            }
+            out
+        }
+        let (g, b, a) = (&grid.0, &before.0, &after.0);
+        let levels = g.levels.iter().zip(b.levels.iter().zip(&a.levels)).map(|(l, (lb, la))| Level { region: l.region.clone(), band: l.band, grid: DetailGrid { voxel: l.grid.voxel, bricks: level(&l.grid, &lb.grid, &la.grid, amount), levels: Vec::new(), solid: Default::default(), clean: false } }).collect();
+        Ok(Detail(Arc::new(DetailGrid { voxel: g.voxel, bricks: level(g, b, a, amount), levels, solid: Default::default(), clean: false })))
+    }
+
+    /// The grid resampled to `other`'s layout (cell and regions), as
+    /// `edit_clay detail_cell` and `detail_regions` move a clay's base
+    /// grid: the layers above follow it.
+    pub(crate) fn relaid_like(&self, other: &Detail) -> Result<Detail, String> {
+        if self.0.same_layout(&other.0) {
+            return Ok(self.clone());
+        }
+        let mut g = if self.0.voxel == other.0.voxel { (*self.0).clone() } else { self.0.resampled(other.0.voxel)? };
+        let regions: Vec<Region> = other.0.levels.iter().map(|l| l.region.clone()).collect();
+        g.set_regions(&regions)?;
+        let out = Detail(Arc::new(g));
+        if !out.0.same_layout(&other.0) {
+            return Err("a layer could not follow the base grid's new regions".into());
+        }
+        Ok(out)
+    }
+
+    /// The coarse grid alone, without refined levels (bricks shared).
+    pub(crate) fn without_levels(&self) -> Detail {
+        Detail(Arc::new(DetailGrid { voxel: self.0.voxel, bricks: self.0.bricks.clone(), levels: Vec::new(), solid: Default::default(), clean: false }))
+    }
+
     /// See `DetailGrid::mirrored_x`.
     pub fn mirrored_x(&self) -> Detail {
         Detail(Arc::new(self.0.mirrored_x()))
     }
 
     pub fn new(voxel: f32) -> Self {
-        Detail(Arc::new(DetailGrid { voxel, bricks: HashMap::new(), levels: Vec::new() }))
+        Detail(Arc::new(DetailGrid { voxel, bricks: Bricks::default(), levels: Vec::new(), solid: Default::default(), clean: false }))
     }
 
     pub fn voxel(&self) -> f32 {
@@ -1900,7 +2608,9 @@ impl Detail {
     }
 
     pub fn grid_mut(&mut self) -> &mut DetailGrid {
-        Arc::make_mut(&mut self.0)
+        let g = Arc::make_mut(&mut self.0);
+        g.forget_bounds();
+        g
     }
 
     fn is_sane(&self) -> bool {
@@ -1914,9 +2624,39 @@ impl Detail {
     }
 }
 
+/// Brick `key` of `sum(amount x grid)` for each key (in parallel; in the
+/// grids' order within a brick): a brick only one grid has at amount 1
+/// is shared, all-zero sums are a zero brick (None).
+fn sum_keys(grids: &[(&DetailGrid, f32)], keys: Vec<[i32; 3]>) -> Vec<([i32; 3], Arc<[f32; BRICK_VALUES]>)> {
+    let zero = Arc::new([0.0f32; BRICK_VALUES]);
+    let mut out: Vec<([i32; 3], Option<Arc<[f32; BRICK_VALUES]>>)> = keys.into_iter().map(|k| (k, None)).collect();
+    par_chunks(&mut out, 256, |_, chunk| {
+        for (key, slot) in chunk.iter_mut() {
+            let have: Vec<(&Arc<[f32; BRICK_VALUES]>, f32)> = grids.iter().filter_map(|(g, a)| g.bricks.get(key).map(|b| (b, *a))).filter(|(_, a)| *a != 0.0).collect();
+            if let [(b, a)] = &have[..]
+                && *a == 1.0
+            {
+                *slot = Some((*b).clone());
+                continue;
+            }
+            let mut v = [0.0f32; BRICK_VALUES];
+            for (b, a) in &have {
+                for i in 0..BRICK_VALUES {
+                    v[i] += a * b[i];
+                }
+            }
+            *slot = Some(if v.iter().any(|x| *x != 0.0) { Arc::new(v) } else { zero.clone() });
+        }
+    });
+    out.into_iter().map(|(k, b)| (k, b.expect("filled"))).collect()
+}
+
 pub(crate) fn split(i: [i32; 3]) -> ([i32; 3], usize) {
-    let key = i.map(|c| c.div_euclid(DB));
-    let l = i.map(|c| c.rem_euclid(DB) as usize);
+    // DB is 8: an arithmetic shift floors (div_euclid) and the low bits
+    // are rem_euclid, for every i32.
+    const _: () = assert!(DB == 8);
+    let key = i.map(|c| c >> 3);
+    let l = i.map(|c| (c & 7) as usize);
     (key, l[0] + DB as usize * (l[1] + DB as usize * l[2]))
 }
 
@@ -1929,11 +2669,69 @@ impl DetailGrid {
 
     /// Sets a grid point on this level.
     pub fn set(&mut self, i: [i32; 3], v: f32) {
+        self.solid = std::sync::OnceLock::new();
+        self.clean = false;
         let (key, at) = split(i);
         if v == 0.0 && !self.bricks.contains_key(&key) {
             return;
         }
         Arc::make_mut(self.bricks.entry(key).or_insert_with(|| Arc::new([0.0; BRICK_VALUES])))[at] = v;
+    }
+
+    /// This level's bricks by key, in no particular order.
+    pub fn bricks(&self) -> impl Iterator<Item = (&[i32; 3], &[f32; BRICK_VALUES])> {
+        self.bricks.iter().map(|(k, b)| (k, &**b))
+    }
+
+    /// One brick of this level, shared (its address says whether two
+    /// grids share it).
+    pub(crate) fn brick(&self, key: &[i32; 3]) -> Option<&Arc<[f32; BRICK_VALUES]>> {
+        self.bricks.get(key)
+    }
+
+    /// This level's brick keys, in no particular order.
+    pub(crate) fn brick_keys(&self) -> impl Iterator<Item = &[i32; 3]> {
+        self.bricks.keys()
+    }
+
+    /// Same cell and same regions (so grid points line up level by level).
+    pub(crate) fn same_layout(&self, other: &DetailGrid) -> bool {
+        self.voxel == other.voxel && self.levels.len() == other.levels.len() && self.levels.iter().zip(&other.levels).all(|(a, b)| a.region == b.region && a.band == b.band)
+    }
+
+    /// Brick by brick over both grids' keys (this layout): `f(mine, other)`
+    /// with absent bricks as zeros; `keep` says what a brick both grids
+    /// share becomes (None: dropped, the result's zeros).
+    fn zip(&self, other: &DetailGrid, shared: fn(&Arc<[f32; BRICK_VALUES]>) -> Option<Arc<[f32; BRICK_VALUES]>>, f: &dyn Fn(f32, f32) -> f32) -> DetailGrid {
+        let zero = [0.0f32; BRICK_VALUES];
+        let mut bricks = Bricks::default();
+        for key in self.bricks.keys().chain(other.bricks.keys().filter(|k| !self.bricks.contains_key(*k))) {
+            let (a, b) = (self.bricks.get(key), other.bricks.get(key));
+            if let (Some(a), Some(b)) = (a, b)
+                && Arc::ptr_eq(a, b)
+            {
+                if let Some(v) = shared(a) {
+                    bricks.insert(*key, v);
+                }
+                continue;
+            }
+            let (a, b) = (a.map_or(&zero, |a| &**a), b.map_or(&zero, |b| &**b));
+            let mut out = [0.0f32; BRICK_VALUES];
+            for i in 0..BRICK_VALUES {
+                out[i] = f(a[i], b[i]);
+            }
+            if out.iter().any(|v| *v != 0.0) {
+                bricks.insert(*key, Arc::new(out));
+            }
+        }
+        DetailGrid { voxel: self.voxel, bricks, levels: Vec::new(), solid: Default::default(), clean: false }
+    }
+
+    /// `zip` on every level (the layouts must match).
+    fn zip_levels(&self, other: &DetailGrid, shared: fn(&Arc<[f32; BRICK_VALUES]>) -> Option<Arc<[f32; BRICK_VALUES]>>, f: &dyn Fn(f32, f32) -> f32) -> DetailGrid {
+        let mut out = self.zip(other, shared, f);
+        out.levels = self.levels.iter().zip(&other.levels).map(|(a, b)| Level { region: a.region.clone(), band: a.band, grid: a.grid.zip(&b.grid, shared, f) }).collect();
+        out
     }
 
     /// Bricks on this level.
@@ -1954,7 +2752,7 @@ impl DetailGrid {
     /// The same offsets mirrored across x = 0 (grid point x -> -x), finer
     /// levels and their regions too.
     pub fn mirrored_x(&self) -> DetailGrid {
-        let mut out = DetailGrid { voxel: self.voxel, bricks: HashMap::new(), levels: Vec::new() };
+        let mut out = DetailGrid { voxel: self.voxel, bricks: Bricks::default(), levels: Vec::new(), solid: Default::default(), clean: false };
         for (key, brick) in &self.bricks {
             for (at, &v) in brick.iter().enumerate().filter(|(_, v)| **v != 0.0) {
                 let l = [at as i32 % DB, at as i32 / DB % DB, at as i32 / (DB * DB)];
@@ -1971,6 +2769,7 @@ impl DetailGrid {
     }
 
     pub(crate) fn levels_mut(&mut self) -> &mut Vec<Level> {
+        self.forget_bounds();
         &mut self.levels
     }
 
@@ -1987,13 +2786,109 @@ impl DetailGrid {
 
     /// Drops bricks that hold only zeros.
     pub fn prune(&mut self) {
+        self.solid = std::sync::OnceLock::new();
         self.bricks.retain(|_, b| b.iter().any(|v| v.abs() > 1e-7));
+        self.clean = true;
+    }
+
+    /// The grid a sculpt target writes: this one (None) or level `k`'s.
+    pub(crate) fn target_mut(&mut self, target: Option<usize>) -> &mut DetailGrid {
+        self.forget_bounds();
+        match target {
+            None => self,
+            Some(k) => &mut self.levels[k].grid,
+        }
+    }
+
+    pub(crate) fn target(&self, target: Option<usize>) -> &DetailGrid {
+        match target {
+            None => self,
+            Some(k) => &self.levels[k].grid,
+        }
+    }
+
+    /// Sets grid points on this level, then drops the bricks left all zero:
+    /// every brick when `all`, else only the ones written (enough once the
+    /// grid has been pruned, as only written bricks change). Returns the
+    /// keys of the bricks written or dropped: what a copy of the grid must
+    /// take over (`share_bricks`) to match it again.
+    pub(crate) fn write(&mut self, changes: &[([i32; 3], f32)], all: bool) -> Vec<[i32; 3]> {
+        self.solid = std::sync::OnceLock::new();
+        // Brushes list their changes x fastest, so they come in runs of up
+        // to 8 points of one brick: each run takes one map lookup (and one
+        // copy-on-write check), and only the runs' keys are sorted. The
+        // values written are exactly `set`'s, point by point in order (a
+        // run of zeros on a brick that is not there makes none, as `set`
+        // makes none).
+        let mut keys: Vec<[i32; 3]> = Vec::new();
+        let mut s = 0;
+        while s < changes.len() {
+            let key = split(changes[s].0).0;
+            let mut e = s + 1;
+            while e < changes.len() && split(changes[e].0).0 == key {
+                e += 1;
+            }
+            let run = &changes[s..e];
+            // The rows after this one cross the same bricks: a key among
+            // the last few listed is not listed again (the sort and dedup
+            // below catch the rest).
+            if !keys[keys.len().saturating_sub(32)..].contains(&key) {
+                keys.push(key);
+            }
+            s = e;
+            if !self.bricks.contains_key(&key) && run.iter().all(|(_, v)| *v == 0.0) {
+                continue;
+            }
+            let brick = Arc::make_mut(self.bricks.entry(key).or_insert_with(|| Arc::new([0.0; BRICK_VALUES])));
+            for &(i, v) in run {
+                brick[split(i).1] = v;
+            }
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        let zero = |b: &[f32; BRICK_VALUES]| !b.iter().any(|v| v.abs() > 1e-7);
+        // A clean grid has no zero brick but the ones written now.
+        if all && !self.clean {
+            self.clean = true;
+            let mut dropped = Vec::new();
+            self.bricks.retain(|k, b| {
+                let keep = !zero(b);
+                if !keep && keys.binary_search(k).is_err() {
+                    dropped.push(*k);
+                }
+                keep
+            });
+            keys.extend(dropped);
+        } else {
+            for k in &keys {
+                if self.bricks.get(k).is_some_and(|b| zero(b)) {
+                    self.bricks.remove(k);
+                }
+            }
+        }
+        keys
+    }
+
+    /// Makes bricks `keys` the same as `from`'s, sharing them (no copy).
+    pub(crate) fn share_bricks(&mut self, from: &DetailGrid, keys: &[[i32; 3]]) {
+        self.solid = std::sync::OnceLock::new();
+        self.clean &= from.clean;
+        for k in keys {
+            match from.bricks.get(k) {
+                Some(b) => {
+                    self.bricks.insert(*k, b.clone());
+                }
+                None => {
+                    self.bricks.remove(k);
+                }
+            }
+        }
     }
 
     /// The same offsets on a grid of `voxel` spacing (refined levels keep
     /// their own cells, and drop out when no longer finer).
     pub fn resampled(&self, voxel: f32) -> Result<DetailGrid, String> {
-        let mut out = DetailGrid { voxel, bricks: HashMap::new(), levels: Vec::new() };
+        let mut out = DetailGrid { voxel, bricks: Bricks::default(), levels: Vec::new(), solid: Default::default(), clean: false };
         for &key in self.bricks.keys() {
             let (lo, hi) = self.brick_box(key);
             let (i0, i1) = ((lo / voxel).floor().as_ivec3(), (hi / voxel).ceil().as_ivec3());
@@ -2019,6 +2914,31 @@ impl DetailGrid {
         Ok(out)
     }
 
+    /// The offset at grid point `i` with every refined level: this
+    /// level's own value there (as brushes read it) plus what the finer
+    /// levels add at its place.
+    pub(crate) fn lattice(&self, i: [i32; 3]) -> f32 {
+        let mut v = self.get(i);
+        if !self.levels.is_empty() {
+            let p = Vec3::new(i[0] as f32, i[1] as f32, i[2] as f32) * self.voxel;
+            for l in &self.levels {
+                let w = l.weight(p);
+                if w > 0.0 {
+                    v += l.grid.level_offset(p) * w;
+                }
+            }
+        }
+        v
+    }
+
+    /// Whether a refined level reaches into the box (`lo`..`hi`).
+    pub(crate) fn levels_touch(&self, lo: Vec3, hi: Vec3) -> bool {
+        self.levels.iter().any(|l| {
+            let (a, b) = l.extent(0.0);
+            a.cmple(hi).all() && b.cmpge(lo).all() && l.grid.level_touches(lo, hi)
+        })
+    }
+
     /// Trilinear offset at an object-space point, with every refined level.
     pub fn offset(&self, p: Vec3) -> f32 {
         self.parent(self.levels.len(), p)
@@ -2035,6 +2955,24 @@ impl DetailGrid {
             }
         }
         v
+    }
+
+    /// `get` at grid points `i0 + (x, 0, 0)` for each x in `out` (this
+    /// level): one brick lookup per run of points in one brick.
+    pub(crate) fn row(&self, i0: [i32; 3], out: &mut [f32]) {
+        let (ky, kz) = (i0[1].div_euclid(DB), i0[2].div_euclid(DB));
+        let at = (i0[1].rem_euclid(DB) * DB + i0[2].rem_euclid(DB) * DB * DB) as usize;
+        let mut x = 0;
+        while x < out.len() {
+            let gx = i0[0] + x as i32;
+            let (kx, lx) = (gx.div_euclid(DB), gx.rem_euclid(DB));
+            let run = ((DB - lx) as usize).min(out.len() - x);
+            match self.bricks.get(&[kx, ky, kz]) {
+                Some(b) => out[x..x + run].copy_from_slice(&b[at + lx as usize..at + lx as usize + run]),
+                None => out[x..x + run].fill(0.0),
+            }
+            x += run;
+        }
     }
 
     /// Level `k`'s whole offset at its grid point `i` (the coarse grid for
@@ -2124,7 +3062,7 @@ impl DetailGrid {
         })
     }
 
-    fn level_touches(&self, lo: Vec3, hi: Vec3) -> bool {
+    pub(crate) fn level_touches(&self, lo: Vec3, hi: Vec3) -> bool {
         if self.bricks.is_empty() {
             return false;
         }
@@ -2149,8 +3087,20 @@ impl DetailGrid {
         })
     }
 
+    /// Forgets `solid_bounds` here and on every level (before a change).
+    fn forget_bounds(&mut self) {
+        self.solid = std::sync::OnceLock::new();
+        for l in &mut self.levels {
+            l.grid.forget_bounds();
+        }
+    }
+
     /// Bounds of bricks that can add material outside the blobs.
     fn solid_bounds(&self) -> Option<(Vec3, Vec3)> {
+        *self.solid.get_or_init(|| self.solid_bounds_now())
+    }
+
+    fn solid_bounds_now(&self) -> Option<(Vec3, Vec3)> {
         let pad = Vec3::splat(2.0 * self.voxel);
         let own = self.bricks
             .iter()
@@ -2164,36 +3114,165 @@ impl DetailGrid {
     }
 
     /// Replaces the refined regions. A region already there (same name,
-    /// place and cell) keeps its detail; a new one starts empty (the
-    /// surface does not change). A removed region's finer detail goes, but
-    /// nothing else: every stroke also landed on the coarse grid.
+    /// place and cell) keeps its detail. A new one takes over the detail of
+    /// the regions that went (each goes to one new region: the one of its
+    /// cell, else the finest, that overlaps it most), as the old levels
+    /// showed it: inside both the old and the new region the surface does
+    /// not change, so growing or merging regions (Sculptris Pro) keeps
+    /// every finer stroke. What a removed region held outside every new
+    /// one goes, but nothing else: every stroke also landed on the coarse
+    /// grid.
     pub(crate) fn set_regions(&mut self, regions: &[Region]) -> Result<(), String> {
+        self.forget_bounds();
         if regions.len() > MAX_REGIONS {
             return Err(format!("at most {MAX_REGIONS} detail regions"));
         }
         for r in regions {
             r.validate(self.voxel)?;
         }
-        // A level that goes away takes its finer detail with it; the coarse
-        // grid holds its own version of every stroke.
-        let mut kept: Vec<Level> = Vec::new();
-        for r in regions {
-            if let Some(l) = self.levels.iter().find(|l| &l.region == r) {
-                kept.push(l.clone());
-                continue;
+        let kept: Vec<Option<usize>> = regions.iter().map(|r| self.levels.iter().position(|l| &l.region == r)).collect();
+        let dropped: Vec<&Level> = self.levels.iter().filter(|l| !regions.contains(&l.region)).collect();
+        let mut fresh: Vec<Level> = regions
+            .iter()
+            .zip(&kept)
+            .map(|(r, k)| match k {
+                Some(k) => self.levels[*k].clone(),
+                // Empty until it takes over a removed region's detail.
+                None => Level { band: band_for(self.voxel, r), region: r.clone(), grid: DetailGrid { voxel: r.cell, ..Default::default() } },
+            })
+            .collect();
+        // Which new region each removed one's detail goes to (in the old
+        // levels' order, so overlapping ones add up as they showed).
+        for old in dropped {
+            let (a, b) = old.extent(0.0);
+            let cell = old.grid.voxel;
+            let best = fresh
+                .iter()
+                .enumerate()
+                .filter(|(n, l)| kept[*n].is_none() && {
+                    let (c, d) = l.extent(0.0);
+                    a.cmple(d).all() && c.cmple(b).all()
+                })
+                .map(|(n, l)| {
+                    let (c, d) = l.extent(0.0);
+                    let s = (b.min(d) - a.max(c)).max(Vec3::ZERO);
+                    ((l.grid.voxel != cell, l.grid.voxel, -(s.x as f64 * s.y as f64 * s.z as f64)), n)
+                })
+                .min_by(|(x, _), (y, _)| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(_, n)| n);
+            if let Some(n) = best
+                && !old.grid.bricks.is_empty()
+            {
+                let into = &mut fresh[n];
+                let (lo, hi) = into.extent(0.0);
+                carry(old, &mut into.grid, &into.region.name, lo, hi)?;
+                if into.grid.bricks.len() > MAX_BRICKS {
+                    return Err(format!("detail region {} would need more than {MAX_BRICKS} sculpt blocks; use a smaller region or a larger cell", into.region.name));
+                }
             }
-            // Empty: it adds nothing until something finer is sculpted.
-            let level = Level { band: band_for(self.voxel, r), region: r.clone(), grid: DetailGrid { voxel: r.cell, ..Default::default() } };
-            kept.push(level);
         }
         // Coarse first, so finer cells win where regions overlap.
-        kept.sort_by(|a, b| b.region.cell.total_cmp(&a.region.cell));
-        self.levels = kept;
+        fresh.sort_by(|a, b| b.region.cell.total_cmp(&a.region.cell));
+        self.levels = fresh;
         if self.total_bricks() > MAX_TOTAL_BRICKS {
             return Err(format!("detail regions need more than {MAX_TOTAL_BRICKS} sculpt blocks in all; use smaller regions or larger cells"));
         }
         Ok(())
     }
+}
+
+/// Adds what level `old` showed (its difference times its weight) to the
+/// grid `into`, at `into`'s grid points within `lo..=hi` (bricks around
+/// them). A brick of the same cell that `old` showed whole and `into`
+/// lacks is shared, not copied: a grown region keeps its strokes exactly.
+fn carry(old: &Level, into: &mut DetailGrid, region: &str, lo: Vec3, hi: Vec3) -> Result<(), String> {
+    into.solid = std::sync::OnceLock::new();
+    into.clean = false;
+    let mut keys: Vec<[i32; 3]> = old.grid.bricks.keys().copied().collect();
+    keys.sort_unstable();
+    let inside = |p: Vec3| ((p - old.region.center) / old.region.radii).length() <= 1.0;
+    let v = into.voxel;
+    let near = |key: [i32; 3]| {
+        let (a, b) = old.grid.brick_box(key);
+        a.cmple(hi).all() && lo.cmple(b).all()
+    };
+    if old.grid.voxel != v {
+        // Another cell: the old level read at this grid's points, brick by
+        // brick of this grid (each once, though the old bricks' boxes share
+        // their edges).
+        let size = DB as f32 * v;
+        let too_many = || format!("detail region {region} would need more than {MAX_BRICKS} sculpt blocks to keep the finer detail it takes over; use a smaller region or a larger cell");
+        let mut news: Vec<[i32; 3]> = Vec::new();
+        for key in keys.into_iter().filter(|k| near(*k)) {
+            let (a, b) = old.grid.brick_box(key);
+            let (k0, k1) = ((a.max(lo) / size).floor().as_ivec3(), (b.min(hi) / size).floor().as_ivec3());
+            let n = (k1 - k0 + 1).max(glam::IVec3::ZERO).as_i64vec3();
+            if n.x * n.y * n.z > MAX_BRICKS as i64 {
+                return Err(too_many());
+            }
+            if news.len() > 4 * MAX_BRICKS {
+                news.sort_unstable();
+                news.dedup();
+                if news.len() > MAX_BRICKS {
+                    return Err(too_many());
+                }
+            }
+            for z in k0.z..=k1.z {
+                for y in k0.y..=k1.y {
+                    for x in k0.x..=k1.x {
+                        news.push([x, y, z]);
+                    }
+                }
+            }
+        }
+        news.sort_unstable();
+        news.dedup();
+        if news.len() > MAX_BRICKS {
+            return Err(too_many());
+        }
+        for key in news {
+            let base = glam::IVec3::from(key) * DB;
+            let mut add = [0.0f32; BRICK_VALUES];
+            for (at, slot) in add.iter_mut().enumerate() {
+                let p = (base + glam::IVec3::new(at as i32 % DB, at as i32 / DB % DB, at as i32 / (DB * DB))).as_vec3() * v;
+                *slot = old.grid.level_offset(p) * old.weight(p);
+            }
+            if add.iter().all(|x| *x == 0.0) {
+                continue;
+            }
+            let dst = Arc::make_mut(into.bricks.entry(key).or_insert_with(|| Arc::new([0.0; BRICK_VALUES])));
+            for (d, s) in dst.iter_mut().zip(add) {
+                *d += s;
+            }
+            if dst.iter().all(|x| *x == 0.0) {
+                into.bricks.remove(&key);
+            }
+        }
+        return Ok(());
+    }
+    for key in keys.into_iter().filter(|k| near(*k)) {
+        let (a, b) = old.grid.brick_box(key);
+        let whole = (0..8).all(|c| inside(Vec3::new(if c & 1 == 0 { a.x } else { b.x }, if c & 2 == 0 { a.y } else { b.y }, if c & 4 == 0 { a.z } else { b.z })));
+        let src = &old.grid.bricks[&key];
+        if whole && !into.bricks.contains_key(&key) {
+            into.bricks.insert(key, src.clone());
+            continue;
+        }
+        let base = glam::IVec3::from(key) * DB;
+        let mut add = [0.0f32; BRICK_VALUES];
+        for (at, slot) in add.iter_mut().enumerate() {
+            let i = base + glam::IVec3::new(at as i32 % DB, at as i32 / DB % DB, at as i32 / (DB * DB));
+            *slot = src[at] * old.weight(i.as_vec3() * v);
+        }
+        let dst = Arc::make_mut(into.bricks.entry(key).or_insert_with(|| Arc::new([0.0; BRICK_VALUES])));
+        for (d, s) in dst.iter_mut().zip(add) {
+            *d += s;
+        }
+        if dst.iter().all(|x| *x == 0.0) {
+            into.bricks.remove(&key);
+        }
+    }
+    Ok(())
 }
 
 /// One level of a detail grid as brushes see it: whole offsets at its grid
@@ -2202,16 +3281,15 @@ pub(crate) struct LevelView<'a> {
     pub top: &'a DetailGrid,
     pub level: Option<usize>,
     /// Coarse grid: the largest offset in each brick; levels: one bound.
-    bricks: HashMap<[i32; 3], f32>,
-    most: f32,
+    /// Found on first use (`carved`): it reads every brick, too slow for
+    /// every dab of a long stroke on a big grid.
+    bricks: std::sync::OnceLock<HashMap<[i32; 3], f32>>,
+    most: std::sync::OnceLock<f32>,
 }
 
 impl<'a> LevelView<'a> {
     pub(crate) fn new(top: &'a DetailGrid, level: Option<usize>) -> Self {
-        match level {
-            None => LevelView { top, level, bricks: top.brick_max_abs(), most: 0.0 },
-            Some(_) => LevelView { top, level, bricks: HashMap::new(), most: top.max_abs() },
-        }
+        LevelView { top, level, bricks: std::sync::OnceLock::new(), most: std::sync::OnceLock::new() }
     }
 
     pub(crate) fn voxel(&self) -> f32 {
@@ -2222,18 +3300,43 @@ impl<'a> LevelView<'a> {
         self.top.full(self.level, i)
     }
 
+    /// `get` at grid points `i0 + (x, 0, 0)` for each x in `out`.
+    pub(crate) fn row(&self, i0: [i32; 3], out: &mut [f32]) {
+        match self.level {
+            None => self.top.row(i0, out),
+            Some(_) => {
+                for (x, o) in out.iter_mut().enumerate() {
+                    *o = self.get([i0[0] + x as i32, i0[1], i0[2]]);
+                }
+            }
+        }
+    }
+
+    /// The largest offset in the world box `lo..=hi` (a bound over the
+    /// whole grid for a box too large or too far to look at brick by brick).
+    pub(crate) fn carved_in(&self, lo: Vec3, hi: Vec3) -> f32 {
+        let v = self.voxel();
+        let (a, b) = ((lo / v).floor(), (hi / v).ceil());
+        let bound = 1e8;
+        if !a.is_finite() || !b.is_finite() || (b - a).max_element() > (4 * DB) as f32 || a.abs().max_element() > bound || b.abs().max_element() > bound {
+            return *self.most.get_or_init(|| self.top.max_abs());
+        }
+        self.carved(a.as_ivec3(), b.as_ivec3())
+    }
+
     /// The largest offset around grid points `lo..=hi`: how far sculpting
     /// can have moved the surface there.
     pub(crate) fn carved(&self, lo: glam::IVec3, hi: glam::IVec3) -> f32 {
         if self.level.is_some() {
-            return self.most;
+            return *self.most.get_or_init(|| self.top.max_abs());
         }
+        let bricks = self.bricks.get_or_init(|| self.top.brick_max_abs());
         let (b0, b1) = (lo.div_euclid(glam::IVec3::splat(DB)), hi.div_euclid(glam::IVec3::splat(DB)));
         let mut m = 0.0f32;
         for z in b0.z..=b1.z {
             for y in b0.y..=b1.y {
                 for x in b0.x..=b1.x {
-                    m = m.max(self.bricks.get(&[x, y, z]).copied().unwrap_or(0.0));
+                    m = m.max(bricks.get(&[x, y, z]).copied().unwrap_or(0.0));
                 }
             }
         }
@@ -2241,11 +3344,16 @@ impl<'a> LevelView<'a> {
     }
 }
 
-/// File form: offsets as little-endian i16 in 1/256 voxel steps, base64.
+/// File form: offsets as i16 in 1/256 voxel steps. `packed` holds every
+/// brick of a level deflated together (see `pack`); files from before
+/// that have one base64 `bricks` entry per brick, and still read.
 #[derive(Serialize, Deserialize)]
 struct DetailFile {
     voxel: f32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     bricks: Vec<BrickFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    packed: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     levels: Vec<LevelFile>,
 }
@@ -2254,7 +3362,149 @@ struct DetailFile {
 struct LevelFile {
     region: Region,
     band: f32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     bricks: Vec<BrickFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    packed: Option<String>,
+}
+
+/// Most bytes `unpack` inflates over one read of a scene (or of a grid or
+/// ledger read on its own): a file that deflates to more is refused
+/// before it is allocated, however many objects, levels and ledger
+/// records it spreads them over. Detail bricks take twice their inflated
+/// size in memory (f32 for i16), so this is about 8 GiB of grids.
+pub const INFLATE_BUDGET: u64 = 4 << 30;
+
+thread_local! {
+    /// Bytes `unpack` may still inflate in the read going on (None: no
+    /// read has opened a budget).
+    static INFLATE_LEFT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// The open budget's size, for errors.
+    static INFLATE_BUDGET_SIZE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f`, a deserialization, with `bytes` of inflate budget shared by
+/// every grid it reads. Inside another read's budget it shares that one:
+/// scene loads open one for the whole file, and grids and ledgers open
+/// the default for themselves, so no read is unbounded.
+pub fn inflate_budget<T>(bytes: u64, f: impl FnOnce() -> T) -> T {
+    if INFLATE_LEFT.with(|b| b.get()).is_some() {
+        return f();
+    }
+    struct Close;
+    impl Drop for Close {
+        fn drop(&mut self) {
+            INFLATE_LEFT.with(|b| b.set(None));
+            INFLATE_BUDGET_SIZE.with(|b| b.set(None));
+        }
+    }
+    INFLATE_LEFT.with(|b| b.set(Some(bytes)));
+    INFLATE_BUDGET_SIZE.with(|b| b.set(Some(bytes)));
+    let _close = Close;
+    f()
+}
+
+/// Deserializes with `INFLATE_BUDGET` unless a budget is open
+/// (`deserialize_with` for fields that hold grids).
+pub fn in_inflate_budget<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<T, D::Error> {
+    inflate_budget(INFLATE_BUDGET, || T::deserialize(d))
+}
+
+/// `in_inflate_budget` with a deserializing function of its own.
+pub fn in_inflate_budget_with<'de, D: serde::Deserializer<'de>, T>(d: D, f: impl FnOnce(D) -> Result<T, D::Error>) -> Result<T, D::Error> {
+    inflate_budget(INFLATE_BUDGET, || f(d))
+}
+
+/// Takes `bytes` of the read's inflate budget (the default outside a
+/// read) for data decoded some other way than `unpack` (alpha images).
+pub fn charge_inflate(bytes: u64) -> Result<(), String> {
+    let left = INFLATE_LEFT.with(|b| b.get()).unwrap_or(INFLATE_BUDGET);
+    if bytes > left {
+        let budget = INFLATE_BUDGET_SIZE.with(|b| b.get()).unwrap_or(INFLATE_BUDGET);
+        return Err(format!("the file's packed data inflates to more than its budget of {budget} bytes ({} MiB) in all", budget >> 20));
+    }
+    INFLATE_LEFT.with(|b| b.set(b.get().map(|l| l - bytes)));
+    Ok(())
+}
+
+/// Packs bricks for a file: a brick count, the keys (i32 x 3), then the
+/// values (`width` bytes each, little-endian) split into byte planes (all
+/// first bytes, then all second bytes ...), deflated and base64. With
+/// `delta` the values (i16) are stored as differences from the one
+/// before in the brick: smooth offsets and the planes compress well.
+pub(crate) fn pack(keys: &[[i32; 3]], values: &[u8], width: usize, delta: bool) -> String {
+    use std::io::Write;
+    let mut raw = Vec::with_capacity(4 + keys.len() * 12 + values.len());
+    raw.extend((keys.len() as u32).to_le_bytes());
+    for k in keys {
+        for c in k {
+            raw.extend(c.to_le_bytes());
+        }
+    }
+    let mut vals = values.to_vec();
+    if delta {
+        for brick in vals.chunks_exact_mut(BRICK_VALUES * 2) {
+            let mut prev = 0i16;
+            for pair in brick.chunks_exact_mut(2) {
+                let v = i16::from_le_bytes([pair[0], pair[1]]);
+                pair.copy_from_slice(&v.wrapping_sub(prev).to_le_bytes());
+                prev = v;
+            }
+        }
+    }
+    for plane in 0..width {
+        raw.extend(vals.iter().skip(plane).step_by(width));
+    }
+    let mut z = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    z.write_all(&raw).expect("deflate into memory");
+    base64::engine::general_purpose::STANDARD.encode(z.finish().expect("deflate into memory"))
+}
+
+/// Reads `pack`'s form back: (keys, values), at most `max` bricks of
+/// `width`-byte values.
+pub(crate) fn unpack(text: &str, width: usize, delta: bool, max: usize) -> Result<(Vec<[i32; 3]>, Vec<u8>), String> {
+    use std::io::Read;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(text).map_err(|e| e.to_string())?;
+    let limit = (4 + max * (12 + BRICK_VALUES * width)) as u64;
+    // Outside any read's budget (a direct call) the default applies.
+    let left = INFLATE_LEFT.with(|b| b.get()).unwrap_or(INFLATE_BUDGET);
+    let mut raw = Vec::new();
+    flate2::read::DeflateDecoder::new(&bytes[..]).take(limit.min(left) + 1).read_to_end(&mut raw).map_err(|e| e.to_string())?;
+    if raw.len() as u64 > left {
+        let budget = INFLATE_BUDGET_SIZE.with(|b| b.get()).unwrap_or(INFLATE_BUDGET);
+        return Err(format!("the file's packed grids inflate to more than its budget of {budget} bytes ({} MiB) in all", budget >> 20));
+    }
+    INFLATE_LEFT.with(|b| b.set(b.get().map(|l| l - raw.len() as u64)));
+    if raw.len() < 4 {
+        return Err("packed bricks are cut short".into());
+    }
+    let n = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+    if n > max {
+        return Err("too many bricks".into());
+    }
+    if raw.len() != 4 + n * (12 + BRICK_VALUES * width) {
+        return Err("packed bricks have the wrong size".into());
+    }
+    let keys = raw[4..4 + n * 12].chunks_exact(12).map(|c| [0, 4, 8].map(|o| i32::from_le_bytes([c[o], c[o + 1], c[o + 2], c[o + 3]]))).collect();
+    let planes = &raw[4 + n * 12..];
+    let count = n * BRICK_VALUES;
+    let mut values = vec![0u8; count * width];
+    for plane in 0..width {
+        for (i, b) in planes[plane * count..(plane + 1) * count].iter().enumerate() {
+            values[i * width + plane] = *b;
+        }
+    }
+    if delta {
+        for brick in values.chunks_exact_mut(BRICK_VALUES * 2) {
+            let mut prev = 0i16;
+            for pair in brick.chunks_exact_mut(2) {
+                let v = prev.wrapping_add(i16::from_le_bytes([pair[0], pair[1]]));
+                pair.copy_from_slice(&v.to_le_bytes());
+                prev = v;
+            }
+        }
+    }
+    Ok((keys, values))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2266,37 +3516,70 @@ struct BrickFile {
 /// Offsets are kept within this many voxels so the file form is lossless enough.
 pub const MAX_OFFSET_VOXELS: f32 = 127.0;
 
-fn bricks_file(g: &DetailGrid) -> Vec<BrickFile> {
-    let mut keys: Vec<&[i32; 3]> = g.bricks.keys().collect();
-    keys.sort();
-    let b64 = base64::engine::general_purpose::STANDARD;
-    keys.into_iter()
-        .map(|k| {
-            let bytes: Vec<u8> = g.bricks[k]
-                .iter()
-                .flat_map(|v| ((v / g.voxel * 256.0).round().clamp(-32767.0, 32767.0) as i16).to_le_bytes())
-                .collect();
-            BrickFile { at: *k, data: b64.encode(bytes) }
-        })
-        .collect()
+/// A brick's offsets as file values: i16 steps of 1/256 voxel.
+fn brick_bytes(g: &DetailGrid, k: &[i32; 3]) -> Vec<u8> {
+    g.bricks[k].iter().flat_map(|v| ((v / g.voxel * 256.0).round().clamp(-32767.0, 32767.0) as i16).to_le_bytes()).collect()
 }
 
-fn bricks_read<E: serde::de::Error>(file: Vec<BrickFile>, voxel: f32) -> Result<HashMap<[i32; 3], Arc<[f32; BRICK_VALUES]>>, E> {
+fn sorted_keys(g: &DetailGrid) -> Vec<[i32; 3]> {
+    let mut keys: Vec<[i32; 3]> = g.bricks.keys().copied().collect();
+    keys.sort();
+    keys
+}
+
+/// The packed file form of a level's bricks (None when it has none).
+fn bricks_packed(g: &DetailGrid) -> Option<String> {
+    let keys = sorted_keys(g);
+    (!keys.is_empty()).then(|| pack(&keys, &keys.iter().flat_map(|k| brick_bytes(g, k)).collect::<Vec<u8>>(), 2, true))
+}
+
+/// The older file form, one base64 entry per brick (tests measure the
+/// packed form against it).
+#[cfg(test)]
+fn bricks_file(g: &DetailGrid) -> Vec<BrickFile> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    sorted_keys(g).into_iter().map(|k| BrickFile { at: k, data: b64.encode(brick_bytes(g, &k)) }).collect()
+}
+
+/// A level's bricks; at most `max` (`MAX_BRICKS` or fewer: what is left
+/// of `MAX_TOTAL_BRICKS`).
+fn bricks_unpack<E: serde::de::Error>(packed: Option<String>, file: Vec<BrickFile>, voxel: f32, max: usize) -> Result<Bricks, E> {
+    if file.len() > max {
+        return Err(E::custom("too many detail bricks"));
+    }
+    let mut bricks = bricks_read(file, voxel)?;
+    if let Some(text) = packed {
+        let (keys, values) = unpack(&text, 2, true, max).map_err(|e| E::custom(format!("detail bricks: {e}")))?;
+        for (at, bytes) in keys.into_iter().zip(values.chunks_exact(BRICK_VALUES * 2)) {
+            bricks.insert(at, Arc::new(brick_values(bytes, voxel)));
+        }
+        if bricks.len() > max {
+            return Err(E::custom("too many detail bricks"));
+        }
+    }
+    Ok(bricks)
+}
+
+fn brick_values(bytes: &[u8], voxel: f32) -> [f32; BRICK_VALUES] {
+    let mut values = [0.0f32; BRICK_VALUES];
+    for (v, pair) in values.iter_mut().zip(bytes.chunks_exact(2)) {
+        *v = i16::from_le_bytes([pair[0], pair[1]]) as f32 / 256.0 * voxel;
+    }
+    values
+}
+
+fn bricks_read<E: serde::de::Error>(file: Vec<BrickFile>, voxel: f32) -> Result<Bricks, E> {
     if file.len() > MAX_BRICKS {
         return Err(E::custom("too many detail bricks"));
     }
     let b64 = base64::engine::general_purpose::STANDARD;
-    let mut bricks = HashMap::new();
+    let mut bricks = Bricks::default();
     for b in file {
         let bytes = b64.decode(&b.data).map_err(E::custom)?;
         if bytes.len() != BRICK_VALUES * 2 {
             return Err(E::custom("bad detail brick size"));
         }
-        let mut values = [0.0f32; BRICK_VALUES];
-        for (v, pair) in values.iter_mut().zip(bytes.chunks_exact(2)) {
-            *v = i16::from_le_bytes([pair[0], pair[1]]) as f32 / 256.0 * voxel;
-        }
-        bricks.insert(b.at, Arc::new(values));
+        bricks.insert(b.at, Arc::new(brick_values(&bytes, voxel)));
     }
     Ok(bricks)
 }
@@ -2304,24 +3587,51 @@ fn bricks_read<E: serde::de::Error>(file: Vec<BrickFile>, voxel: f32) -> Result<
 impl Serialize for Detail {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let g = &self.0;
-        let levels = g.levels.iter().map(|l| LevelFile { region: l.region.clone(), band: l.band, bricks: bricks_file(&l.grid) }).collect();
-        DetailFile { voxel: g.voxel, bricks: bricks_file(g), levels }.serialize(s)
+        let levels = g.levels.iter().map(|l| LevelFile { region: l.region.clone(), band: l.band, bricks: Vec::new(), packed: bricks_packed(&l.grid) }).collect();
+        DetailFile { voxel: g.voxel, bricks: Vec::new(), packed: bricks_packed(g), levels }.serialize(s)
+    }
+}
+
+impl Detail {
+    /// The grid as a file reads it back: every offset rounded to the
+    /// file's 1/256 voxel steps (levels at their region's cell, as they
+    /// load). Rounding twice changes nothing, so a quantized grid saves
+    /// and loads bit for bit.
+    pub fn quantized(&self) -> Detail {
+        let round = |g: &DetailGrid, voxel: f32| g.bricks.keys().map(|k| (*k, Arc::new(brick_values(&brick_bytes(g, k), voxel)))).collect();
+        let g = &self.0;
+        let levels = g.levels.iter().map(|l| Level { region: l.region.clone(), band: l.band, grid: DetailGrid { voxel: l.region.cell, bricks: round(&l.grid, l.region.cell), levels: Vec::new(), solid: Default::default(), clean: false } }).collect();
+        Detail(Arc::new(DetailGrid { voxel: g.voxel, bricks: round(g, g.voxel), levels, solid: Default::default(), clean: false }))
+    }
+
+    /// The file form from before bricks were deflated (for size checks).
+    #[cfg(test)]
+    pub(crate) fn raw_file_json(&self) -> String {
+        let g = &self.0;
+        let levels = g.levels.iter().map(|l| LevelFile { region: l.region.clone(), band: l.band, bricks: bricks_file(&l.grid), packed: None }).collect();
+        serde_json::to_string(&DetailFile { voxel: g.voxel, bricks: bricks_file(g), packed: None, levels }).expect("json")
     }
 }
 
 impl<'de> Deserialize<'de> for Detail {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let file = DetailFile::deserialize(d)?;
-        if file.levels.len() > MAX_REGIONS {
-            return Err(serde::de::Error::custom("too many detail regions"));
-        }
-        let bricks = bricks_read(file.bricks, file.voxel)?;
-        let mut levels = Vec::new();
-        for l in file.levels {
-            let grid = DetailGrid { voxel: l.region.cell, bricks: bricks_read(l.bricks, l.region.cell)?, levels: Vec::new() };
-            levels.push(Level { region: l.region, band: l.band, grid });
-        }
-        Ok(Detail(Arc::new(DetailGrid { voxel: file.voxel, bricks, levels })))
+        inflate_budget(INFLATE_BUDGET, || {
+            let file = DetailFile::deserialize(d)?;
+            if file.levels.len() > MAX_REGIONS {
+                return Err(serde::de::Error::custom("too many detail regions"));
+            }
+            // Every level counts toward MAX_TOTAL_BRICKS as it is read.
+            let bricks = bricks_unpack(file.packed, file.bricks, file.voxel, MAX_BRICKS)?;
+            let mut total = bricks.len();
+            let mut levels = Vec::new();
+            for l in file.levels {
+                let max = MAX_BRICKS.min(MAX_TOTAL_BRICKS - total);
+                let grid = DetailGrid { voxel: l.region.cell, bricks: bricks_unpack(l.packed, l.bricks, l.region.cell, max)?, levels: Vec::new(), solid: Default::default(), clean: false };
+                total += grid.bricks.len();
+                levels.push(Level { region: l.region, band: l.band, grid });
+            }
+            Ok(Detail(Arc::new(DetailGrid { voxel: file.voxel, bricks, levels, solid: Default::default(), clean: false })))
+        })
     }
 }
 
@@ -2389,7 +3699,7 @@ mod tests {
     #[test]
     fn membrane_distances_round_edges_and_cut_scallops() {
         let blob = membrane();
-        let (geo, lo, hi) = Geo::new(&blob.form);
+        let (geo, lo, hi) = Geo::new(&blob.form, &Default::default());
         assert!((geo.sdf(Vec3::ZERO) + 0.05).abs() < 1e-6);
         assert!((geo.sdf(Vec3::Z * 0.2) - 0.15).abs() < 1e-6);
         assert!((geo.sdf(Vec3::new(1.03, 0.0, 0.04))).abs() < 1e-6);
@@ -2399,7 +3709,7 @@ mod tests {
             *scallop = 0.2;
             *scallop_edges = vec![1];
         }
-        let (cut, _, _) = Geo::new(&form);
+        let (cut, _, _) = Geo::new(&form, &Default::default());
         assert!(cut.sdf(Vec3::new(0.9, 0.0, 0.0)) > 0.2);
         assert!(cut.sdf(Vec3::new(0.4, 0.0, 0.0)) < 0.0);
         assert!(cut.sdf(Vec3::new(1.0, -1.0, 0.0)) < 0.0);
@@ -2430,7 +3740,7 @@ mod tests {
         let bowed = c.build_mesh();
         assert!(bowed.bounds().1.z > 0.3);
         assert!(!bowed.vertices.is_empty());
-        let (geo, lo, hi) = Geo::new(&c.blobs[0].form);
+        let (geo, lo, hi) = Geo::new(&c.blobs[0].form, &c.assets);
         // A distance field must not overstep the sheet even at its rim.
         let a = Vec3::new(0.2,0.1,0.7);
         let b = Vec3::new(-0.3,0.2,0.4);
@@ -2547,6 +3857,86 @@ mod tests {
         let huge = Clay { blobs: vec![with_radius(1e30)], resolution: 32, detail: None, paint: None, detail_cell: None, ..Default::default() };
         let _ = huge.build_mesh();
     }
+    fn region(name: &str, center: Vec3, radii: Vec3, cell: f32) -> Region {
+        Region { name: name.into(), center, radii, cell }
+    }
+
+    /// A level's grid points inside `lo..=hi` set to a pattern (by point).
+    fn sculpt_level(g: &mut DetailGrid, k: usize, lo: Vec3, hi: Vec3, scale: f32) {
+        let v = g.levels[k].grid.voxel;
+        let (a, b) = ((lo / v).ceil().as_ivec3(), (hi / v).floor().as_ivec3());
+        for z in a.z..=b.z {
+            for y in a.y..=b.y {
+                for x in a.x..=b.x {
+                    g.levels[k].grid.set([x, y, z], scale * (1.0 + ((x * 7 + y * 3 + z) % 5) as f32));
+                }
+            }
+        }
+    }
+
+    fn offsets(g: &DetailGrid, lo: Vec3, hi: Vec3, step: f32) -> Vec<f32> {
+        let n = ((hi - lo) / step).ceil().as_ivec3();
+        let mut out = Vec::new();
+        for z in 0..=n.z {
+            for y in 0..=n.y {
+                for x in 0..=n.x {
+                    out.push(g.offset(lo + Vec3::new(x as f32, y as f32, z as f32) * step));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_grown_region_keeps_its_finer_detail() {
+        let mut g = DetailGrid { voxel: 0.01, ..Default::default() };
+        g.set_regions(&[region("a", Vec3::ZERO, Vec3::splat(0.1), 0.002)]).unwrap();
+        let (lo, hi) = (Vec3::splat(-0.04), Vec3::splat(0.04));
+        sculpt_level(&mut g, 0, lo, hi, 1e-4);
+        let want = offsets(&g, lo, hi, 0.0013);
+        // Grown (and renamed, as Sculptris does): the same offsets, exactly.
+        g.set_regions(&[region("b", Vec3::new(0.05, 0.0, 0.0), Vec3::new(0.2, 0.12, 0.12), 0.002)]).unwrap();
+        assert!(g.levels[0].grid.brick_count() > 0);
+        assert_eq!(offsets(&g, lo, hi, 0.0013), want);
+        // Removed: only the coarse grid's (none here) is left.
+        g.set_regions(&[]).unwrap();
+        assert!(offsets(&g, lo, hi, 0.0013).iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn merged_regions_keep_both_details() {
+        let mut g = DetailGrid { voxel: 0.01, ..Default::default() };
+        let (a, b) = (region("a", Vec3::ZERO, Vec3::splat(0.1), 0.002), region("b", Vec3::new(0.12, 0.0, 0.0), Vec3::splat(0.1), 0.002));
+        g.set_regions(&[a, b]).unwrap();
+        let (lo0, hi0) = (Vec3::splat(-0.04), Vec3::splat(0.04));
+        let (lo1, hi1) = (Vec3::new(0.08, -0.04, -0.04), Vec3::new(0.16, 0.04, 0.04));
+        sculpt_level(&mut g, 0, lo0, hi0, 1e-4);
+        sculpt_level(&mut g, 1, lo1, hi1, 2e-4);
+        let (w0, w1) = (offsets(&g, lo0, hi0, 0.0013), offsets(&g, lo1, hi1, 0.0013));
+        g.set_regions(&[region("ab", Vec3::new(0.06, 0.0, 0.0), Vec3::new(0.3, 0.2, 0.2), 0.002)]).unwrap();
+        assert_eq!(g.levels.len(), 1);
+        for (got, want) in [(offsets(&g, lo0, hi0, 0.0013), w0), (offsets(&g, lo1, hi1, 0.0013), w1)] {
+            assert!(got.iter().zip(&want).all(|(x, y)| (x - y).abs() <= 1e-7), "lost in the merge");
+        }
+        // Merged at a finer cell (past sixteen regions): kept to tolerance.
+        let want = offsets(&g, lo0, hi0, 0.0013);
+        g.set_regions(&[region("fine", Vec3::new(0.06, 0.0, 0.0), Vec3::new(0.3, 0.2, 0.2), 0.001)]).unwrap();
+        assert_eq!(g.levels[0].grid.voxel, 0.001);
+        let got = offsets(&g, lo0, hi0, 0.0013);
+        assert!(got.iter().zip(&want).all(|(x, y)| (x - y).abs() <= 1e-6), "lost in the finer merge");
+    }
+
+    #[test]
+    fn a_layer_follows_a_grown_region_with_its_detail() {
+        let mut base = Detail::new(0.01);
+        base.grid_mut().set_regions(&[region("a", Vec3::ZERO, Vec3::splat(0.1), 0.002)]).unwrap();
+        let mut layer = base.clone();
+        let (lo, hi) = (Vec3::splat(-0.04), Vec3::splat(0.04));
+        sculpt_level(layer.grid_mut(), 0, lo, hi, 1e-4);
+        let want = offsets(layer.grid(), lo, hi, 0.0013);
+        base.grid_mut().set_regions(&[region("sculptris1", Vec3::new(0.02, 0.0, 0.0), Vec3::splat(0.15), 0.002)]).unwrap();
+        let moved = layer.relaid_like(&base).unwrap();
+        assert!(moved.same_layout(&base));
+        assert_eq!(offsets(moved.grid(), lo, hi, 0.0013), want);
+    }
 }
-
-

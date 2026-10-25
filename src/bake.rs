@@ -303,6 +303,239 @@ pub fn bake(src: &Source, settings: Settings, progress: &crate::progress::Progre
     Ok((mesh, skin))
 }
 
+/// Displacement maps a bake also makes (per call: they are files, not
+/// saved on the object or shown).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Maps {
+    /// Height along the simple mesh's normal.
+    pub displacement: bool,
+    /// The whole offset in the simple mesh's tangent frame (VDM).
+    pub vector: bool,
+    /// Pixels across (over the bake's UVs).
+    pub size: u32,
+}
+
+/// Largest displacement map: a vector map at 4096 is 192 MB of floats.
+pub const MAX_MAP_SIZE: u32 = 4096;
+
+/// Displacement maps over a baked mesh's UVs, in the clay's own (object)
+/// units: where the clay surface is, seen from each texel's point of the
+/// simple mesh. Height runs along the simple mesh's interpolated normal;
+/// the vector is (along +u tangent, along the bitangent (glTF: toward -v),
+/// along the normal). The surface is looked for only along that normal
+/// (`displacement`), so the vector's first two parts are about zero: it
+/// holds the height's offset in vector form, no sideways reach. Texels
+/// outside every island hold their nearest island's values.
+pub struct Displacement {
+    pub size: u32,
+    pub height: Option<Vec<f32>>,
+    pub vector: Option<Vec<[f32; 3]>>,
+    /// Texels whose surface was found on the clay field (not the fine mesh),
+    /// and those where neither met a surface (left at 0).
+    pub from_field: usize,
+    pub missed: usize,
+}
+
+impl Displacement {
+    /// The largest |value| over the maps (each vector component counts).
+    pub fn max(&self) -> f32 {
+        let h = self.height.iter().flatten().fold(0.0f32, |m, v| m.max(v.abs()));
+        self.vector.iter().flatten().flatten().fold(h, |m, v| m.max(v.abs()))
+    }
+
+    /// One code range for every map: value = (code / 65535 - 0.5) *
+    /// scale (the tool gives each file its own).
+    #[cfg(test)]
+    pub fn scale(&self) -> f32 {
+        2.0 * self.max()
+    }
+
+    /// 16-bit codes of `values` (mid grey = 0) at `scale` (see `scale`).
+    pub fn encode16(values: impl Iterator<Item = f32>, scale: f32) -> Vec<u16> {
+        values.map(|v| if scale > 0.0 { ((v / scale + 0.5).clamp(0.0, 1.0) * 65535.0).round() as u16 } else { 32768 }).collect()
+    }
+
+    /// One value back from its 16-bit code.
+    pub fn decode16(code: u16, scale: f32) -> f32 {
+        (code as f32 / 65535.0 - 0.5) * scale
+    }
+
+    /// Bilinear height at `uv` (0 without a height map).
+    pub fn height_at(&self, uv: glam::Vec2) -> f32 {
+        self.height.as_ref().map_or(0.0, |h| self.bilinear(uv, |i| Vec3::splat(h[i])).x)
+    }
+
+    /// Bilinear vector at `uv` (zero without a vector map).
+    pub fn vector_at(&self, uv: glam::Vec2) -> Vec3 {
+        self.vector.as_ref().map_or(Vec3::ZERO, |v| self.bilinear(uv, |i| Vec3::from(v[i])))
+    }
+
+    fn bilinear(&self, uv: glam::Vec2, at: impl Fn(usize) -> Vec3) -> Vec3 {
+        let s = self.size as usize;
+        let p = uv * self.size as f32 - glam::Vec2::splat(0.5);
+        let (x0, y0) = (p.x.floor(), p.y.floor());
+        let (fx, fy) = (p.x - x0, p.y - y0);
+        let clamp = |v: f32| (v.max(0.0) as usize).min(s - 1);
+        let (xa, xb, ya, yb) = (clamp(x0), clamp(x0 + 1.0), clamp(y0), clamp(y0 + 1.0));
+        let top = at(ya * s + xa).lerp(at(ya * s + xb), fx);
+        let bottom = at(yb * s + xa).lerp(at(yb * s + xb), fx);
+        top.lerp(bottom, fy)
+    }
+}
+
+/// Bakes displacement maps for `mesh` (a bake of `src`, with its UVs and
+/// tangents): each texel's point on the simple mesh looks along its
+/// normal, both ways, for the clay's fine surface (as the normal map
+/// does, but reaching further: simplifying can move the surface several
+/// cells), else for the clay field's surface on that line.
+pub fn displacement(src: &Source, mesh: &Mesh, maps: Maps, progress: &crate::progress::Progress) -> Result<Displacement, String> {
+    if !maps.displacement && !maps.vector {
+        return Err("no displacement map asked for".into());
+    }
+    if !(TEXTURE_SIZES.contains(&maps.size) && maps.size <= MAX_MAP_SIZE) {
+        return Err(format!("map_size must be one of {:?}", TEXTURE_SIZES.iter().filter(|s| **s <= MAX_MAP_SIZE).collect::<Vec<_>>()));
+    }
+    if mesh.vertices.iter().any(|v| v.tangent[3] == 0.0) {
+        return Err("the baked mesh has no tangents".into());
+    }
+    let cell = src.clay.cell_size().ok_or("nothing to bake: the clay is empty")?;
+    let whole = Field::new(src.clay, cell);
+    let (lo, hi) = whole.bounds().unwrap_or((Vec3::ZERO, Vec3::ONE));
+    let reach = (cell * 8.0).max((hi - lo).length() * 0.05);
+    progress.stage("building the detailed surface", 0.0);
+    let built = src.fine.is_none().then(|| src.clay.refine_rest(src.rest, crate::clay::MAX_FINE_TRIANGLES));
+    let high = High::bare(src.fine.unwrap_or_else(|| built.as_ref().expect("built")), reach);
+    progress.check()?;
+    progress.stage("baking displacement", 0.1);
+    let size = maps.size;
+    let covered = grown_ids(&raster_ids(mesh, size), size as usize, EXTRAPOLATE);
+    let n = (size * size) as usize;
+    // Per texel: Some(offset in the tangent frame) once baked.
+    let mut texels: Vec<Option<Vec3>> = vec![None; n];
+    let all: Vec<u32> = (0..whole.prim_count() as u32).collect();
+    let from_field = std::sync::atomic::AtomicUsize::new(0);
+    let missed = std::sync::atomic::AtomicUsize::new(0);
+    const ROWS: usize = 4096;
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let chunk_count = n.div_ceil(ROWS).max(1);
+    par_chunks(&mut texels, ROWS, |chunk, out| {
+        if progress.cancelled() {
+            return;
+        }
+        let finished = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        progress.set(0.1 + 0.85 * finished as f32 / chunk_count as f32);
+        for (k, texel) in out.iter_mut().enumerate() {
+            let t = chunk * ROWS + k;
+            let tri = covered[t];
+            if tri == u32::MAX {
+                continue;
+            }
+            let corner = |c: usize| &mesh.vertices[mesh.indices[tri as usize * 3 + c] as usize];
+            let (a, b, c) = (corner(0), corner(1), corner(2));
+            let Some(bary) = barycentric(a.uv, b.uv, c.uv, t, size) else { continue };
+            let w = [1.0 - bary.x - bary.y, bary.x, bary.y];
+            let lerp3 = |f: fn(&Vertex) -> Vec3| f(a) * w[0] + f(b) * w[1] + f(c) * w[2];
+            let pos = lerp3(|v| Vec3::from(v.pos));
+            let nrm = lerp3(|v| Vec3::from(v.normal)).normalize_or(Vec3::Y);
+            let tan = lerp3(|v| Vec3::from_slice(&v.tangent));
+            let tan = (tan - nrm * nrm.dot(tan)).normalize_or(nrm.any_orthonormal_vector());
+            let bit = nrm.cross(tan) * a.tangent[3].signum();
+            let p = match high.find(pos, nrm) {
+                Some((p, _, _)) => p,
+                None => {
+                    let near = whole.near(pos - Vec3::splat(reach), pos + Vec3::splat(reach));
+                    let list = if near.is_empty() { &all } else { &near };
+                    let f = |q: Vec3| whole.sample(q, list).0;
+                    let p = crate::adaptive::along(&f, pos, nrm, cell * 0.05, reach);
+                    if p == pos && f(pos).abs() > cell * 0.05 {
+                        missed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        from_field.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    p
+                }
+            };
+            let d = p - pos;
+            *texel = Some(Vec3::new(d.dot(tan), d.dot(bit), d.dot(nrm)));
+        }
+    });
+    progress.check()?;
+    // Fill the gaps between islands from the nearest island (as the
+    // textures are), so filtering never pulls in zero across a seam.
+    progress.stage("filling map gaps", 0.96);
+    let mut filled: Vec<bool> = texels.iter().map(Option::is_some).collect();
+    let mut values: Vec<Vec3> = texels.into_iter().map(|t| t.unwrap_or(Vec3::ZERO)).collect();
+    fill_values(&mut values, &mut filled, size as usize);
+    Ok(Displacement {
+        size,
+        height: maps.displacement.then(|| values.iter().map(|v| v.z).collect()),
+        vector: maps.vector.then(|| values.iter().map(|v| v.to_array()).collect()),
+        from_field: from_field.into_inner(),
+        missed: missed.into_inner(),
+    })
+}
+
+/// Texels around each island baked from its own triangles, extended
+/// past their edges: a renderer's bilinear read at an island's rim then
+/// blends values of the same surface, not the gap fill's averages.
+const EXTRAPOLATE: usize = 2;
+
+/// `ids` (a triangle per texel, `u32::MAX`: none) grown `rings` texels
+/// outward, each new texel taking a covered neighbor's triangle.
+fn grown_ids(ids: &[u32], size: usize, rings: usize) -> Vec<u32> {
+    let mut out = ids.to_vec();
+    for _ in 0..rings {
+        let before = out.clone();
+        for t in (0..out.len()).filter(|&t| before[t] == u32::MAX) {
+            let (x, y) = ((t % size) as i32, (t / size) as i32);
+            let near = [(-1i32, 0i32), (1, 0), (0, -1), (0, 1), (-1, -1), (1, 1), (-1, 1), (1, -1)].into_iter().find_map(|(dx, dy)| {
+                let (nx, ny) = (x + dx, y + dy);
+                (nx >= 0 && ny >= 0 && (nx as usize) < size && (ny as usize) < size).then(|| before[ny as usize * size + nx as usize]).filter(|&id| id != u32::MAX)
+            });
+            if let Some(id) = near {
+                out[t] = id;
+            }
+        }
+    }
+    out
+}
+
+/// `fill` for float texels.
+fn fill_values(values: &mut [Vec3], filled: &mut [bool], size: usize) {
+    let neighbors = |t: usize| {
+        let (x, y) = ((t % size) as i32, (t / size) as i32);
+        [(-1i32, 0i32), (1, 0), (0, -1), (0, 1), (-1, -1), (1, 1), (-1, 1), (1, -1)].into_iter().filter_map(move |(dx, dy)| {
+            let (nx, ny) = (x + dx, y + dy);
+            (nx >= 0 && ny >= 0 && (nx as usize) < size && (ny as usize) < size).then(|| ny as usize * size + nx as usize)
+        })
+    };
+    let mut queued = filled.to_vec();
+    let mut ring: Vec<usize> = (0..filled.len()).filter(|&t| !filled[t] && neighbors(t).any(|n| filled[n])).collect();
+    for &t in &ring {
+        queued[t] = true;
+    }
+    while !ring.is_empty() {
+        let next_values: Vec<Vec3> = ring.iter().map(|&t| {
+            let (sum, count) = neighbors(t).filter(|&n| filled[n]).fold((Vec3::ZERO, 0), |(s, c), n| (s + values[n], c + 1));
+            sum / count.max(1) as f32
+        }).collect();
+        for (&t, v) in ring.iter().zip(next_values) {
+            values[t] = v;
+            filled[t] = true;
+        }
+        let mut next = Vec::new();
+        for &t in &ring {
+            for n in neighbors(t) {
+                if !queued[n] {
+                    queued[n] = true;
+                    next.push(n);
+                }
+            }
+        }
+        ring = next;
+    }
+}
+
 /// The rest mesh's positions with each detail region spread out from its
 /// middle by its texel-density factor (see `Settings::region_density`),
 /// fading over the region's band; None without regions.
@@ -516,6 +749,12 @@ impl<'a> High<'a> {
         High { mesh, bvh, ao, reach: cell * 6.0 }
     }
 
+    /// Without ambient occlusion (displacement maps), reaching `reach`.
+    fn bare(mesh: &'a Mesh, reach: f32) -> High<'a> {
+        let corners: Vec<[Vec3; 3]> = mesh.indices.chunks_exact(3).map(|t| [0, 1, 2].map(|k| Vec3::from(mesh.vertices[t[k] as usize].pos))).collect();
+        High { mesh, bvh: crate::film::bvh::Bvh::new(&corners), ao: Vec::new(), reach }
+    }
+
     /// The fine surface nearest `pos` along the simple mesh's normal (out
     /// or in): (point, normal, ambient occlusion).
     fn find(&self, pos: Vec3, nrm: Vec3) -> Option<(Vec3, Vec3, f32)> {
@@ -531,7 +770,7 @@ impl<'a> High<'a> {
         let v = |k: usize| &self.mesh.vertices[t[k] as usize];
         let p: Vec3 = (0..3).map(|k| Vec3::from(v(k).pos) * w[k]).sum();
         let n: Vec3 = (0..3).map(|k| Vec3::from(v(k).normal) * w[k]).sum();
-        let ao: f32 = (0..3).map(|k| self.ao[t[k] as usize] * w[k]).sum();
+        let ao: f32 = (0..3).map(|k| self.ao.get(t[k] as usize).copied().unwrap_or(1.0) * w[k]).sum();
         let n = n.normalize_or(nrm);
         // The far side of a thin part faces away: not this surface.
         (n.dot(nrm) > 0.0).then_some((p, n, ao))
@@ -987,4 +1226,67 @@ mod tests {
         assert!(checked > 100);
         assert!(mesh.vertices.iter().all(|v| v.uv.iter().all(|c| (0.0..=1.0).contains(c)) && v.tangent[3].abs() == 1.0));
     }
+
+    /// Stage 8b acceptance: a bumpy ball baked to 800 triangles, its
+    /// displacement map written as a 16-bit PNG, read back and reapplied
+    /// as geometry through `film::dice` lands within one clay cell of the
+    /// clay both ways (Hausdorff), where the simple mesh alone misses the
+    /// bumps by more than a cell; the vector map (EXR floats) does too.
+    #[test]
+    fn displacement_bake_reapplied_through_dice_matches_the_clay() {
+        // 24 bumps spread evenly (a Fibonacci sphere), more than 800
+        // triangles follow. (Scalar displacement needs the clay to be a
+        // height field over the simple mesh: steep bumps a coarse mesh
+        // cuts through are not, and `verify` then reports a larger error.)
+        let mut blobs = vec![serde_json::json!({ "type": "sphere", "center": [0, 0, 0], "radius": 0.3 })];
+        for i in 0..24 {
+            let y = 1.0 - (i as f32 + 0.5) / 12.0;
+            let (r, phi) = ((1.0 - y * y).sqrt(), i as f32 * 2.399_963);
+            let d = Vec3::new(r * phi.cos(), y, r * phi.sin()) * 0.3;
+            blobs.push(serde_json::json!({ "type": "sphere", "center": d.to_array(), "radius": 0.05, "blend": 0.03 }));
+        }
+        let clay: Clay = serde_json::from_value(serde_json::json!({ "blobs": blobs, "resolution": 64 })).unwrap();
+        let cell = clay.cell_size().unwrap();
+        let rest = clay.build_mesh();
+        let src = Source { clay: &clay, rest: &rest, skin: None, parts: &[], library: &[], fallback: "", fine: None };
+        let (mesh, _) = bake(&src, Settings { triangles: 800, texture: 512, ..Default::default() }, &Default::default()).unwrap();
+        let t = std::time::Instant::now();
+        let disp = displacement(&src, &mesh, Maps { displacement: true, vector: true, size: 512 }, &Default::default()).unwrap();
+        eprintln!("displacement maps 512: {:.2} s, {} texels from the field, {} missed", t.elapsed().as_secs_f32(), disp.from_field, disp.missed);
+        assert_eq!(disp.missed, 0);
+        // Through the file formats an agent gets.
+        let scale = disp.scale();
+        let codes = Displacement::encode16(disp.height.clone().unwrap().into_iter(), scale);
+        let (w, h, channels, back) = crate::outputs::read_png16(&crate::outputs::png16(512, 512, 1, &codes).unwrap()).unwrap();
+        assert_eq!((w, h, channels), (512, 512, 1));
+        let height = Displacement { size: 512, height: Some(back.iter().map(|c| Displacement::decode16(*c, scale)).collect()), vector: None, from_field: 0, missed: 0 };
+        let path = std::env::temp_dir().join(format!("clide-vdm-{}.exr", std::process::id()));
+        let v = disp.vector.clone().unwrap();
+        crate::outputs::write_exr(&path, 512, 512, vec![("R", v.iter().map(|c| c[0]).collect()), ("G", v.iter().map(|c| c[1]).collect()), ("B", v.iter().map(|c| c[2]).collect())]).unwrap();
+        let (_, _, read) = crate::outputs::read_exr(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let get = |n: &str| &read.iter().find(|(k, _)| k == n).unwrap().1;
+        let vector = Displacement { size: 512, height: None, vector: Some((0..512 * 512).map(|i| [get("R")[i], get("G")[i], get("B")[i]]).collect()), from_field: 0, missed: 0 };
+        let field = Field::new(&clay, cell);
+        let all: Vec<u32> = (0..field.prim_count() as u32).collect();
+        // Both ways: the mesh's points to the clay (|field|), and the clay's
+        // (its rest mesh) to the nearest point of the mesh.
+        let hausdorff = |m: &Mesh| {
+            let to_clay = m.vertices.iter().map(|v| field.sample(Vec3::from(v.pos), &all).0.abs()).fold(0.0f32, f32::max);
+            let near = crate::rig::NearestVertex::new(m, cell);
+            let to_mesh = rest.vertices.iter().map(|v| { let p = Vec3::from(v.pos); Vec3::from(near.vertex(p).unwrap().pos).distance(p) }).fold(0.0f32, f32::max);
+            (to_clay / cell, to_mesh / cell)
+        };
+        let plain = crate::film::dice::apply_baked(&mesh, &Displacement { size: 1, height: Some(vec![0.0]), vector: None, from_field: 0, missed: 0 }, cell * 0.5, 4_000_000).unwrap();
+        let (a, b) = hausdorff(&plain);
+        eprintln!("cell {cell:.4}; simple mesh ({} triangles) alone: {a:.2} / {b:.2} cells (to clay / from clay)", mesh.indices.len() / 3);
+        assert!(a.max(b) > 1.4, "the bumps should need the map: {a} {b}");
+        for (name, map) in [("height (png16)", &height), ("vector (exr)", &vector)] {
+            let diced = crate::film::dice::apply_baked(&mesh, map, cell * 0.5, 4_000_000).unwrap();
+            let (a, b) = hausdorff(&diced);
+            eprintln!("{name} map reapplied ({} triangles): {a:.2} / {b:.2} cells", diced.indices.len() / 3);
+            assert!(a <= 1.0 && b <= 1.0, "{name}: Hausdorff {a} / {b} cells");
+        }
+    }
+
 }

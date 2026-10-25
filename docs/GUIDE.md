@@ -20,7 +20,10 @@ Q W E R = select / move / rotate / scale · hold X = grid snap · hold D = edit
 pivot · 4 / 5 = wireframe / shaded · Space = single / four view · F frame
 selected · A frame all · Ctrl+G group · P parent (last selected is the parent)
 · Shift+P unparent · Ctrl+H / Shift+H hide / show · Alt+V play · ⌘Z / ⇧⌘Z
-undo / redo · ⌘D duplicate · ⌫ delete · ⌘S save · ⌘O open.
+undo / redo · ⌘D duplicate · ⌫ delete · ⌘S save · ⌘O open. With a brush
+tool on (Sculpt, Paint, Mask, Groups), D / Shift+D step the detail level
+and X toggles X symmetry instead (see Sculpt, Paint, Mask and Groups tools
+below).
 
 Selection: click, Shift-click to toggle, Ctrl-click to remove, or drag a box.
 The last selected object is the lead (green); the others are white.
@@ -49,19 +52,14 @@ claude mcp add --transport http clide3d http://127.0.0.1:7878/mcp
 
 Inside this repo, `.mcp.json` already registers it.
 
-Tools: `get_scene`, `create_object`, `update_object`, `delete_object`,
-`duplicate_object`, `select_object` (multi), `group_objects`, `parent_objects`,
-`set_pivot`, `set_camera`, `frame_view`, `screenshot`, `set_material`, `decal`
-(PNG of the viewport or whole window), `run_mel`, `set_display`, `undo`, `redo`,
-`new_scene`, `open_scene`, `save_scene`, for faces `face_detail` and
-`face_hair` (see Faces below), and for environments `kit`,
-`scatter` and `edit_terrain` (see Environments below). Open/save only accept absolute `.json`
-
-`new_scene`, `open_scene`, `save_scene`, for environments `kit`,
-`scatter` and `edit_terrain` (see Environments below), for hard-surface
-detail `kitbash` and `detail_pass` (see Kitbash below), and for symmetry and
-posing `mirror_object` and `pose_bone` (see Mirror, align and pose below). Open/save only accept absolute `.json`
-paths and never overwrite a file that is not a scene.
+It serves 72 tools; the README lists them all by area, and each section
+below covers its own. The basics: `get_scene`, `create_object`,
+`update_object`, `delete_object`, `duplicate_object`, `select_object`
+(multi), `group_objects`, `parent_objects`, `set_pivot`, `set_camera`,
+`frame_view`, `screenshot` (PNG of the viewport or whole window),
+`set_material`, `run_mel`, `set_display`, `undo`, `redo`, `history`,
+`new_scene`, `open_scene` and `save_scene`. Open/save only accept absolute
+`.json` paths and never overwrite a file that is not a scene.
 
 ### Sculpting from an image
 
@@ -253,6 +251,24 @@ lip paint first. The 20 micrometer cover follows the existing lip shape.
   cell). `export_glb` / `export_fbx` with `lods: true` add LOD1-LOD3 (half,
   a quarter and an eighth of the triangles, same UVs and maps, so the
   normal maps keep the finest detail at every level).
+- Displacement maps: `bake` with `maps: ["displacement",
+  "vector_displacement"]` and an absolute `save_dir` also writes
+  `<object>_displacement` and `<object>_vector_displacement` over the
+  bake's UVs, for renderers and sculpting apps that displace the simple
+  mesh back into the clay. `map_format: "png"` (default) is 16-bit, mid
+  grey zero, decoded as `(code / 65535 - 0.5) * scale` with each map's
+  `scale` in the reply; `"exr"` holds 32-bit floats in the clay's units.
+  `map_size` is 512, 1024, 2048 or 4096 (default the texture size, at most
+  2048). `verify: true` reapplies the maps as geometry and reports
+  `max_error_cells` and `mean_error_cells`. The bake looks for the surface
+  only along the simple mesh's normal, so the vector map's R and G are
+  about 0: it is the height in vector form and keeps no overhangs (VDM
+  stamps keep those). The maps are one-off files, not saved on the object.
+
+```json
+{"target":"Head", "triangles":30000, "maps":["displacement","vector_displacement"], "map_format":"exr", "save_dir":"/abs/out/maps", "verify":true}
+```
+
 - Clay resolution goes up to 512 cells across (about 3.4 mm on a full
   body). The meshing grid is stored only in blocks near the surface.
 
@@ -392,6 +408,50 @@ always **object-local Y**, even with world-space stroke points. Unknown
 names are errors; an empty name list masks everything. Masks also apply
 to large tiled strokes and surface-band noise.
 
+### Brush controls: falloff, pressure, spacing, symmetry, stroke kinds
+
+Every `sculpt` and `paint` stroke takes the same controls (they resolve
+into dabs before anything is applied, so a stroke replays the same way
+whatever the camera or selection):
+
+- `standard`: dab by dab, the surface rises along its area normal (the
+  mean normal over the middle of the dab) by `strength * radius / 2` at the
+  center, following the falloff; `invert` carves. Along a path the dabs are
+  spaced `spacing` x radius apart (default 0.15) and scaled so the ridge
+  rises about as high as one dab.
+- `falloff`: `smooth` (the classic clay curve), `linear`, `sharp`, `flat`
+  (a plateau to 0.9 of the radius) or `sphere`, or `[[t, value], ..]` (up
+  to 16 points, a monotone cubic), or `{preset | curve, focal_shift}`;
+  `focal_shift` (-1..1) makes the dab narrower (+) or fuller (-). Strokes
+  without one keep the curve they always had.
+- Points can carry pressure: `[x, y, z, pressure]` or
+  `{p, pressure, normal, t}`. `pressure: {size, strength}` maps it
+  (`linear` by default, `off`, or `[[pressure, factor], ..]`).
+- `symmetry: {axes: ["x", "y", "z"], radial: {axis, count}, about:
+  pivot | origin}`; `mirror: true` is `axes: ["x"]`.
+- `kind`: `path` (default), `dots` (a dab per point), `{spray: {count,
+  jitter, seed}}` (scattered dabs; the same seed gives the same dabs),
+  `{drag_rect: {from, to}}` (one dab as wide as the drag) or `drag_dot`
+  (one dab where the drag ends) or `{curve: {closed}}` (the points are
+  control points of a smooth centripetal Catmull-Rom curve, back to the
+  first when `closed`). `lazy` (0 off, or 0.01 to 1) smooths the path like
+  LazyMouse; `taper: [start, end]` fades the ends (a crease with taper is
+  the Dam Standard).
+- A curve stroke's record keeps its control points, so moving one is
+  `stroke_edit {action: replace, id, spec}` with that point changed
+  (MoveCurve): the layer replays and the result equals a fresh stroke
+  through the new points. There are no curve handles in the viewport yet.
+- `smooth_mode`: `gentle`, `normal`, `peaks` (only lowers) or `valleys`
+  (only raises). `flatten` takes `side: above` (only cuts) or `below`
+  (only fills).
+- `frame`: `world` (the call's `space`), `object`, `{surface: {offset}}`
+  (points snapped onto the clay, then lifted by offset) or `{screen: {view,
+  at: [[h, v], ..]}}` (rays from a named view, like `surface_point`) or
+  `{screen: {camera: {view, proj, viewport}, px: [[x, y], ..]}}`.
+- `paint: {color, hardness, strength}` on a sculpt stroke colors the same
+  stroke as it sculpts (MRGB); a `paint` call's strokes are the same spec
+  with color.
+
 `noise` with `pattern: "folds"` makes soft draped folds running along
 `normal` (default `[0,-1,0]`, gravity). `scale` is fold spacing; strength
 sets amplitude as `strength * scale / 2`. Use a path over the sleeve,
@@ -435,6 +495,529 @@ than the feature spacing, and render a fine mesh to inspect details):
 ]}
 ```
 
+### Clay brushes, alphas, presets and posable symmetry
+
+The plane brushes work dab by dab toward the plane of the area under the
+dab (its mean surface along the mean surface normal), so they follow the
+form and fill or cut against it:
+
+- `clay` fills hollows up to that plane, with a square footprint; it never
+  cuts (`invert` cuts instead). `clay_buildup` fills them at once and lays
+  a layer over the plane, about `strength * radius / 10` per stroke, so
+  hollows fill first and passes build up.
+- `clay_tubes` lays an even strip `strength * radius / 2` high along the
+  path over the surface the stroke starts on, flat across; overlapping
+  dabs do not stack, so the ridge stays even.
+- `trim_dynamic` cuts what stands above the plane (never adds) and
+  `polish` presses both ways onto it; both have a flat, sharp-edged
+  falloff unless given one.
+- `snakehook` pulls a horn out of the surface along `points` (the first on
+  the surface, the rest out in the air, up to 16 radii; or one point and
+  `delta`). `curl_deg` curls it about `normal` (default level, across the
+  pull): the tip ends `curl_deg` degrees from the base direction.
+
+Alphas are 16-bit grayscale images in the scene's library:
+`alpha {action: import, name, path}` reads a PNG (8 or 16 bit), JPEG or
+OpenEXR (channel Y, else R; values 0..1), at most 1024 pixels a side; `from_view {name, target, view, size}` captures a
+clay's height map from a named view; `list`, `preview` and `delete` manage
+them. A stroke names one with `alpha: {name, depth, mid, rotate, scale,
+mode: stamp | drag | tile, use: height | mask}`: on `standard` (use height)
+the dab rises `depth * (gray - mid)`; on any dab brush, use mask scales the
+dab's weight. Records keep the image's content hash and each clay keeps
+the images its strokes use, so strokes replay without the library.
+Importing a name again with other pixels marks the records made with the
+old image `stale_context`; `stroke_edit {action: rebase}` takes the new one.
+
+```json
+{"target":"Slab", "strokes":[
+ {"brush":"standard", "point":[0,0,0], "radius":0.1, "falloff":"flat", "alpha":{"name":"checker", "depth":0.01}},
+ {"brush":"clay_buildup", "points":[[-0.2,0,0.1],[0.2,0,0.1]], "radius":0.05, "alpha":{"name":"ring", "mode":"drag"}}
+]}
+```
+
+VDM stamps (Alpha 3D) hold shapes a height image cannot: overhangs,
+horns that curl over, undercuts. `alpha {action: create_vdm, name,
+target, center, radius}` captures one from any clay as sculpted: a box
+`radius` across each way, standing on the surface at `center` (moved onto
+it along the normal), from `below` (default radius / 2) under the surface
+to `above` (default 2 x radius) over it, each at most 8 radii. Only what
+stands out of (or sinks into) the flat base plane is kept, as a sparse
+volume at `cell` (default the clay's detail cell, coarsened to at most 2M
+lattice points). `normal` and `tangent` turn the stamp; `space: local`
+takes the values in object space. `alpha list` shows it as `kind: vdm`.
+`brush: "vdm"` stamps it under each dab, overhangs included:
+
+```json
+{"action":"create_vdm", "name":"horn", "target":"Sculpt", "center":[0,1.2,0.1], "radius":0.04}
+{"target":"Head", "strokes":[{"brush":"vdm", "alpha":{"name":"horn"}, "points":[[0.03,1.75,0.05]], "radius":0.04, "kind":"drag_dot"}]}
+```
+
+The stamp's width is the dab's (a radius equal to the captured one stamps
+it at its own size) and its up is the area normal. `strength` (default 1)
+blends it in, `invert` carves its shape in (a horn becomes a hole),
+symmetry mirrors it, and spacing defaults to 2 (a stamp's width apart);
+a single point or `drag_dot` stamps once. A vdm alpha takes `rotate`,
+`scale` and `mode: stamp | drag` but no `depth`, `mid`, `use` or `tile`.
+Stamps are stored, hashed and rebound like images, so strokes replay
+without the library. Importing VDM images made in other tools is not
+supported yet.
+
+Brush presets are a stroke's settings without its points. Twenty-one are
+built in (Standard, Clay, ClayBuildup, ClayTubes, DamStandard, TrimDynamic,
+hPolish, Inflate, Move, Pinch, Snakehook, Layer, Flatten, Planar, Smooth,
+SmoothPeaks, SmoothValleys, Pores, Wrinkles, Scales, and MaskPen for the
+mask tool's strokes); `brush_preset {action:
+save, name, spec}` (or `from_record: {target, id}`) saves one in the
+scene, and `list`, `get` and `delete` manage them. `sculpt` takes `preset`
+per call or per stroke: the preset goes under the stroke, the stroke's own
+fields win, and the record keeps the merged stroke. The Sculpting shelf's
+preset list sends `brush_preset {action: set_current, preset}`, so the
+human's strokes carry the same preset.
+
+Posable symmetry, `symmetry: {axes: ["x"], posable: true}`, sculpts a
+posed character: the points are on the clay as posed at the editor's frame,
+each goes back to the rest pose through the skin weights where it is, the
+copies are made there, and the rest pose is sculpted. A stroke on the
+posed left arm lands on both arms at rest, as if made there.
+`symmetry.frame` names the pose (a clip frame, or "rest"); left out, the
+editor's frame is used and written into the record and the reply
+(`pose_frame`), so a stored stroke sent again lands the same wherever the
+timeline is.
+
+### Masks, polygroups and the masked transform
+
+A clay has a persistent sculpt mask: 0 (free) to 1 (frozen) on its
+surface. Every `sculpt` and `paint` stroke moves each point by 1 - mask,
+so a mask protects what it covers until it is cleared. The `mask` tool
+edits it with a list of actions, each a record on the clay's mask ledger
+(`stroke_log {layer: mask}`):
+
+```json
+{"target":"Head", "actions":[
+ {"lasso":{"view":"front", "at":[[-0.1,1.5],[0.1,1.5],[0,1.7]], "through":false}},
+ {"grow":2}, {"blur":1},
+ {"paint":[{"preset":"MaskPen", "points":[[0,1.62,0.1]], "radius":0.02}]},
+ {"by_cavity":{"mode":"add"}}
+]}
+```
+
+- Painting: `{paint: [strokes]}` are `mask_paint` strokes with every
+  stroke control (falloff, alpha with `use: mask`, symmetry ...);
+  strength is how far the mask rises, `invert` lowers it.
+- Selections: `lasso` and `rect` (a named view with `at` / `from`, `to` in
+  world units, or a `camera {view, proj, viewport}` with pixels; the
+  record keeps the camera, so sending it again selects the same however
+  the viewport moved; `through: false` takes only surface facing the
+  camera), `by_cavity`, `by_curvature`, `by_normal {dir, angle}`,
+  `by_height {axis, min, max}`, `by_blobs {names}`, `by_groups {ids}`,
+  `connected {seed_point}`. Each takes `mode`: set (default), add or sub.
+- `"invert"`, `"clear"`, `"all"`, `{grow: cells}`, `{shrink: cells}`,
+  `{blur: cells}` (walking the surface band, so a grow never jumps a thin
+  wall; blur keeps the mask's sum), `{sharpen: amount}`.
+- `{to_channel: name}` and `{from_channel: name}` copy to and from a smart
+  material's painted mask channel.
+
+A stroke can also mask itself: `mask: {channel: false}` ignores the
+persistent mask, `invert_channel: true` works on the masked part instead,
+`groups: [ids]` keeps to some polygroups, and auto-masking reads the
+surface around each dab: `backface` (leave surface facing away alone),
+`normal_angle` (degrees from the dab's normal), `cavity` (-1..1: positive
+spares cavities, negative spares ridges) and `connected` (Move
+Topological: only surface joined to the dab's center within 1.5 radii, so
+a grab moves one finger and not its neighbour). Each record keeps the mask
+and polygroups it read (by hash, on the clay), so it replays the same after
+they change.
+
+The `transform` brush moves, turns or scales the unmasked part:
+
+```json
+{"target":"Body", "strokes":[{"brush":"transform", "transform":{"rotate":[0,0,-30], "pivot":[0.18,1.42,0]}}]}
+```
+
+Mask what should stay (the torso), then transform the rest (the arm about
+its shoulder). Offsets are capped at 127 detail cells: big changes of form
+belong to blobs. With a mask on the selected clay, the Move, Rotate and
+Scale gizmo sends this same stroke on release instead of moving the
+object.
+
+Polygroups are ids on the surface with a name and visibility each; the
+`group` tool's actions are records on the group ledger: `"from_blobs"`,
+`{from_mask: {threshold, id}}`, `{from_normals: {angle}}`, `{paint: {id,
+strokes}}`, `{rename: {id, name}}`, `{show|hide|isolate: {ids}}`,
+`"show_all"`, `"clear"`, `"list"`. Brushes skip hidden groups and the
+viewport leaves them out. `set_display {overlay: mask | groups | none}`
+picks how the viewport shows the mask (masked surface darker, the
+default) and groups (each tinted); film renders, bakes and exports never
+show either. `probe_clay`, `surface_point` and `get_clay` report the mask
+and group at a point and the mask's coverage.
+
+### Sculpt and paint layers, morphs and blend shapes
+
+A clay's layers, bottom first: `base` (its own sculpt) and `paint` (its
+own paint), then up to 14 more made with `sculpt_layer`:
+
+```json
+{"target":"Head", "action":"add", "name":"wrinkles"}
+{"target":"Head", "layer":"wrinkles", "strokes":[{"brush":"crease", "points":[[-0.03,1.68,0.09],[0.03,1.68,0.09]], "radius":0.006, "strength":0.001}]}
+{"target":"Head", "action":"amount", "name":"wrinkles", "amount":0.5}
+```
+
+The clay shows base plus each enabled sculpt layer times its amount
+(-2..2), and paint layers (`kind: "paint"`, painted with `paint {layer}`)
+laid over paint at their amount (opacity 0..1); meshes, bakes, film
+renders and exports all take that. A stroke on a layer reads every
+enabled layer (what you see) and writes its own, divided by its amount, so
+amount 1 is what the brush did, 0 hides it and 2 doubles it; strokes are
+refused below amount 0.05. Each layer has its own stroke ledger
+(`stroke_log` / `stroke_edit {layer: "wrinkles"}`). Because strokes read
+the other layers, changing one (its amount or new strokes) marks the
+others' records `stale_context`; `stroke_edit {action: rebase}` replays
+them against the layers as they are.
+
+Other actions: `enable` / `disable`, `rename {to}`, `move {to}`, `bake`
+(fold the layer into base at its amount: the surface stays, the layer's
+records stay readable as `stroke_log {layer: "archived:NAME"}`),
+`merge_down`, `delete`, `split_by_mask {name, to}` (the masked part of a
+layer moves to a new one), `record {name}` (the layer `sculpt` calls
+without `layer` write, saved with the clay) and `select {name}` (the
+layer the editor's Sculpt and Paint tools stroke; editor state, never an
+undo step). base and paint stay at amount 1. Layers, morphs, the mask and
+groups share one grid budget (`grid_mb` in `get_clay`; at most 512 MB).
+A file has no sharing, so a clay with layers or morphs is also held to
+1 GiB of saved grids (`saved_mb` and `max_saved_mb` in `sculpt_layer
+list`): its own grids, its ledgers' outside-edit grids, and every morph's
+grids and ledgers again. A full-size sculpt (262,144 bricks) saves about
+260 MB, so that is the clay and about 3 morphs, fewer once its ledgers hold
+outside-edit grids (a `detail_cell` change records the whole grid; `bake`,
+`blend` and `split_by_mask` the bricks they changed). A call that would
+pass either budget is refused and changes nothing.
+
+`morph` keeps snapshots of the sculpt layers (grids, ledgers, amounts),
+shared rather than copied: `store {name}`, `switch {name}` (swap the
+clay's sculpt with the morph: switching again goes back), `blend {name,
+weight}` or `{weights: {name: weight}}`, `delete`, `list` and `diff`
+(how far each is from the clay). `sculpt_diff {from: "morph:NAME"}`
+measures against one. Morphs are free in memory but each one is written
+out again in a file, so the 1 GiB saved budget above is what limits them.
+
+Blend shapes: `export_glb` and `export_fbx` take `blend_shapes:
+["morph:smile", "layer:wrinkles"]` (a layer's shape is the exported mesh
+with that layer fully on: export with it off or at 0). Each rest vertex is
+moved onto the target surface, so vertex counts stay the same; a shape
+the vertices cannot follow (a long pull stretches the surface past them)
+is refused with its residual (`max_residual`, default half a mesh cell).
+`check_export {morph_weights: {"morph:smile": 1}}` shows the file with a
+target applied.
+
+### Importing meshes, clay from anything, booleans and printing
+
+`import_mesh {path}` reads `.obj`, `.stl` (binary or ASCII), `.ply`
+(ASCII or binary), `.glb` (every mesh at its node's placement) and binary
+`.fbx` (its Geometry nodes, in meters by the file's UnitScaleFactor; model
+transforms are not applied). Files are capped at 1 GiB and 4M triangles,
+and malformed ones are refused. `as: "clay"` (the default) makes a clay
+with one mesh blob: the triangles (decimated to at most 200k for the
+distance field) kept with the clay, so it saves, sculpts, paints and
+replays like any other. A mesh that is not closed is read by its
+generalized winding number, so its holes close (`close_holes: false`
+refuses it instead). `as: "mesh"` makes a Mesh object that draws the
+file's triangles; `close_holes` fills its boundary loops. `scale`, `up:
+"z"` (a Z-up file) and `center` place it; File > Import… sends the same
+call.
+
+`to_clay` turns objects into clay and combines them (Make PolyMesh3D,
+DynaMesh, Remesh All and booleans across objects):
+
+```json
+{"target":"pCube1"}
+{"targets":["Hull","Cutter"], "op":"carve"}
+{"targets":["pSphere1","pCube1"], "op":"intersect"}
+{"target":"Scan", "mode":"volume", "resolution":160, "blur":1, "polish":0.5}
+```
+
+Primitives become analytic blobs (a cube a box, a sphere a sphere or
+ellipsoid, a cylinder or cone a lathe, a torus a torus, a plane a thin
+slab); clay, imported meshes and every other mesh become mesh blobs of
+their mesh. The first target is converted in place (it keeps its name,
+placement and children) and the others are added with `op` (`add`,
+`carve`, `intersect`) and hidden; `into` puts every target into an
+existing clay instead. `mode: "volume"` remeshes the result into one
+closed surface at `resolution` (sculpt and layers folded in), with `blur`
+(a Gaussian over the field, in cells) and `polish` (curvature flow) kept
+as sculpt offsets and the volume kept. Modify > Remesh as Clay… sends it.
+Blobs also take `op: "intersect"` directly in `edit_clay`.
+
+InsertMesh: `kitbash {target, part: {object, op: "carve"}, at}` puts any
+object's shape into a clay at a surface point (its +Y along the normal,
+half sunk), so a carved cylinder makes a hole; `kitbash remove {group}`
+takes it out again.
+
+`export_print {path}` writes `.stl`, `.obj`, `.ply` or `.3mf` for a
+slicer: one welded mesh of the targets (default every visible solid) in
+millimeters, Z up, on the plate. `size_mm: {axis, value}` scales it to a
+size, `hollow: {wall_mm}` hollows clay inward, `fine` uses fine meshes.
+The reply says whether it is `watertight` (every edge used by exactly two
+triangles) and gives `non_manifold_edges`, `volume_cm3` and `bbox_mm`.
+File > Export for Print… sends it.
+
+#### 3D printing workflow
+
+1. Build the model as clay, or bring it in with `import_mesh` (a scan or
+   another app's model) and combine parts with `to_clay` (`op: carve` to
+   cut holes or flats, `mode: "volume"` to fuse everything into one closed
+   surface).
+2. Export once and read the report. `watertight: true` and
+   `non_manifold_edges: 0` mean a slicer gets a closed solid; otherwise
+   remesh with `to_clay {mode: "volume"}` and export again. `bbox_mm` and
+   `volume_cm3` show the size and material before you slice.
+3. Size it: one scene unit is one meter, so give `size_mm {axis, value}`
+   for a model built at another scale (`axis` is a scene axis: `y` for
+   height).
+4. Hollow large clay prints with `hollow: {wall_mm}` to save resin or
+   filament; add drain holes yourself (a carved cylinder through
+   `kitbash`).
+5. Use `fine: true` on clays with a `detail_cell` (pores, scales,
+   engraving), so the print gets the fine mesh rather than the view mesh.
+6. Clide3D does not add supports or pick a print orientation beyond
+   turning the model Z up and setting it on the plate; do that in the
+   slicer. `.3mf` keeps millimeter units; `.stl` is binary.
+
+```json
+{"path":"/abs/out/bust.3mf", "targets":["Bust"], "size_mm":{"axis":"y", "value":120}, "hollow":{"wall_mm":2}, "fine":true}
+```
+
+### Stroke ledger, selective undo and history
+
+Every `sculpt` stroke is a record on the clay's base layer, and every
+`paint` color stroke a record on its paint layer: the stroke as sent and
+as resolved (the object-space dabs it applies), with what it changed. The
+`sculpt` reply lists them (`record_ids`, and per stroke `changed_points`,
+`bricks`, `bbox`, `max_disp`, `mean_disp`; `measure: true` adds
+`volume_delta`). `dry_run: true` runs the strokes on a copy and reports
+the same numbers without changing anything; `label` names the records.
+
+- `stroke_log {target, layer: base | paint}` lists the records (`full:
+  true` adds the spec, to edit and resend, and the resolved dabs). A record
+  is `stale_context` when the blobs or detail cell changed since it was
+  made (replaying it now would give another result) and `engine_stale`
+  when an older brush kernel made it.
+- `stroke_edit` edits them and replays the layer from the first record
+  changed (from the nearest checkpoint, every 32 records): `disable`,
+  `enable`, `delete`, `replace {id, spec}`, `move {ids, to_seq}`, `scale
+  {ids, factor}`, `rebase` (take the current blobs and kernel), `replay`
+  (check), `squash`. `{action: scale, last: true, factor}` is Adjust Last:
+  the newest stroke rescaled from 0 (gone) to 2 (twice as strong); it is
+  stale after an undo or any other change, then scale by id.
+- `sculpt_diff {target, from, to}` measures the base layer between two
+  seqs (or `{id}`, `"blobs"`, `"current"`): max, mean and rms change,
+  volume and area changed, a histogram. A seq or `{id}` is replayed as a
+  background job.
+- `probe_clay {target, points | rays | screen}` reads the surface: the
+  nearest surface point, signed distance, normal, curvature, how far the
+  sculpt moved it there (`layer_offsets.base`, mm) and the blob that owns it.
+
+Grid changes made outside strokes (a new `detail_cell`, `clear_detail`, a
+paint `fill`, a scene from before the ledger) become opaque records, so a
+replay always ends at what the clay shows. Saved files keep the records;
+on open each layer replays to check its saved grid (`get_clay` `layers`
+reports `replay_verified`), and sculpt and paint grids are stored deflated
+(about 5x smaller).
+
+`history` lists the undo steps, one per agent call ("sculpt standard x3
+on Head [agent]") or UI edit, with `goto`, `mark` and `label`; undo keeps
+the last 300 steps and 2 GB of grid data (dropped steps are counted).
+QuickSave writes a backup every 5 minutes while there are unsaved
+changes, keeping 10 in `~/Library/Application Support/Clide3D/backups`
+(`history {action: quicksave}`, or File > QuickSave).
+
+### Sculpt, Paint, Mask and Groups tools (mouse and pen strokes)
+
+The toolbox's brush tools turn a drag on a clay object into the same
+`sculpt`, `paint`, `mask` or `group` request an agent sends. While the
+button is down a worker previews the stroke so far on a copy of the clay;
+nothing in the scene changes until release. Then the samples become one
+stroke with a `screen` frame (the pixels and the view's camera matrices,
+so the request means the same thing after you orbit), and the request runs
+through the same tool handler as an MCP call, in the same line. Each drag
+is one record with `source: ui` and one undo step ("sculpt inflate on Ball
+[ui]"). The preview is exact for plain strokes; symmetric, tapered and
+Backtracked strokes preview approximately (a tapered stroke can look
+shallower in the middle) until the record replaces the preview. Alpha
+strokes, lassos and posed clays commit on release without a preview.
+
+Modifiers on a Sculpt drag: Shift smooths, Alt inverts, Ctrl paints the
+mask, Ctrl+Alt erases it and Ctrl+Shift draws a mask lasso. With a brush
+tool on, the right button orbits (Alt no longer does). Grab and Snakehook
+drag across the view plane at the depth of the press. On a posed clay a
+Sculpt drag sends posable symmetric strokes, which land on the rest pose;
+Paint, Mask, Groups, Grab and Snakehook are still refused there.
+
+The brush HUD sits over the right side of the viewport while a brush tool
+is on. Every control is a front end for a tool call:
+
+- size, strength, focal shift, the falloff curve, the alpha, X / Y / Z
+  symmetry, LazyMouse and pressure: `brush_preset set_current`;
+- the layer list (select, enable, record, add, and an amount slider that
+  previews while it drags and sends one `sculpt_layer amount` on release);
+- mask and group controls (`set_display overlay`, `mask` actions,
+  `group show | hide | isolate | show_all`);
+- Adjust Last (`stroke_edit {action: scale, last: true}`), a history
+  scrubber (`history goto` and `mark`) and Save brush (`brush_preset save`).
+
+Hotkeys with a brush tool on and the mouse over the view: hold S, U or O
+and move the mouse sideways to change size, strength or focal shift; X
+toggles X symmetry; D and Shift+D go to the next finer and coarser detail
+level (`detail_level`, see below), but not while a stroke is drawn. X, D
+and Shift+D are the Hotkey Editor's SymmetryX, LevelFiner and LevelCoarser
+actions, so they can be rebound; with a brush tool on they win over Snap
+to Grid's X and Edit Pivot's D.
+
+Pressure comes from a touch's force (pens that report touches), from the
+HUD's Tablet setting on macOS (an opt-in pen-pressure monitor, saved with
+the editor's settings), or, with Velocity on, from the pointer's speed.
+The request carries the pressure in its samples and names the source in
+`pressure_source`. LazyMouse (string radius, LazySnap, Backtrack) smooths
+the samples before they are sent, so a replay smooths nothing again.
+
+The brushes are standard, clay, clay_buildup, clay_tubes, trim_dynamic,
+polish, add, carve, inflate, deflate, smooth, flatten, crease, pinch,
+layer, grab, snakehook, vdm and (for the Mask tool) mask_paint; the
+Sculpting shelf has the preset list, brush, radius, strength, invert, X
+symmetry and the Paint tool's color. Agents read and set the same brush
+with `brush_preset {action: get_current}` and `{action: set_current,
+tool, brush, preset, radius, strength, invert, color, symmetry, falloff,
+alpha, pressure, lazy, velocity, tablet, group}`; it is editor state, not
+saved and not an undo step. `set_display {brush_cursor: false}` hides the
+depth-tested brush ring.
+
+Agents see what the human did: `get_scene` and `job_status` list
+`ui_activity`, the latest strokes and HUD calls with their job, status,
+undo `step` and `record_ids`. `get_scene {detail: true}` adds each one's
+`request`, which an agent can send to that tool again verbatim (it gives
+the same record and reply).
+
+### Live sculpt sessions, matcaps and Sculptris Pro
+
+A clay under sculpt (a stroke in the last minute, or the Sculpt or Paint
+tool on it while it is selected) is drawn in chunks of 32 x 32 x 32 cells
+at its detail cell (`edit_clay detail_cell`; else the cell of its first
+stroke): a stroke remeshes only the chunks it touched, and the GPU takes
+only those, so a dab shows in a few milliseconds even on a clay of
+millions of triangles. Paint, the sculpt mask and polygroups change only
+chunk colors and overlay attributes. Everything else (snapping,
+`surface_point`, bakes, film renders, exports) still reads the clay's
+regular mesh, which builds again once strokes pause; a clay posed by its
+rig, or shown baked or fine, draws as before. Agents see the same: each
+`sculpt` record reports `dirty_chunks`, and `get_clay` reports
+`session_cache` (the blob field cached for the session: `bricks`, `mb`,
+`chunked`, `last_remesh_ms`). Strokes read that cache too, so agent
+sculpt calls are faster on big clays as well.
+
+MatCaps: `set_display {shading: "matcap"}` shades every fill with a lit
+sphere looked up by the normal as the camera sees it (creases on sculpted
+clay a little darker), the way sculpting apps show forms; `{matcap:
+"clay" | "red_wax" | "skin" | "metal" | "/path/to/sphere.png"}` picks one
+(a square image at most 1024 a side) and turns matcap shading on;
+`{shading: "shaded"}` turns it off. The Display > MatCap menu sends the
+same calls. `ao` (true, false or ambient_occlusion's object) and
+`ao_radius` are short for `ambient_occlusion`'s settings.
+
+Sculptris Pro: give a stroke a `cell` finer than the clay's detail cell
+(or give `cell` to the whole `sculpt` call for strokes without one), and
+before the stroke a detail region of that cell grows over it (its dabs
+grown by their radius): a region of the same cell that already holds it
+stays as it is, one it overlaps grows to hold both, and past 16 regions
+the smallest of the nearest cell merges into its neighbour. The stroke
+then writes the finer grid there; the reply's `detail_regions` counts
+them, and `edit_clay detail_regions` or `get_clay` show them. Each
+growth is one small `regions` record in `stroke_log` (the regions, not the
+grid), so it replays exactly and a long drag costs the saved file next to
+nothing: a clay without layers or morphs is held only to its per-grid caps
+(about 270 MB in a file), well inside the 1 GiB saved budget. With morphs
+(each written out again) a drag can still reach it, and the stroke that
+would pass it is refused and changes nothing.
+
+```json
+{"target": "Head", "strokes": [{"brush": "crease", "points": [[0.02, 1.71, 0.11], [0.05, 1.7, 0.1]], "radius": 0.004, "strength": 0.001, "cell": 0.0005}]}
+```
+
+### Detail levels and detail transport
+
+Detail levels work like subdivision levels. Level 0 is the clay's own
+detail cell; `detail_level {target, add: cell}` adds a finer cell as a
+level (up to 8, coarse first) and makes it active. `level` (an index) or
+`cell` picks the active level, and a call with neither lists them:
+
+```json
+{"target":"Head", "add":0.0005}
+{"target":"Head", "level":0}
+{"target":"Head", "strokes":[{"brush":"grab", "point":[0,1.6,0.1], "radius":0.05, "delta":[0,0,0.02], "level":0}]}
+```
+
+`sculpt` strokes without `level` work at the active level (`level` can
+also be given per call or per stroke). A stroke at level k writes level k
+and the coarser ones; above 0 it first grows a Sculptris Pro region of
+that level's cell over itself. Finer detail on the layer it writes is
+carried along (transport): grab, stretch, snakehook and transform move it
+with the material through their backward map, and other brushes move it
+with the surface along the normal, so pores made at a fine level survive a
+coarse grab or inflate. Other sculpt layers keep their detail where it was,
+so their records show `stale_context` and `stroke_edit rebase` replays
+them. Records keep `level` and `cell`.
+
+Adding a level is an undo step. Picking the active level is like a
+selection: it is saved with the clay but is never an undo step, and undo,
+redo and `history goto` keep it. The reply lists `levels` (`level`, `cell`,
+`regions`, `active`), and `get_clay` reports them too. In the editor, D
+and Shift+D step the selected clay's level while a brush tool is on.
+
+Transport changed what several brushes produce, so the brush kernel is
+version 2: every record made by the version-1 kernel (before detail
+levels) is reported `engine_stale` in `stroke_log`, and `stroke_edit
+{action: rebase}` replays it with the current kernel.
+
+### Viewport graphics: shadows, ambient occlusion, bloom and sky
+
+The viewport (and `render_views` and `render_animation`, which draw
+through it) is lit like `render_film`, so a film look can be previewed
+live. Everything is on by default and set with `set_display`:
+
+- `lighting`: `"studio"` (default: render_film's studio environment and
+  key, fill and rim lights), an environment preset (`overcast`, `sunset`,
+  `golden_hour`, `forest`, `night`, `storm`, or the physical sky:
+  `physical`, `sky_noon`, `sky_afternoon`, `sky_golden`, `sky_sunset`), a
+  look preset (`trailer`, `desert_heat`, `night_ops` ...), `"film"` (the
+  last `render_film`'s lighting), `"classic"` (the old fixed studio), or
+  `{environment, lights, extra_lights, look}` as `render_film` takes them.
+  The environment lights the scene diffusely and in reflections
+  (image-based lighting); its sun and the studio lights become
+  directional lights.
+- `shadows`: key-light shadow maps. `true` / `false` or `{enabled, soft
+  (contact-hardening PCSS), quality: normal | high (2048 or 4096 map),
+  strength (0..1), softness (the key's angular radius, 0.005..0.3),
+  ground (catch shadows on y = 0 where there is no floor), key_direction}`.
+  Other lighting shadows its brightest sun.
+- `ambient_occlusion` (or `ao`): screen-space contact darkening, `true` /
+  `false` or `{enabled, radius (0.01..10 world units, default 0.5),
+  strength (0..2, default 1)}`.
+- `post`: HDR finishing, `true` / `false` or `{exposure, white_balance,
+  bloom, vignette, tonemap: aces | agx | filmic | none, grade, look,
+  reset}`. The default is ACES with bloom `{strength 0.08, threshold 1}`,
+  so only light above the threshold (emitters, torches, lit windows)
+  glows.
+
+```json
+{"lighting":{"environment":{"preset":"physical", "sun_elevation":12}, "lights":"none"}, "shadows":{"soft":true, "quality":"high"}, "post":{"exposure":0.5, "bloom":{"strength":0.15}}}
+```
+
+Scenes over the triangle budget draw without shadows or ambient occlusion;
+the reply's `shadows.last_frame` and `ambient_occlusion.last_frame` say
+whether the last frame had them and why not. Masks never change. The
+Lighting menu offers the same settings. Repeated geometry (`scatter`,
+`kitbash` parts, `instance_array`) is drawn instanced. `render_film`
+always traces its own shadows and light. `graphics_check/README.md` has
+before and after pictures for each feature.
+
 ### Film renders
 
 - `render_film` renders with Clide3D's own path tracer (like Blender's
@@ -463,7 +1046,15 @@ than the feature spacing, and render a fine mesh to inspect details):
   (patchy shine). They are measured from the shape, so one `set_material`
   call weathers a whole creature; clay meshes show it and bakes keep it.
 - Lighting: `environment` defaults to `"studio"`; file-free skies are
-  `"overcast"`, `"sunset"`, `"forest"`, `"golden_hour"`, and `"night"`.
+  `"overcast"`, `"sunset"`, `"forest"`, `"golden_hour"`, `"night"` and
+  `"storm"`. `"physical"` is a physical sun and sky (Rayleigh, Mie and
+  ozone scattering): the sun and sky redden and dim as the sun goes down.
+  `{"preset":"physical", "sun_elevation":10, "sun_azimuth":120,
+  "turbidity":3, "ground_albedo":0.3}` sets it (elevation -5..90 degrees,
+  below 0 is twilight with no sun; turbidity 1 clear to 10 hazy);
+  `"sky_noon"`, `"sky_afternoon"`, `"sky_golden"` and `"sky_sunset"` are it
+  at 60, 30, 8 and 1.5 degrees. Fog does not follow the sky: set its color
+  to match.
   They supply sky and ground light; sunny presets include a small finite
   sun disc for soft-edged shadows. Forest approximates canopy gaps.
   Use `lights: "none"` for natural light, or retain `"studio"` (default)
@@ -543,6 +1134,23 @@ than the feature spacing, and render a fine mesh to inspect details):
   side, and each color crosses that thickness (red furthest), so ears and
   nose wings glow red against a back light. Human faces get regional skin
   instead of the even pores (see Faces below).
+- Render passes for compositing (like ZBrush BPR passes): `passes:
+  ["depth", "normal", "albedo", "ao", "shadow", "mask", "emission"]` with
+  an absolute `passes_dir` writes `<pass>.png` (or `<view>_<pass>` with
+  several views) next to the picture. `passes_format: "png"` (default) is
+  16-bit for depth, normal, ao, shadow and mask and 8-bit sRGB for albedo
+  and emission; `"exr"` writes 32-bit floats (depth in world units, linear
+  colors). `pass_samples` (default 8), `ao_distance` (default a quarter of
+  the framing radius) and `normal_space: world | camera` tune them. The
+  reply's `passes` gives each file and `passes_info` how to decode it
+  (depth PNG: hits 1..65535, nearest 65535, background 0). Passes come
+  from their own CPU first-hit trace of the same scene, after the picture
+  and outside `time_limit` (well under a second at 640 px), and not with
+  `motion_blur`.
+
+```json
+{"views":["three_quarter"], "size":640, "passes":["depth","normal","mask"], "passes_dir":"/abs/out/passes", "passes_format":"exr"}
+```
 
 ### Adaptive detail: pores, scales and chips in one object
 
@@ -668,6 +1276,22 @@ per piece, real geometry, film-rendered.
   draw (`triangles_drawn`, `copies`, `lights`). The reply says how many
   were placed and why fewer than asked (too close, avoided, off the
   surfaces, too steep).
+- `instance_array {target, blob}` turns an `array` blob of a clay into
+  instances: one copy is meshed (a hidden clay under the object) and a
+  scatter under the object holds every copy, drawn instanced in the
+  viewport and shared by `render_film` and the exports. The blob leaves
+  the clay. For nested arrays `level: "outer"` (default) instances the
+  inner array as one unit and `"leaf"` the innermost shape. It is refused
+  when separate copies would not look the same: the blob is not an added,
+  unmirrored array, other blobs blend with, carve into or cover the
+  copies, or the clay has sculpt, paint, masks or decals. `force: true`
+  instances anyway (the copies are then separate closed shapes that do not
+  merge). The reply gives the unit, the scatter, the copy count and
+  triangles before and after (drawn and unique).
+
+```json
+{"target":"Colonnade", "blob":"pillars"}
+```
 - Any object can carry a `light` (`create_object` / `update_object` /
   `kit`): a preset (`candle`, `torch`, `brazier`, `lantern`, `fire`,
   `magic`) or `{offset, temperature (Kelvin), color, intensity, radius,
@@ -869,6 +1493,21 @@ speed behind other windows. Undo skips playback changes (which clip plays).
   its own thread): a long one answers with a job id, `job_status {id, wait:
   45}` fetches the sheet. `clip` picks the clip to show, `save_path` also
   writes the PNG; 16 frames of a big scene no longer time out.
+  `format: "png_sequence"` also writes every frame (`frame_00000.png` ..)
+  into the absolute folder `path`; `format: "mp4"` writes a movie at an
+  absolute `.mp4` `path` (H.264 through libx264, else mpeg4). `frames`
+  then goes up to 1200 (default every whole frame of the clip; the sheet
+  shows 16), `fps` defaults to the timeline's and `size` is the frame size
+  (default 512, at most 1024, made even). mp4 needs an `ffmpeg` binary,
+  found through `CLIDE_FFMPEG` (a path to the program), then the PATH,
+  `/opt/homebrew/bin`, `/usr/local/bin` and `/usr/bin`; it is run with an
+  argument list, never a shell. Without one the frames stay as a PNG
+  sequence in `<name>_frames` next to the movie path and the reply warns.
+
+```json
+{"clip":"walk", "view":"three_quarter", "format":"mp4", "path":"/abs/out/walk.mp4", "fps":24, "size":720}
+```
+
   `render_views` also takes `frame`, `show_bones`, and `weights` (a bone name:
   shows its skin weights as colors).
 

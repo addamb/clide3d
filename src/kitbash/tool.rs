@@ -117,6 +117,149 @@ fn nearest(s: &Surface, p: Vec3, normal: Option<Vec3>) -> Option<Hit> {
     }
 }
 
+/// InsertMesh: `part: {object, op: add|carve, scale}` puts another
+/// object's shape (as `to_clay` makes it: analytic for primitives, a
+/// mesh blob otherwise) into the target clay at each spot, its +Y along
+/// the surface normal, its X along `along`, turned by `rotate` about the
+/// normal and lifted by `offset`, at its own world size times `scale`.
+/// The blobs are named under the call's group, so `remove` takes them out.
+/// A mesh is made one asset (its size baked in) that every spot's blob
+/// places. The editor runs `Insert::build` as a job (`is_insert`).
+fn insert_object(scene: &mut Scene, meshes: &mut MeshLib, args: &Value) -> Result<Value, String> {
+    let plan = insert_plan(scene, meshes, args)?;
+    let built = plan.build()?;
+    plan.apply(scene, built)
+}
+
+/// Whether a `kitbash` call is an InsertMesh.
+pub fn is_insert(args: &Value) -> bool {
+    matches!(args["action"].as_str(), None | Some("place")) && args["part"].get("object").is_some()
+}
+
+/// An InsertMesh worked out on the editor's thread: where each copy goes.
+pub struct Insert {
+    pub target: u64,
+    tag: String,
+    source: crate::to_clay::Source,
+    /// The source's own space to its placed size (the same at every spot).
+    inner: Mat4,
+    /// Each spot: the placed source into the target clay's space.
+    places: Vec<Mat4>,
+    op: crate::clay::Op,
+    color: [f32; 3],
+    missed: usize,
+}
+
+/// The blobs and assets an `Insert` makes (on any thread).
+pub struct Built(crate::to_clay::Converted);
+
+/// The checks, spots and placements of an InsertMesh (cheap: the source
+/// is only gathered, see `to_clay::source`).
+pub fn insert_plan(scene: &Scene, meshes: &mut MeshLib, args: &Value) -> Result<Insert, String> {
+    let spec = &args["part"];
+    let src = resolve(scene, &spec["object"])?;
+    let op = match spec["op"].as_str().or(args["op"].as_str()).unwrap_or("add") {
+        "add" => crate::clay::Op::Add,
+        "carve" => crate::clay::Op::Carve,
+        other => return Err(format!("an inserted object's op is add or carve, not {other}")),
+    };
+    let ids = targets(scene, args)?;
+    let [target] = ids[..] else { return Err("InsertMesh goes into one clay target".into()) };
+    if scene.get(target).is_none_or(|o| o.clay.is_none()) {
+        return Err("InsertMesh goes into a clay target (to_clay makes one from any object)".into());
+    }
+    if target == src || scene.ancestors(src).contains(&target) {
+        return Err("the inserted object must not be the target or under it".into());
+    }
+    if args["mirror"].as_bool().unwrap_or(false) {
+        return Err("mirror is not supported for inserted objects; place each side".into());
+    }
+    let scale = match spec.get("scale").or(args.get("scale")).filter(|v| !v.is_null()) {
+        None => 1.0,
+        Some(v) => v.as_f64().map(|x| x as f32).filter(|x| x.is_finite() && *x > 1e-4 && *x < 1e4).ok_or("scale must be a positive number")?,
+    };
+    meshes.sync(scene);
+    let s = surface_for(scene, meshes, &ids, None);
+    if s.is_empty() {
+        return Err("the target has no surface".into());
+    }
+    let normal = args.get("normal").filter(|v| !v.is_null()).map(|v| vec3(v, "normal")).transpose()?;
+    let mut spots = Vec::new();
+    if let Some(a) = args.get("at").filter(|v| !v.is_null()) {
+        spots.push(vec3(a, "at")?);
+    }
+    if let Some(p) = args.get("points").filter(|v| !v.is_null()) {
+        spots.extend(points(p, "points")?);
+    }
+    if spots.is_empty() || spots.len() > 64 {
+        return Err("give at (a world point near the surface) or points (at most 64)".into());
+    }
+    let clay_blobs = scene.get(target).and_then(|o| o.clay.as_ref()).map_or(0, |c| c.blobs.len());
+    if clay_blobs + spots.len() > crate::clay::MAX_BLOBS {
+        return Err(format!("the clay would have more than {} blobs", crate::clay::MAX_BLOBS));
+    }
+    let rotate = (args["rotate"].as_f64().unwrap_or(0.0) as f32).to_radians();
+    let lift = args["offset"].as_f64().unwrap_or(0.0) as f32;
+    let along = match args.get("along") {
+        Some(Value::Array(_)) => Some(vec3(&args["along"], "along")?),
+        _ => None,
+    };
+    // The object's own shape at its world size, origin at its pivot.
+    let (size, _, _) = scene.world_matrix(src).to_scale_rotation_translation();
+    let pivot = scene.get(src).map_or(Vec3::ZERO, |o| o.pivot);
+    let inner = Mat4::from_scale(size * scale) * Mat4::from_translation(-pivot);
+    let to_target = scene.world_matrix(target).inverse();
+    let tag = match args["group"].as_str() {
+        Some(t) if !t.trim().is_empty() => t.to_string(),
+        _ => place::new_tag(scene, "kb_insert"),
+    };
+    let mut places = Vec::new();
+    let mut missed = 0;
+    for p in spots {
+        let Some(hit) = nearest(&s, p, normal) else {
+            missed += 1;
+            continue;
+        };
+        let f = frame(hit.p, hit.n, along.unwrap_or_else(|| place::default_along(hit.n)), 1.0);
+        places.push(to_target * f * Mat4::from_rotation_y(rotate) * Mat4::from_translation(Vec3::Y * lift));
+    }
+    if places.is_empty() {
+        return Err(format!("no spot found the target's surface ({missed} missed)"));
+    }
+    let color = crate::to_clay::tint(scene.get(src).map_or([1.0; 3], |o| o.color), scene.get(target).map_or([1.0; 3], |o| o.color));
+    let source = crate::to_clay::source(scene, meshes, src)?;
+    Ok(Insert { target, tag, source, inner, places, op, color, missed })
+}
+
+impl Insert {
+    /// The blobs (the slow part for a mesh: weld, hash and decimate once).
+    pub fn build(&self) -> Result<Built, String> {
+        self.source.convert(self.inner, &self.places, self.op, self.color).map(Built)
+    }
+
+    /// Adds what `build` made to the target clay; Ok(the call's answer).
+    pub fn apply(&self, scene: &mut Scene, built: Built) -> Result<Value, String> {
+        let o = scene.get_mut(self.target).ok_or("the target was deleted")?;
+        let clay = o.clay.as_mut().ok_or("the target is no longer clay")?;
+        let mut next = clay.clone();
+        for mut b in built.0.blobs {
+            b.name = format!("{}/insert{}", self.tag, next.blobs.len() - clay.blobs.len() + 1);
+            b.validate()?;
+            next.blobs.push(b);
+        }
+        for a in built.0.assets {
+            next.assets.insert(a.hash().to_string(), a);
+        }
+        if next.blobs.len() > crate::clay::MAX_BLOBS {
+            return Err(format!("the clay would have more than {} blobs", crate::clay::MAX_BLOBS));
+        }
+        next.adopt_assets()?;
+        let inserted = next.blobs.len() - clay.blobs.len();
+        *clay = next;
+        Ok(json!({ "group": self.tag, "inserted": inserted, "op": self.op, "object": self.source.name, "target": o.name, "missed": self.missed, "blobs": clay.blobs.len() }))
+    }
+}
+
 /// A part from `part` (a kind name or settings) and top-level part keys.
 fn part_from(args: &Value) -> Result<Part, String> {
     let mut v = match args.get("part") {
@@ -193,6 +336,9 @@ fn list(scene: &Scene, meshes: &MeshLib) -> Value {
 }
 
 fn place_parts(scene: &mut Scene, meshes: &mut MeshLib, args: &Value) -> Result<Value, String> {
+    if args["part"].get("object").is_some() {
+        return insert_object(scene, meshes, args);
+    }
     let mut ids = targets(scene, args)?;
     let linked_skipped: Vec<_> = ids.iter().copied().filter(|id|scene.get(*id).is_some_and(|o|o.link.is_some())).collect();
     ids.retain(|id|!linked_skipped.contains(id));

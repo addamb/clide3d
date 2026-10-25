@@ -18,7 +18,8 @@
 //! the interior of a head of hair.
 //!
 //! The result is denoised (an edge-aware filter guided by the first hit's
-//! color, normal and depth) and tone-mapped with a filmic curve.
+//! color, normal and depth, and by each pixel's measured noise) and
+//! tone-mapped with a filmic curve.
 
 pub(crate) mod bvh;
 mod denoise;
@@ -28,9 +29,11 @@ pub mod gpu;
 mod checks;
 pub mod lighting;
 pub mod look;
+pub mod passes;
 mod post;
 pub use look::Look;
 pub mod shade;
+pub mod sky;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -107,6 +110,59 @@ pub struct Image {
     pub linear: Vec<Vec3>,
     pub samples: u32,
     pub seconds: f32,
+    /// Which tracer made it, and why not the GPU when it did not.
+    pub traced: Traced,
+}
+
+/// Which tracer rendered an image.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Traced {
+    /// The GPU tracer (`gpu.rs`) on this adapter; `warning`: a known way
+    /// its picture may differ from the CPU's.
+    Gpu { name: String, warning: Option<String> },
+    /// The CPU tracer; `reason`: why not the GPU (None: the CPU was asked for).
+    Cpu { reason: Option<String> },
+}
+
+impl Default for Traced {
+    fn default() -> Self {
+        Traced::Cpu { reason: None }
+    }
+}
+
+impl Traced {
+    /// For tool replies: `{used, gpu, fallback_reason}` (plus `warning`).
+    pub fn json(&self) -> serde_json::Value {
+        match self {
+            Traced::Gpu { name, warning } => {
+                let mut v = serde_json::json!({ "used": "gpu", "gpu": name, "fallback_reason": null });
+                if let Some(w) = warning {
+                    v["warning"] = w.as_str().into();
+                }
+                v
+            }
+            Traced::Cpu { reason } => serde_json::json!({ "used": "cpu", "gpu": null, "fallback_reason": reason }),
+        }
+    }
+
+    /// The tracer's short name, "gpu" or "cpu".
+    pub fn used(&self) -> &'static str {
+        match self {
+            Traced::Gpu { .. } => "gpu",
+            Traced::Cpu { .. } => "cpu",
+        }
+    }
+
+    /// Fails a parity test when `asked` was the GPU, one exists, and the
+    /// CPU traced anyway (so GPU-vs-CPU checks cannot pass CPU-vs-CPU).
+    #[cfg(test)]
+    pub fn assert_honours(&self, asked: look::Device) {
+        match asked {
+            look::Device::Gpu if gpu::get().is_some() => assert!(matches!(self, Traced::Gpu { .. }), "the GPU was asked for but not used: {self:?}"),
+            look::Device::Cpu => assert_eq!(self, &Traced::Cpu { reason: None }),
+            _ => {}
+        }
+    }
 }
 
 /// Per-triangle shading data, in world space.
@@ -250,11 +306,17 @@ struct Sss {
     item: u32,
 }
 
+/// Direction toward the studio key light (not normalised). The viewport's
+/// key and its shadows use the same one.
+pub const KEY_DIR: Vec3 = Vec3::new(0.45, 0.75, 0.55);
+/// The key light's angular radius in radians.
+pub const KEY_RADIUS: f32 = 0.12;
+
 /// Studio lights: (direction toward the light, angular radius, the light
 /// it casts on a surface facing it). A key, a large soft fill, and a rim
 /// light from behind that outlines hair and shoulders.
-const LIGHTS: [(Vec3, f32, Vec3); 3] = [
-    (Vec3::new(0.45, 0.75, 0.55), 0.12, Vec3::new(3.1, 2.95, 2.75)),
+pub(crate) const LIGHTS: [(Vec3, f32, Vec3); 3] = [
+    (KEY_DIR, KEY_RADIUS, Vec3::new(3.1, 2.95, 2.75)),
     (Vec3::new(-0.7, 0.25, 0.45), 0.35, Vec3::new(0.7, 0.75, 0.85)),
     (Vec3::new(-0.2, 0.5, -0.85), 0.1, Vec3::new(2.2, 2.2, 2.3)),
 ];
@@ -582,6 +644,9 @@ impl<'a> Scene<'a> {
     }
 }
 
+/// The floor's gray (linear), as traced and in the albedo pass.
+pub const FLOOR_ALBEDO: f32 = 0.42;
+
 /// Studio environment: soft sky above, warm dark floor below.
 fn environment(d: Vec3) -> Vec3 {
     let t = smoothstep(-0.3, 0.6, d.y);
@@ -643,12 +708,22 @@ impl Rng {
     }
 }
 
-/// First-hit data for the denoiser.
+/// First-hit data for the denoiser. Summed over a pixel's samples, with
+/// the sum and square sum of each sample's lighting luminance
+/// (`demodulated`), which give the pixel's noise.
 #[derive(Clone, Copy, Default)]
 struct Guide {
     albedo: Vec3,
     normal: Vec3,
     depth: f32,
+    light: f32,
+    light2: f32,
+}
+
+/// One sample's lighting luminance: its color divided by its first hit's
+/// albedo, as the denoiser filters it. The GPU tracer computes the same.
+fn demodulated(c: Vec3, albedo: Vec3) -> f32 {
+    denoise::luminance(c / albedo.max(Vec3::splat(0.02)))
 }
 
 fn mis(a: f32, b: f32) -> f32 {
@@ -735,7 +810,7 @@ fn inscatter(scene: &Scene, fog: &lighting::Fog, o: Vec3, d: Vec3, t: f32, rng: 
 fn radiance(scene: &Scene, mut o: Vec3, mut d: Vec3, bounces: u32, rng: &mut Rng) -> (Vec3, Guide) {
     let mut color = Vec3::ZERO;
     let mut through = Vec3::ONE;
-    let mut guide = Guide { albedo: Vec3::ONE, normal: Vec3::ZERO, depth: 1e9 };
+    let mut guide = Guide { albedo: Vec3::ONE, normal: Vec3::ZERO, depth: 1e9, ..Guide::default() };
     let fog = scene.look.fog;
     // Light reaching a point through fog is dimmed on the way.
     let fogged = |p: Vec3, l: Vec3, far: f32| fog.map_or(1.0, |f| f.transmittance(p, l, far)) * crate::fire::transmittance(&scene.look.volumes, p, l, far);
@@ -803,7 +878,7 @@ fn radiance(scene: &Scene, mut o: Vec3, mut d: Vec3, bounces: u32, rng: &mut Rng
                 // The strand's direction stands in for the normal, so the
                 // denoiser only blends strands running the same way.
                 let along = if tangent.y < 0.0 { -tangent } else { tangent };
-                guide = Guide { albedo: pigment.max(Vec3::splat(0.02)), normal: along, depth: t };
+                guide = Guide { albedo: pigment.max(Vec3::splat(0.02)), normal: along, depth: t, ..Guide::default() };
             }
             let v = -d;
             let lift = 2e-4 * (1.0 + p.abs().max_element());
@@ -848,11 +923,11 @@ fn radiance(scene: &Scene, mut o: Vec3, mut d: Vec3, bounces: u32, rng: &mut Rng
             Some(h) => scene.surface(o, d, t, &h),
             None => {
                 let p = o + d * t;
-                (p, Vec3::Y, Vec3::Y, Surface { albedo: Vec3::splat(0.42), rough: 0.7, metal: 0.0, coat: 0.0, sheen: 0.0, skin: 0.0 }, None, Optics::default())
+                (p, Vec3::Y, Vec3::Y, Surface { albedo: Vec3::splat(FLOOR_ALBEDO), rough: 0.7, metal: 0.0, coat: 0.0, sheen: 0.0, skin: 0.0 }, None, Optics::default())
             }
         };
         if bounce == 0 {
-            guide = Guide { albedo: surf.albedo.max(Vec3::splat(0.02)), normal: n, depth: t };
+            guide = Guide { albedo: surf.albedo.max(Vec3::splat(0.02)), normal: n, depth: t, ..Guide::default() };
         }
         // Emission: the surface's own light, in its color.
         color += clamp_indirect(through * optics.emitted, bounce);
@@ -1005,19 +1080,46 @@ pub fn render_views(meshes: &Meshes, fibers: &[Fiber], cams: &[Camera], s: Setti
 
 /// Shares lighting and camera optics across the views.
 pub fn render_views_with_look(meshes: &Meshes, fibers: &[Fiber], cams: &[Camera], s: Settings, look: Arc<Look>, progress: &crate::progress::Progress) -> Vec<Image> {
+    let (views, traced) = trace_views(meshes, fibers, cams, s, look, progress);
+    progress.stage("removing grain", 0.96);
+    views.into_iter().map(|v| v.finish(s, &traced)).collect()
+}
+
+/// Test pictures from one trace (CPU unless `look` asks otherwise):
+/// not denoised, then by the classic and the variance-guided denoiser.
+#[cfg(test)]
+pub(crate) fn render_each_denoiser(meshes: &Meshes, fibers: &[Fiber], cam: &Camera, s: Settings, look: Arc<Look>) -> [Image; 3] {
+    let (views, traced) = trace_views(meshes, fibers, std::slice::from_ref(cam), s, look, &Default::default());
+    let v = &views[0];
+    [None, Some(look::Denoiser::Classic), Some(look::Denoiser::Variance)].map(|d| v.finish_as(s, &traced, d))
+}
+
+/// The views' sums of light and guides, before denoising and finishing.
+fn trace_views<'a>(meshes: &'a Meshes, fibers: &[Fiber], cams: &[Camera], s: Settings, look: Arc<Look>, progress: &crate::progress::Progress) -> (Vec<View<'a>>, Traced) {
     let start = Instant::now();
     progress.stage("building the hair", 0.0);
     let mut views: Vec<View> = cams.iter().map(|cam| View::new(Scene::new(meshes, fibers, cam.eye, s.floor, look.clone()), cam, s)).collect();
     progress.stage("tracing light", 0.02);
     // The GPU when it can take the render; otherwise every core.
-    match gpu::render(&mut views, meshes, s, start, progress) {
-        Ok(_) => {
-            progress.stage("removing grain", 0.96);
-            return views.into_iter().map(|v| v.finish(s)).collect();
+    let traced = match gpu::render(&mut views, meshes, s, start, progress) {
+        Ok(name) => {
+            let traced = Traced::Gpu { name, warning: gpu::stack_warning(&views, meshes) };
+            return (views, traced);
         }
-        Err(e) if look.device == look::Device::Gpu => eprintln!("film: GPU asked for but not used: {e}"),
-        Err(_) => {}
-    }
+        Err(gpu::Refusal::CpuAsked) => Traced::Cpu { reason: None },
+        Err(gpu::Refusal::Because(e)) => {
+            // Expected under auto: no GPU here, or hair strands; anything
+            // else is worth a line in the log too.
+            let expected = e.starts_with("no usable GPU") || e.starts_with("hair strands");
+            if look.device == look::Device::Gpu {
+                eprintln!("film: GPU asked for but not used: {e}");
+            } else if !expected {
+                eprintln!("film: tracing on the CPU: {e}");
+            }
+            progress.stage(&format!("tracing light on the CPU ({e})"), 0.02);
+            Traced::Cpu { reason: Some(e) }
+        }
+    };
     let total = s.samples as usize * views.len();
     // Passes of a few samples each, so a time limit stops cleanly.
     loop {
@@ -1036,8 +1138,7 @@ pub fn render_views_with_look(meshes: &Meshes, fibers: &[Fiber], cams: &[Camera]
             break;
         }
     }
-    progress.stage("removing grain", 0.96);
-    views.into_iter().map(|v| v.finish(s)).collect()
+    (views, traced)
 }
 
 /// One view being rendered: its scene (with hair facing its camera), and
@@ -1105,9 +1206,20 @@ impl<'a> View<'a> {
                                     // Keep HDR highlights for bloom and the display shoulder.
                                     let c = if c.is_finite() { c } else { Vec3::ZERO };
                                     row[x] += c;
-                                    g[x].albedo += gd.albedo;
-                                    g[x].normal += gd.normal;
-                                    g[x].depth += gd.depth.min(1e4);
+                                    // A rare bad (NaN) guide would blacken the
+                                    // pixel in the denoiser (as on the GPU).
+                                    let albedo = if gd.albedo.is_finite() && gd.normal.is_finite() && gd.depth.is_finite() {
+                                        g[x].normal += gd.normal;
+                                        g[x].depth += gd.depth.min(1e4);
+                                        gd.albedo
+                                    } else {
+                                        g[x].depth += 1e4;
+                                        Vec3::splat(0.5)
+                                    };
+                                    g[x].albedo += albedo;
+                                    let l = demodulated(c, albedo);
+                                    g[x].light += l;
+                                    g[x].light2 += l * l;
                                 }
                             }
                             out.push((y, row, g));
@@ -1124,19 +1236,38 @@ impl<'a> View<'a> {
                 self.guides[y * w + x].albedo += g[x].albedo;
                 self.guides[y * w + x].normal += g[x].normal;
                 self.guides[y * w + x].depth += g[x].depth;
+                self.guides[y * w + x].light += g[x].light;
+                self.guides[y * w + x].light2 += g[x].light2;
             }
         }
         self.done += pass;
     }
 
-    fn finish(self, s: Settings) -> Image {
+    fn finish(self, s: Settings, traced: &Traced) -> Image {
+        let denoiser = s.denoise.then_some(self.scene.look.denoiser);
+        self.finish_as(s, traced, denoiser)
+    }
+
+    /// The picture, denoised by `denoiser` (None: not at all).
+    fn finish_as(&self, s: Settings, traced: &Traced, denoiser: Option<look::Denoiser>) -> Image {
         let done = self.done.max(1);
         let mut color: Vec<Vec3> = self.sum.iter().map(|c| *c / done as f32).collect();
-        if s.denoise {
-            color = denoise::filter(&color, &self.guides.iter().map(|g| (g.albedo / done as f32, g.normal.normalize_or_zero(), g.depth / done as f32)).collect::<Vec<_>>(), self.w, self.h, self.done);
+        if let Some(denoiser) = denoiser {
+            color = denoise::filter(&color, &self.denoise_guides(), self.w, self.h, self.done, denoiser == look::Denoiser::Variance);
         }
         let pixels = self.scene.look.finish(color.clone(), self.w, self.h, s.exposure);
-        Image { width: self.w, height: self.h, pixels, linear: color, samples: self.done, seconds: self.seconds }
+        Image { width: self.w, height: self.h, pixels, linear: color, samples: self.done, seconds: self.seconds, traced: traced.clone() }
+    }
+
+    /// Per pixel the mean albedo, normal and depth, and the variance of
+    /// the mean lighting luminance: zero (unknown) below 4 samples, where
+    /// the denoiser falls back to the classic spread.
+    fn denoise_guides(&self) -> Vec<(Vec3, Vec3, f32, f32)> {
+        let n = self.done.max(1) as f32;
+        self.guides.iter().map(|g| {
+            let variance = if self.done >= 4 { (g.light2 / n - (g.light / n).powi(2)).max(0.0) / n } else { 0.0 };
+            (g.albedo / n, g.normal.normalize_or_zero(), g.depth / n, variance)
+        }).collect()
     }
 }
 

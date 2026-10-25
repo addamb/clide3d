@@ -202,7 +202,7 @@ impl ClideApp {
         let o = self.scene.get(rig_id).ok_or("object vanished")?;
         let rig = o.rig.as_ref().ok_or_else(|| format!("{} has no rig", o.name))?;
         let b = rig.bones.iter().find(|x| x.name == bone).ok_or_else(|| format!("{} has no bone {bone}", o.name))?.clone();
-        let had_detail = o.clay.as_ref().is_some_and(|c| c.detail.is_some() || c.paint.is_some());
+        let had_detail = o.clay.as_ref().is_some_and(|c| c.detail.is_some() || c.paint.is_some() || !crate::layers::extra(c).is_empty());
         let world = pose::at_rest(&mut self.scene, |s| s.world_matrix(rig_id));
         let local = match args["space"].as_str().unwrap_or("world") {
             "world" => world.inverse(),
@@ -234,6 +234,11 @@ impl ClideApp {
         let delta = Mat4::from_translation(shift) * Mat4::from_translation(pivot) * Mat4::from_quat(turn.normalize()) * Mat4::from_translation(-pivot);
         let carry = args["carry"].as_bool().unwrap_or(true);
         let extra: Vec<String> = args["blobs"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)).collect();
+        if carry {
+            // Carried blobs move; their sculpt ledgers settle on the old shape first.
+            let ids: Vec<u64> = self.scene.objects.iter().map(|o| o.id).collect();
+            self.settle_clays(ids)?;
+        }
         let mut reports = vec![(bone.clone(), pose::pose_rest(&mut self.scene, rig_id, &bone, delta, carry, &extra)?)];
         if args["mirror"].as_bool().unwrap_or(false) {
             let other = crate::rig::mirror_name(&bone).ok_or_else(|| format!("{bone} has no side suffix (.L/.R) to mirror"))?;
@@ -257,7 +262,7 @@ impl ClideApp {
         let joints: serde_json::Map<String, Value> = reports.iter().flat_map(|(_, r)| r.bones.iter()).filter_map(|n| rig.bones.iter().find(|x| &x.name == n)).map(|x| (x.name.clone(), json!({ "head": round3(world.transform_point3(x.head)), "tail": round3(world.transform_point3(x.tail)) }))).collect();
         let mut out = json!({ "rig": name(rig_id), "posed": list, "rest_joints_world": joints });
         if had_detail && carry {
-            out["note"] = json!("sculpt and paint grids of the rig clay stay where they are; only blobs moved");
+            out["note"] = json!("sculpt and paint grids (and layers) of the rig clay stay where they are; only blobs moved");
         }
         Ok(text(out))
     }

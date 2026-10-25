@@ -66,6 +66,25 @@ impl Bvh {
         (nodes, tris)
     }
 
+    pub(super) fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Levels from the root to the deepest leaf (0 when empty).
+    pub(super) fn depth(&self) -> usize {
+        let mut deepest = 0;
+        let mut stack = if self.nodes.is_empty() { Vec::new() } else { vec![(0u32, 1usize)] };
+        while let Some((at, level)) = stack.pop() {
+            let n = &self.nodes[at as usize];
+            deepest = deepest.max(level);
+            if n.count == 0 {
+                stack.push((n.start, level + 1));
+                stack.push((n.right, level + 1));
+            }
+        }
+        deepest
+    }
+
     /// Nearest hit with t in (t_min, t_max). `skip` decides whether a hit
     /// counts (alpha cut-outs); it is called only for candidate hits.
     pub fn hit(&self, origin: Vec3, dir: Vec3, t_min: f32, t_max: f32, skip: &dyn Fn(&Hit) -> bool) -> Option<Hit> {

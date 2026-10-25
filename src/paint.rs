@@ -17,7 +17,13 @@ use base64::Engine;
 use glam::{IVec3, Vec3};
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+use crate::brush::curve::Curve;
+use crate::brush::resolve::{Dab, PaintParams};
+use crate::brush::spec::StrokeMask;
 use crate::clay::{BRICK_VALUES, Clay, MAX_BRICKS, split};
+use crate::brush::alpha::{Alpha, AlphaParams, Mode, Stamp, frame};
+use crate::sculpt::engine::{Gate, Sweep, allowed};
 
 type Rgba = [u8; 4];
 
@@ -34,6 +40,13 @@ pub struct PaintGrid {
 impl PartialEq for Paint {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Paint {
+    /// The grid's identity, as `==` compares it (cheap to hash).
+    pub fn addr(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
     }
 }
 
@@ -75,6 +88,35 @@ impl Paint {
             }
         }
         Ok(Paint(Arc::new(out)))
+    }
+
+    /// Paint layers laid over each other in order (`layers.rs`): every
+    /// point of each part goes over what is below with its coverage times
+    /// the part's amount (0..1), as a brush lays paint. Parts on another
+    /// cell than the first are left out. One part at amount 1 is itself.
+    pub(crate) fn composite(parts: &[(&Paint, f32)]) -> Option<Paint> {
+        let (first, a0) = parts.first()?;
+        if parts.len() == 1 && *a0 == 1.0 {
+            return Some((*first).clone());
+        }
+        let voxel = first.0.voxel;
+        let mut out = PaintGrid { voxel, bricks: HashMap::new() };
+        for (p, amount) in parts {
+            let amount = amount.clamp(0.0, 1.0);
+            if p.0.voxel != voxel || amount <= 0.0 {
+                continue;
+            }
+            for key in p.0.sorted_keys() {
+                let brick = &p.0.bricks[&key];
+                for (at, c) in brick.iter().enumerate().filter(|(_, c)| c[3] > 0) {
+                    let i = [key[0] * 8 + at as i32 % 8, key[1] * 8 + at as i32 / 8 % 8, key[2] * 8 + at as i32 / 64];
+                    let color = Vec3::new(c[0] as f32, c[1] as f32, c[2] as f32) / 255.0;
+                    out.over(i, color, c[3] as f32 / 255.0 * amount);
+                }
+            }
+        }
+        out.prune();
+        Some(Paint(Arc::new(out)))
     }
 
     /// The same paint mirrored across x = 0 (grid point x -> -x).
@@ -191,11 +233,15 @@ impl PaintGrid {
     }
 }
 
-/// File form: RGBA bytes per brick, base64.
+/// File form: RGBA bytes, every brick deflated together in `packed` (see
+/// `clay::pack`); older files have one base64 `bricks` entry per brick.
 #[derive(Serialize, Deserialize)]
 struct PaintFile {
     voxel: f32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     bricks: Vec<BrickFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    packed: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -204,44 +250,98 @@ struct BrickFile {
     data: String,
 }
 
+impl PaintGrid {
+    /// Keys of the bricks that differ between this grid and `other` (on
+    /// the same cell): in one and not the other, or with other colors.
+    pub(crate) fn changed_bricks(&self, other: &PaintGrid) -> Vec<[i32; 3]> {
+        let mut out: Vec<[i32; 3]> = self.bricks.iter().filter(|(k, b)| other.bricks.get(*k).is_none_or(|o| o[..] != b[..])).map(|(k, _)| *k).collect();
+        out.extend(other.bricks.keys().filter(|k| !self.bricks.contains_key(*k)));
+        out
+    }
+
+    fn sorted_keys(&self) -> Vec<[i32; 3]> {
+        let mut keys: Vec<[i32; 3]> = self.bricks.keys().copied().collect();
+        keys.sort();
+        keys
+    }
+
+    /// Bricks by key (RGBA per grid point), in no particular order.
+    pub(crate) fn bricks(&self) -> impl Iterator<Item = (&[i32; 3], &[Rgba; BRICK_VALUES])> {
+        self.bricks.iter().map(|(k, b)| (k, &**b))
+    }
+
+    /// One brick's values, if it has one.
+    pub(crate) fn brick(&self, key: &[i32; 3]) -> Option<&[Rgba; BRICK_VALUES]> {
+        self.bricks.get(key).map(|b| &**b)
+    }
+
+    /// The file form from before bricks were deflated: one base64 entry
+    /// per brick.
+    #[cfg(test)]
+    pub(crate) fn raw_file_json(&self) -> String {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let bricks = self.sorted_keys().into_iter().map(|k| BrickFile { at: k, data: b64.encode(self.bricks[&k].iter().flatten().copied().collect::<Vec<u8>>()) }).collect();
+        serde_json::to_string(&PaintFile { voxel: self.voxel, bricks, packed: None }).expect("json")
+    }
+}
+
 impl Serialize for Paint {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let g = &self.0;
-        let mut keys: Vec<&[i32; 3]> = g.bricks.keys().collect();
-        keys.sort();
-        let b64 = base64::engine::general_purpose::STANDARD;
-        let bricks = keys
-            .into_iter()
-            .map(|k| BrickFile { at: *k, data: b64.encode(g.bricks[k].iter().flatten().copied().collect::<Vec<u8>>()) })
-            .collect();
-        PaintFile { voxel: g.voxel, bricks }.serialize(s)
+        let keys = g.sorted_keys();
+        let values: Vec<u8> = keys.iter().flat_map(|k| g.bricks[k].iter().flatten().copied()).collect();
+        let packed = (!keys.is_empty()).then(|| crate::clay::pack(&keys, &values, 4, false));
+        PaintFile { voxel: g.voxel, bricks: Vec::new(), packed }.serialize(s)
     }
 }
 
 impl<'de> Deserialize<'de> for Paint {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        crate::clay::inflate_budget(crate::clay::INFLATE_BUDGET, || Self::read(d))
+    }
+}
+
+impl Paint {
+    /// `deserialize` within an inflate budget.
+    fn read<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let file = PaintFile::deserialize(d)?;
         if file.bricks.len() > MAX_BRICKS {
             return Err(serde::de::Error::custom("too many paint bricks"));
         }
         let b64 = base64::engine::general_purpose::STANDARD;
+        let brick = |bytes: &[u8]| {
+            let mut values = Box::new([[0u8; 4]; BRICK_VALUES]);
+            for (v, c) in values.iter_mut().zip(bytes.chunks_exact(4)) {
+                *v = [c[0], c[1], c[2], c[3]];
+            }
+            values
+        };
         let mut bricks = HashMap::new();
         for b in file.bricks {
             let bytes = b64.decode(&b.data).map_err(serde::de::Error::custom)?;
             if bytes.len() != BRICK_VALUES * 4 {
                 return Err(serde::de::Error::custom("bad paint brick size"));
             }
-            let mut values = Box::new([[0u8; 4]; BRICK_VALUES]);
-            for (v, c) in values.iter_mut().zip(bytes.chunks_exact(4)) {
-                *v = [c[0], c[1], c[2], c[3]];
+            bricks.insert(b.at, brick(&bytes));
+        }
+        if let Some(text) = file.packed {
+            let (keys, values) = crate::clay::unpack(&text, 4, false, MAX_BRICKS).map_err(|e| serde::de::Error::custom(format!("paint bricks: {e}")))?;
+            for (at, bytes) in keys.into_iter().zip(values.chunks_exact(BRICK_VALUES * 4)) {
+                bricks.insert(at, brick(bytes));
             }
-            bricks.insert(b.at, values);
+            if bricks.len() > MAX_BRICKS {
+                return Err(serde::de::Error::custom("too many paint bricks"));
+            }
         }
         Ok(Paint(Arc::new(PaintGrid { voxel: file.voxel, bricks })))
     }
 }
 
-#[derive(Deserialize, Clone, Debug)]
+/// A paint stroke in its older form, kept for checks that build strokes
+/// directly; the paint tool reads StrokeSpec (brush paint), which reads
+/// this JSON too.
+#[cfg(test)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PaintStroke {
     /// One point (a dab) or a path, in the clay object's space.
     pub points: Vec<Vec3>,
@@ -260,17 +360,20 @@ pub struct PaintStroke {
     #[serde(default)]
     pub mirror: bool,
     #[serde(default)]
-    pub mask: Option<crate::sculpt::Mask>,
+    pub mask: Option<StrokeMask>,
 }
 
+#[cfg(test)]
 fn one() -> f32 {
     1.0
 }
 
+#[cfg(test)]
 fn half() -> f32 {
     0.5
 }
 
+#[cfg(test)]
 const MAX_POINTS: usize = 512;
 /// Most grid points one stroke may visit (near the surface).
 const MAX_REGION: f64 = 40_000_000.0;
@@ -288,33 +391,8 @@ fn layer(clay: &Clay) -> Result<Paint, String> {
     Ok(Paint::new(voxel))
 }
 
-fn path_distance(p: Vec3, points: &[Vec3]) -> f32 {
-    if points.len() == 1 {
-        return (p - points[0]).length();
-    }
-    points
-        .windows(2)
-        .map(|w| {
-            let ab = w[1] - w[0];
-            let t = if ab.length_squared() < 1e-12 { 0.0 } else { ((p - w[0]).dot(ab) / ab.length_squared()).clamp(0.0, 1.0) };
-            (p - (w[0] + ab * t)).length()
-        })
-        .fold(f32::MAX, f32::min)
-}
-
-/// Brush falloff with adjustable hardness: 1 inside `hardness * radius`,
-/// easing to 0 at the radius.
-fn falloff(d: f32, radius: f32, hardness: f32) -> f32 {
-    let inner = radius * hardness.clamp(0.0, 0.95);
-    if d <= inner {
-        return 1.0;
-    }
-    let t = ((d - inner) / (radius - inner)).clamp(0.0, 1.0);
-    let s = 1.0 - t;
-    s * s * (3.0 - 2.0 * s)
-}
-
 /// Applies one paint stroke (and its mirror) to the clay.
+#[cfg(test)]
 pub fn stroke(clay: &mut Clay, s: &PaintStroke) -> Result<usize, String> {
     if s.points.is_empty() || s.points.len() > MAX_POINTS {
         return Err(format!("a stroke needs 1 to {MAX_POINTS} points"));
@@ -327,24 +405,47 @@ pub fn stroke(clay: &mut Clay, s: &PaintStroke) -> Result<usize, String> {
         (false, Some(c)) => Vec3::from(c).clamp(Vec3::ZERO, Vec3::ONE),
         (false, None) => return Err("a paint stroke needs color [r, g, b] (or erase: true)".into()),
     };
+    let opacity = if s.strength.is_finite() { s.strength.clamp(0.0, 1.0) } else { 1.0 };
+    let mut dabs = vec![Dab::path(s.points.clone(), s.radius)];
+    if s.mirror {
+        dabs.push(Dab::path(s.points.iter().map(|p| Vec3::new(-p.x, p.y, p.z)).collect(), s.radius));
+    }
+    paint_dabs(clay, &PaintParams { color, erase: s.erase, opacity, curve: Curve::Hardness(s.hardness) }, s.mask.as_ref(), &dabs, &crate::sculpt::engine::Gate::default(), None)
+}
+
+/// Lays resolved dabs (see `brush::resolve`) of `params`' color, or
+/// erases, on the clay's paint layer; returns the grid points touched.
+/// Path dabs paint along their whole path; weights follow the falloff
+/// curve and any pressure along the path, times the gate (the persistent
+/// mask and hidden groups) and, for a paint stroke with an alpha, the
+/// image under each dab.
+pub fn paint_dabs(clay: &mut Clay, params: &PaintParams, mask: Option<&StrokeMask>, dabs: &[Dab], gate: &Gate, alpha: Option<(&Alpha, &AlphaParams)>) -> Result<usize, String> {
     let mut paint = layer(clay)?;
     let voxel = paint.grid().voxel;
-    let radius = s.radius.max(voxel);
-    let strength = if s.strength.is_finite() { s.strength.clamp(0.0, 1.0) } else { 1.0 };
-    let mut paths = vec![s.points.clone()];
-    if s.mirror {
-        paths.push(s.points.iter().map(|p| Vec3::new(-p.x, p.y, p.z)).collect());
-    }
     // Paint only matters at the surface: visit tiles near it, so a wide
     // brush on a fine grid stays cheap.
     let field = crate::clay::Field::new(clay, voxel);
-    let carved = clay.detail.as_ref().map_or(0.0, |d| d.grid().max_abs());
+    let carved = crate::layers::surface_detail(clay).map_or(0.0, |d| d.grid().max_abs());
     // Mesh vertices sit up to about half a mesh cell off the true surface.
     let band = 0.5 * clay.cell_size().unwrap_or(voxel) + 2.0 * voxel + carved;
     let mut touched = 0;
     let mut visited = 0usize;
     let g = paint.grid_mut();
-    for path in &paths {
+    for dab in dabs {
+        let path = &dab.points;
+        if path.is_empty() || !path.iter().all(|p| p.is_finite()) || !dab.radius.is_finite() || dab.radius <= 0.0 {
+            return Err("points and radius must be finite, radius > 0".into());
+        }
+        dab.check()?;
+        let radius = dab.radius.max(voxel);
+        let sweep = Sweep { points: path, radius, radii: dab.radii.as_ref().map(|r| r.iter().map(|r| r.max(voxel)).collect()), gains: dab.gains.as_deref() };
+        let strength = params.opacity * dab.gain;
+        let stamp = alpha.map(|(image, a)| {
+            let c = path[0];
+            let n = dab.normal.filter(|n| n.is_finite() && n.length() > 1e-6).map(|n| n.normalize()).unwrap_or_else(|| field.sculpt_normal(c, &field.near(c - radius, c + radius), voxel));
+            let (u, v) = if a.mode == Mode::Drag { frame(n, dab.tangent, dab.flip, a.rotate) } else { frame(n, Some(dab.upright.unwrap_or(Vec3::X)), dab.flip, a.rotate) };
+            Stamp { alpha: image, params: a, center: c, u, v, half: radius * a.scale }
+        });
         let (lo, hi) = path.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(*p), b.max(*p)));
         let cells = ((hi - lo + 2.0 * radius) / voxel + 2.0).as_dvec3();
         if !cells.is_finite() || cells.x * cells.y * cells.z > MAX_BOX {
@@ -361,7 +462,7 @@ pub fn stroke(clay: &mut Clay, s: &PaintStroke) -> Result<usize, String> {
                     let (blo, bhi) = (c0.as_vec3() * voxel, c1.as_vec3() * voxel);
                     let half = (bhi - blo).length() * 0.5;
                     let center = (blo + bhi) * 0.5;
-                    if path_distance(center, path) > radius + half {
+                    if sweep.distance(center) > radius + half {
                         continue;
                     }
                     let list = field.near(blo - band, bhi + band);
@@ -376,16 +477,24 @@ pub fn stroke(clay: &mut Clay, s: &PaintStroke) -> Result<usize, String> {
                         for y in c0.y..=c1.y {
                             for x in c0.x..=c1.x {
                                 let p = IVec3::new(x, y, z).as_vec3() * voxel;
-                                let w = falloff(path_distance(p, path), radius, s.hardness) * strength;
+                                let mut w = (sweep.weight(&params.curve, p) * strength).min(1.0);
+                                if let Some(s) = &stamp {
+                                    w *= s.mask(p);
+                                }
+                                if w > 0.0 && gate.points() {
+                                    w *= gate.at(p);
+                                }
                                 if w <= 0.0 {
                                     continue;
                                 }
-                                if s.mask.as_ref().is_some_and(|m| m.above.is_some_and(|y|p.y<y) || m.below.is_some_and(|y|p.y>y) || m.blobs.as_ref().is_some_and(|names| !field.nearest_named(p,names))) { continue; }
+                                if !allowed(mask, &field, p) {
+                                    continue;
+                                }
                                 touched += 1;
-                                if s.erase {
+                                if params.erase {
                                     g.erase([x, y, z], w);
                                 } else {
-                                    g.over([x, y, z], color, w);
+                                    g.over([x, y, z], params.color, w);
                                 }
                             }
                         }

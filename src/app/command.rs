@@ -266,7 +266,7 @@ impl ClideApp {
             }
             "file" if flag(&["-new"]) => {
                 // Undoable here (unlike File > New), so a stray command is recoverable.
-                self.scene = Scene::default();
+                self.replace_scene(Scene::default());
                 self.selection.clear();
                 ok()
             }

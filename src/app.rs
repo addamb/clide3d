@@ -19,29 +19,47 @@ use crate::render;
 use crate::scene::{Scene, Shape};
 use hotkeys::{Action, HotkeyEditor, Hotkeys};
 
+mod alphas;
 mod anim;
+mod brush;
 mod chrome;
 mod cinema;
 mod envtools;
 mod command;
 mod eyes;
+#[cfg(test)]
+pub(crate) use eyes::{BACKGROUND, contact_sheet, scene_callback_of};
 mod game;
 mod garments;
 mod fires;
+pub(crate) mod history;
 mod hotkeys;
+mod hud;
+mod importing;
 mod icons;
 mod jobs;
+mod layering;
+mod leveling;
 mod look;
+mod masking;
 mod panels;
+mod pen_macos;
 mod people;
 mod posing;
 mod probe;
-mod theme;
+mod quicksave;
+mod recorder;
+pub(crate) mod theme;
 mod timeline;
 pub(crate) mod tools;
 mod viewport;
 #[cfg(test)]
+mod live_tests;
+#[cfg(test)]
 mod speed_checks;
+#[cfg(test)]
+mod stage7_tests;
+mod strokes;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tool {
@@ -49,6 +67,14 @@ enum Tool {
     Move,
     Rotate,
     Scale,
+    /// Drag on a clay to record a sculpt stroke (see `recorder.rs`).
+    Sculpt,
+    /// Drag on a clay to record a paint stroke.
+    Paint,
+    /// Drag on a clay to paint the sculpt mask (Alt erases, Shift lassos).
+    Mask,
+    /// Drag on a clay to paint a polygroup.
+    Groups,
 }
 
 impl Tool {
@@ -58,6 +84,10 @@ impl Tool {
             Tool::Move => "Move Tool: Use manipulator to move object(s). Hold X to snap to the grid, D to move the pivot.",
             Tool::Rotate => "Rotate Tool: Use manipulator to rotate object(s). Hold X to snap to 15°.",
             Tool::Scale => "Scale Tool: Use manipulator to scale object(s).",
+            Tool::Sculpt => "Sculpt Tool: drag on a clay to sculpt (the stroke shows as you draw and applies when you let go). Shift smooths, Alt inverts, Ctrl masks, Ctrl+Shift lassos the mask. S, U, O + drag: size, strength, focal; X: symmetry. Right-drag orbits.",
+            Tool::Paint => "Paint Tool: drag on a clay to paint with the brush color (Alt erases). Right-drag orbits.",
+            Tool::Mask => "Mask Tool: drag on a clay to paint the sculpt mask; Alt erases, Shift draws a lasso. Right-drag orbits.",
+            Tool::Groups => "Groups Tool: drag on a clay to paint the HUD's polygroup. Right-drag orbits.",
         }
     }
 }
@@ -82,6 +112,8 @@ enum DragMode {
     Dolly,
     /// Left drag without Alt: a click picks, a drag draws a selection box.
     Click,
+    /// Left drag with the Sculpt or Paint tool: records a stroke.
+    Stroke,
 }
 
 struct ViewDrag {
@@ -124,6 +156,24 @@ pub struct ClideApp {
     pivot_mode: bool,
     shading: Shading,
     show_grid: bool,
+    /// Key-light shadows in the viewport and its screenshots.
+    shadows: render::Shadows,
+    /// HDR finishing (bloom, exposure, tonemap) of the viewport and its
+    /// screenshots, and the `set_display.post` settings it came from.
+    view_look: render::post::ViewLook,
+    view_post: serde_json::Value,
+    /// What lights the viewport and its screenshots (render_film's
+    /// environment and lights), and the `set_display.lighting` it came from.
+    view_lighting: std::sync::Arc<crate::view_light::ViewLighting>,
+    view_lighting_args: serde_json::Value,
+    /// Screen-space ambient occlusion in the viewport and its screenshots.
+    ao: render::Ao,
+    /// MatCap shading in the viewport and its screenshots (None: off), and
+    /// the matcap `set_display shading: matcap` turns on.
+    matcap: Option<std::sync::Arc<render::matcap::Matcap>>,
+    matcap_choice: std::sync::Arc<render::matcap::Matcap>,
+    /// The last render_film's arguments (`set_display lighting: "film"`).
+    last_film_args: Option<serde_json::Value>,
     /// Draw rig skeletons in the viewport.
     show_bones: bool,
     /// One manipulator per view pane; each keeps its own drag state.
@@ -164,15 +214,27 @@ pub struct ClideApp {
     help: String,
     hotkeys: Hotkeys,
     hotkey_editor: HotkeyEditor,
+    /// The Remesh as Clay… dialog, while open.
+    remesh_dialog: Option<importing::RemeshDialog>,
 
-    undo: Vec<Scene>,
-    redo: Vec<Scene>,
+    /// Undo and redo, one labelled step per agent call or UI edit.
+    history: history::History,
+    /// The scene as of the last recorded step this frame: what the next
+    /// step is measured against.
+    step_base: Scene,
+    /// Label for the UI step this frame records (new scene, open ...),
+    /// and whether it leaves the scene saved (a new or opened file).
+    ui_label: Option<String>,
+    ui_clean: bool,
     /// True while one continuous edit (a drag, a focused text box) is running,
     /// so the whole edit becomes a single undo step.
     edit_session: bool,
     /// Counts undo/redo jumps, so the frame's undo diff does not record a jump
     /// as an edit. (The undo + redo lengths alone do not change on a jump.)
     history_jumps: u64,
+    /// Counts scene replacements (new, open) and history jumps, after which
+    /// an object id may name a different object (ids are reused).
+    scene_generation: u64,
 
     file_path: Option<PathBuf>,
     dirty: bool,
@@ -192,9 +254,53 @@ pub struct ClideApp {
     viewport_rect: Rect,
     /// Image the agent is sculpting from (see `eyes.rs`).
     reference: Option<eyes::Reference>,
+    /// Ledger replay checkpoints (never saved, never undone).
+    replay_cache: std::sync::Arc<crate::ledger::ReplayCache>,
+    /// The newest stroke per clay object, for Adjust Last.
+    last_deltas: std::collections::HashMap<u64, crate::ledger::LastDelta>,
+    /// A gizmo drag on a masked clay: (object, transform at the press,
+    /// transform now). The clay does not move while it drags; on release
+    /// it sends `sculpt {brush: transform}` (the masked transform).
+    masked_drag: Option<(u64, transform_gizmo_egui::math::Transform, transform_gizmo_egui::math::Transform)>,
+    quicksave: quicksave::QuickSave,
+    /// The Sculpt and Paint tools' brush (`brush_preset get_current`).
+    brush: recorder::CurrentBrush,
+    /// The stroke being drawn (the button is down).
+    capture: Option<recorder::Capture>,
+    /// Released strokes waiting to be sent, oldest first.
+    strokes: std::collections::VecDeque<recorder::Capture>,
+    /// The tool requests the human's strokes sent, newest last.
+    ui_activity: std::collections::VecDeque<recorder::UiActivity>,
+    /// Who sent the tool call running now (records name it).
+    call_source: crate::ledger::Source,
+    /// The layer the editor's Sculpt and Paint tools stroke, per clay
+    /// (`sculpt_layer select`; editor state, never an undo step).
+    layer_selection: std::collections::HashMap<u64, String>,
+    /// Strokes sent whose previews show until their requests install.
+    lives: Vec<brush::Live>,
+    /// Numbers previews across strokes.
+    preview_seq: u64,
+    /// Milliseconds from a sample to its preview's chunks being ready to
+    /// draw (the newest few thousand).
+    preview_latency: Vec<f64>,
+    /// How long each preview took its worker (ms), the newest few thousand.
+    preview_work_ms: Vec<f64>,
+    /// Previews checked against their records, and how many differed.
+    preview_checks: (usize, usize),
+    /// Asks the window to draw again (preview workers).
+    repaint: egui::Context,
+    /// Draw the brush ring (`set_display brush_cursor`).
+    show_brush_cursor: bool,
+    /// The HUD's sliders and the brush hotkeys being dragged.
+    hud: hud::HudState,
 }
 
 const HOTKEYS_KEY: &str = "hotkeys";
+/// The actions the saved hotkeys knew (later ones get their defaults).
+const HOTKEYS_KNOWN_KEY: &str = "hotkeys_known";
+const QUICKSAVE_KEY: &str = "quicksave";
+/// The brush tools' macOS tablet monitor (`brush_preset set_current tablet`).
+const TABLET_KEY: &str = "tablet";
 
 impl ClideApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -207,8 +313,26 @@ impl ClideApp {
             Ok((rx, url)) => (Some(rx), format!("MCP: {url}")),
             Err(e) => (None, format!("MCP off ({e})")),
         };
-        let hotkeys = cc.storage.and_then(|s| eframe::get_value(s, HOTKEYS_KEY)).unwrap_or_default();
+        let hotkeys = match cc.storage.and_then(|s| eframe::get_value::<Hotkeys>(s, HOTKEYS_KEY)) {
+            Some(saved) => {
+                // Saved before the list was kept: every action but the
+                // brush tools' level steps and X symmetry was known.
+                let known = cc.storage.and_then(|s| eframe::get_value::<Vec<Action>>(s, HOTKEYS_KNOWN_KEY)).unwrap_or_else(|| Action::ALL.into_iter().filter(|a| !matches!(a, Action::LevelFiner | Action::LevelCoarser | Action::SymmetryX)).collect());
+                saved.with_new_defaults(&known)
+            }
+            None => Hotkeys::default(),
+        };
+        let quicksave_on = cc.storage.and_then(|s| eframe::get_value(s, QUICKSAVE_KEY)).unwrap_or(true);
+        let mut app = Self::with(meshes, rs.clone(), mcp_rx, mcp_status, hotkeys, quicksave_on);
+        // The tablet monitor, if it was on (opt-in; the window's thread).
+        if cc.storage.and_then(|s| eframe::get_value::<bool>(s, TABLET_KEY)).unwrap_or(false) {
+            app.brush.tablet = pen_macos::set_enabled(true).is_ok();
+        }
+        app
+    }
 
+    /// The editor around a render state `render::init` has set up.
+    fn with(meshes: MeshLib, render_state: egui_wgpu::RenderState, mcp_rx: Option<Receiver<ToolCall>>, mcp_status: String, hotkeys: Hotkeys, quicksave_on: bool) -> Self {
         Self {
             // Empty, like Maya: agents build everything themselves.
             scene: Scene::default(),
@@ -220,10 +344,19 @@ impl ClideApp {
             pivot_mode: false,
             shading: Shading::Shaded,
             show_grid: true,
+            shadows: render::Shadows::default(),
+            view_look: render::post::ViewLook::default(),
+            view_post: serde_json::json!({}),
+            view_lighting: crate::view_light::ViewLighting::studio_default(),
+            view_lighting_args: serde_json::json!("studio"),
+            ao: render::Ao::default(),
+            matcap: None,
+            matcap_choice: render::matcap::Matcap::builtin("clay").expect("built in"),
+            last_film_args: None,
             show_bones: true,
             gizmos: (0..render::SLOTS).map(|_| Gizmo::default()).collect(),
             meshes,
-            render_state: rs.clone(),
+            render_state,
             view_drag: None,
             zoom_anchor: None,
             four_view: false,
@@ -248,10 +381,14 @@ impl ClideApp {
             help: String::new(),
             hotkeys,
             hotkey_editor: HotkeyEditor::default(),
-            undo: Vec::new(),
-            redo: Vec::new(),
+            remesh_dialog: None,
+            history: history::History::default(),
+            step_base: Scene::default(),
+            ui_label: None,
+            ui_clean: false,
             edit_session: false,
             history_jumps: 0,
+            scene_generation: 0,
             file_path: None,
             dirty: false,
             title: String::new(),
@@ -263,7 +400,33 @@ impl ClideApp {
             next_shot_id: 0,
             viewport_rect: Rect::NOTHING,
             reference: None,
+            replay_cache: Default::default(),
+            last_deltas: Default::default(),
+            masked_drag: None,
+            quicksave: quicksave::QuickSave::new(quicksave_on),
+            brush: Default::default(),
+            capture: None,
+            strokes: std::collections::VecDeque::new(),
+            ui_activity: Default::default(),
+            call_source: crate::ledger::Source::Agent,
+            layer_selection: Default::default(),
+            lives: Vec::new(),
+            preview_seq: 0,
+            preview_latency: Vec::new(),
+            preview_work_ms: Vec::new(),
+            preview_checks: (0, 0),
+            repaint: egui::Context::default(),
+            show_brush_cursor: true,
+            hud: Default::default(),
         }
+    }
+
+    /// A windowless editor for tests: agent calls arrive on the returned
+    /// sender as if from the MCP server. QuickSave is off.
+    #[cfg(test)]
+    pub(crate) fn headless(rs: egui_wgpu::RenderState) -> (Self, std::sync::mpsc::Sender<ToolCall>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (Self::with(MeshLib::new(), rs, Some(rx), "MCP: test".into(), Hotkeys::default(), false), tx)
     }
 
     // ---------- selection ----------
@@ -305,10 +468,12 @@ impl ClideApp {
         }
     }
 
-    /// Drops ids that no longer exist (after undo, delete, ...).
+    /// Drops ids that no longer exist (after undo, delete, ...), and
+    /// layer selections the scene no longer has (`prune_layer_selection`).
     fn prune_selection(&mut self) {
         let scene = &self.scene;
         self.selection.retain(|&id| scene.get(id).is_some());
+        prune_layer_selection(&mut self.layer_selection, scene);
     }
 
     fn select_all(&mut self) {
@@ -474,56 +639,118 @@ impl ClideApp {
     /// One undo step per continuous edit; `before` is the scene before it.
     fn record_edit(&mut self, before: Scene) {
         if !self.edit_session {
-            self.undo.push(before);
-            self.redo.clear();
+            let label = self.ui_label.take().unwrap_or_else(|| "edit [ui]".into());
+            self.history.push(before, &self.scene, history::StepInfo::new(label, "ui", Vec::new()));
             self.edit_session = true;
         }
-        self.dirty = true;
+        self.ui_label = None;
+        self.dirty = !std::mem::take(&mut self.ui_clean);
+        self.quicksave.pending = true;
+    }
+
+    /// Records the UI's changes since the last step (before an agent call
+    /// runs, so the call's step holds only the call's changes).
+    fn flush_ui_step(&mut self) {
+        if edited(&self.step_base, &self.scene) {
+            crate::pose::sync(&mut self.scene);
+            let before = std::mem::take(&mut self.step_base);
+            self.record_edit(before);
+        }
+        self.step_base = self.scene.clone();
+    }
+
+    /// Records what a tool call (or a job's finisher) changed as one
+    /// step labelled `label`. `jumps` is `history_jumps` before the call:
+    /// undo, redo and history goto calls are jumps, not edits. A UI
+    /// stroke's request is a call too, from `Source::Ui`.
+    fn agent_step(&mut self, tool: &str, label: String, jumps: u64, source: crate::ledger::Source) {
+        if self.history_jumps == jumps && edited(&self.step_base, &self.scene) {
+            crate::pose::sync(&mut self.scene);
+            let before = std::mem::take(&mut self.step_base);
+            let ui_call = source == crate::ledger::Source::Ui;
+            let source = if ui_call { "ui" } else if self.edit_session { "agent+ui" } else { "agent" };
+            let label = if self.edit_session && !ui_call { label.replace("[agent]", "[agent+ui]") } else { label };
+            self.history.push(before, &self.scene, history::StepInfo::new(label, source, vec![tool.to_string()]));
+            // A UI drag going on goes on as a step of its own.
+            self.edit_session = false;
+            self.dirty = true;
+            self.quicksave.pending = true;
+        }
+        self.step_base = self.scene.clone();
     }
 
     fn undo(&mut self) {
-        if let Some(prev) = self.undo.pop() {
-            let playing = active_clips(&self.scene);
-            self.redo.push(std::mem::replace(&mut self.scene, prev));
+        let playing = active_clips(&self.scene);
+        let levels = leveling::active_levels(&self.scene);
+        if self.history.undo(&mut self.scene) {
             set_active_clips(&mut self.scene, &playing);
+            leveling::set_active_levels(&mut self.scene, &levels);
             self.after_history_jump();
         }
     }
 
     fn redo(&mut self) {
-        if let Some(next) = self.redo.pop() {
-            let playing = active_clips(&self.scene);
-            self.undo.push(std::mem::replace(&mut self.scene, next));
+        let playing = active_clips(&self.scene);
+        let levels = leveling::active_levels(&self.scene);
+        if self.history.redo(&mut self.scene) {
             set_active_clips(&mut self.scene, &playing);
+            leveling::set_active_levels(&mut self.scene, &levels);
             self.after_history_jump();
         }
     }
 
+    /// Undoes or redoes to snapshot `n` (see `history.rs`).
+    fn history_goto(&mut self, n: u64) -> Result<(), String> {
+        let playing = active_clips(&self.scene);
+        let levels = leveling::active_levels(&self.scene);
+        self.history.goto(n, &mut self.scene)?;
+        set_active_clips(&mut self.scene, &playing);
+        leveling::set_active_levels(&mut self.scene, &levels);
+        self.after_history_jump();
+        Ok(())
+    }
+
     fn after_history_jump(&mut self) {
         self.history_jumps += 1;
+        self.scene_generation += 1;
         self.edit_session = false;
         self.prune_selection();
         self.dirty = true;
+        self.quicksave.pending = true;
+        self.step_base = self.scene.clone();
     }
 
+    /// Swaps in a whole new scene (new, open). Ids in it may name other
+    /// objects than before.
+    fn replace_scene(&mut self, scene: Scene) {
+        self.scene = scene;
+        self.scene_generation += 1;
+        // Its ids name other objects: no layer stays selected.
+        self.layer_selection.clear();
+    }
+
+    /// File > New: an undoable step, like the agent's new_scene.
     fn new_scene(&mut self) {
-        self.scene = Scene::default();
+        self.replace_scene(Scene::default());
         self.selection.clear();
-        self.undo.clear();
-        self.redo.clear();
+        self.ui_label = Some("new scene [ui]".into());
+        self.ui_clean = true;
         self.file_path = None;
         self.dirty = false;
         self.status = "New scene".into();
     }
 
+    /// File > Open: an undoable step, like the agent's open_scene.
     fn open(&mut self) {
         let Some(path) = rfd::FileDialog::new().add_filter("Clide3D scene", &["json"]).pick_file() else {
             return;
         };
         match tools::load_scene(&path) {
             Ok(scene) => {
-                self.new_scene();
-                self.scene = scene;
+                self.replace_scene(scene);
+                self.selection.clear();
+                self.ui_label = Some(format!("open {} [ui]", path.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned())));
+                self.ui_clean = true;
                 self.fit_range_to_clips();
                 self.status = format!("Opened {}", path.display());
                 self.file_path = Some(path);
@@ -573,8 +800,7 @@ impl ClideApp {
     }
 
     fn save_to(&mut self, path: PathBuf) -> Result<(), String> {
-        let json = serde_json::to_string_pretty(&self.scene).map_err(|e| e.to_string())?;
-        std::fs::write(&path, json).map_err(|e| format!("{}: {e}", path.display()))?;
+        write_scene(&self.scene, &path)?;
         self.dirty = false;
         self.status = format!("Saved {}", path.display());
         self.file_path = Some(path);
@@ -649,6 +875,17 @@ impl ClideApp {
             Action::PlayToggle => {
                 self.timeline.playing = if self.timeline.playing.is_some() { None } else { Some(1.0) };
             }
+            // Over a view, with a brush tool (`brush_keys` has the rest).
+            Action::LevelFiner | Action::LevelCoarser => {
+                if self.stroke_tool() && self.hover_view.is_some() {
+                    self.step_level(if action == Action::LevelFiner { 1 } else { -1 });
+                }
+            }
+            Action::SymmetryX => {
+                if self.stroke_tool() && self.hover_view.is_some() {
+                    self.toggle_symmetry_x();
+                }
+            }
             Action::GridSnapHold | Action::PivotHold => {}
         }
     }
@@ -656,6 +893,17 @@ impl ClideApp {
     /// True while a hold-type hotkey is down (ignored while typing).
     fn holding(&self, ctx: &egui::Context, action: Action) -> bool {
         !ctx.wants_keyboard_input() && !self.hotkey_editor.open && self.hotkeys.held(ctx, action)
+    }
+
+    /// True while Edit Pivot is held. Brush tools have no manipulator, and
+    /// their D steps the detail level instead.
+    fn pivot_held(&self, ctx: &egui::Context) -> bool {
+        !self.stroke_tool() && self.holding(ctx, Action::PivotHold)
+    }
+
+    /// True while Snap to Grid is held; brush tools' X toggles symmetry.
+    fn snap_held(&self, ctx: &egui::Context) -> bool {
+        !self.stroke_tool() && self.holding(ctx, Action::GridSnapHold)
     }
 
     fn update_title(&mut self, ctx: &egui::Context) {
@@ -674,18 +922,53 @@ impl ClideApp {
 
 impl eframe::App for ClideApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.frame(ctx);
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, HOTKEYS_KEY, &self.hotkeys);
+        eframe::set_value(storage, HOTKEYS_KNOWN_KEY, &Action::ALL.to_vec());
+        eframe::set_value(storage, QUICKSAVE_KEY, &self.quicksave.enabled);
+        eframe::set_value(storage, TABLET_KEY, &self.brush.tablet);
+    }
+}
+
+impl ClideApp {
+    /// One frame of the editor (tests drive it with synthetic input).
+    fn frame(&mut self, ctx: &egui::Context) {
+        self.repaint = ctx.clone();
         self.history_shortcuts(ctx);
         let jumps = self.history_jumps;
-        let before = self.scene.clone();
+        self.step_base = self.scene.clone();
 
         self.shortcuts(ctx);
         self.tick_playback(ctx);
         self.set_frame(Some(self.timeline.frame));
+        self.brush_keys(ctx);
+        // A finished UI stroke joins the line of tool calls.
+        self.send_stroke(ctx);
         self.process_mcp(ctx);
+        self.tick_previews();
+        self.tick_hud();
+        // A sculpt tool on a clay keeps its sculpt session (chunks) going,
+        // as does a stroke still previewing on it.
+        let previewing = self.capture.iter().chain(&self.strokes).map(|c| c.target).chain(self.lives.iter().map(|l| l.target));
+        let tool_on: Vec<u64> = if self.stroke_tool() { self.selection.iter().copied().chain(previewing).collect() } else { previewing.collect() };
+        self.meshes.set_sculpt_tool(&tool_on);
+        // The clays a brush tool is on get their picking trees ready for
+        // the stroke's samples.
+        for id in &tool_on {
+            self.meshes.warm_bvh(*id);
+        }
         // Slow mesh builds run on other threads; the old meshes show meanwhile.
         self.meshes.sync_background(&self.scene);
+        // A sculpt session's chunks show as soon as they are built.
+        if self.meshes.chunks_pending() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
         self.answer_deferred(ctx);
         self.poll_jobs(ctx);
+        self.report_ui_activity();
         self.collect_screenshots(ctx);
         self.help = self.tool.help().to_string();
 
@@ -733,38 +1016,65 @@ impl eframe::App for ClideApp {
             .show(ctx, |ui| self.viewport_panel(ui));
 
         self.hotkey_editor.show(ctx, &mut self.hotkeys);
+        self.remesh_dialog_window(ctx);
         self.prune_selection();
 
-        // Record one undo step per continuous edit. A menu undo/redo changed the
+        // Record one undo step per continuous edit (agent calls recorded
+        // their own steps as they ran). A menu undo/redo changed the
         // history this frame; it is not an edit.
         let history_jumped = self.history_jumps != jumps;
-        // Which clip plays is playback, not an edit: undo skips it.
-        let mut before = before;
         // Kitbash parts follow what they sit on; linked mirror copies their
         // sources. Part of the same undo step as the edit that moved them.
-        if self.scene != before && !history_jumped {
+        if !history_jumped && edited(&self.step_base, &self.scene) {
             crate::pose::sync(&mut self.scene);
+            let before = std::mem::take(&mut self.step_base);
+            self.record_edit(before);
         }
-        if self.scene != before && !history_jumped {
-            let was = active_clips(&before);
-            set_active_clips(&mut before, &active_clips(&self.scene));
-            if self.scene != before {
-                set_active_clips(&mut before, &was);
-                self.record_edit(before);
-            }
-        }
+        // A New or Open that changed nothing labels no later edit.
+        (self.ui_label, self.ui_clean) = (None, false);
         let editing = ctx.input(|i| i.pointer.any_down()) || ctx.memory(|m| m.focused().is_some());
         if !editing {
             self.edit_session = false;
         }
+        // QuickSave backs up unsaved changes only.
+        if self.dirty {
+            self.quicksave.tick(&self.scene);
+            if let Some(wait) = self.quicksave.due_in() {
+                ctx.request_repaint_after(wait.max(std::time::Duration::from_secs(1)));
+            }
+        }
 
         self.update_title(ctx);
     }
+}
 
+/// Writes a scene file (Save, Save As, save_scene and QuickSave).
+pub(crate) fn write_scene(scene: &Scene, path: &std::path::Path) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(scene).map_err(|e| e.to_string())?;
+    std::fs::write(path, json).map_err(|e| format!("{}: {e}", path.display()))
+}
 
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, HOTKEYS_KEY, &self.hotkeys);
+/// Whether `after` differs from `before` by an edit. Which clip plays is
+/// playback, not an edit: undo skips it.
+/// Keeps the editor's layer selections (`sculpt_layer select`) the scene
+/// still has: the object is a clay with a layer of that name. An undo of
+/// a rename or an add takes the name away, so a stroke is never sent to a
+/// layer other than the one shown as selected (or quietly to base).
+fn prune_layer_selection(selection: &mut std::collections::HashMap<u64, String>, scene: &Scene) {
+    selection.retain(|id, name| scene.get(*id).and_then(|o| o.clay.as_ref()).is_some_and(|c| crate::layers::kind_of(c, name).is_ok()));
+}
+
+fn edited(before: &Scene, after: &Scene) -> bool {
+    if before == after {
+        return false;
     }
+    let playing = active_clips(after);
+    if playing == active_clips(before) {
+        return true;
+    }
+    let mut b = before.clone();
+    set_active_clips(&mut b, &playing);
+    b != *after
 }
 
 /// The clip each rig plays, by object id.

@@ -651,7 +651,7 @@ fn closeup_substrate_and_markings_survive_fast_exact_bake_and_glb() {
                 file_stem: String::new(),
                 lods: false,
                 atlas: false,
-                texel_density: None,
+                texel_density: None, gpu_instancing: false, blend_shapes: Vec::new(),
             },
         )
         .unwrap();

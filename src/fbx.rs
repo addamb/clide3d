@@ -207,13 +207,16 @@ struct Builder {
     files: Vec<(String, Vec<u8>)>,
     /// Written texture sets: (source, [color, normal] Texture ids).
     texture_sets: Vec<(Arc<Textures>, [i64; 2])>,
-    /// Geometry written for scatter sources: object id -> (geometry, its
-    /// materials), so every copy's Model shares them (FBX instancing).
-    shared: std::collections::HashMap<u64, (i64, Vec<i64>)>,
+    /// Geometry written for unskinned Models, with what it was written
+    /// from (mesh, tint, own material) and its materials: scattered copies
+    /// and identical clay objects share them (FBX instancing).
+    shared: Vec<SharedGeometry>,
     /// Materials made by the last `mesh` call.
     last_materials: Vec<i64>,
     /// Triangles of each LOD written: (object, [LOD1, LOD2, LOD3]).
     lods: Vec<(String, Vec<usize>)>,
+    /// Blend shapes written: (object, shape name).
+    shapes_written: Vec<(u64, String)>,
 }
 
 impl Builder {
@@ -303,6 +306,23 @@ impl Builder {
         let ids = [self.texture(&format!("{safe}_color"), &t.color, t.size, t.alpha)?, self.texture(&format!("{safe}_normal"), &t.normal, t.size, false)?];
         self.texture_sets.push((t.clone(), ids));
         Ok(ids)
+    }
+
+    /// Links `model` to Geometry (and materials) already written from the
+    /// same mesh, tint and material, else writes them.
+    fn shared_mesh(&mut self, name: &str, mesh: &Arc<Mesh>, tint: [f32; 3], own: &Material, model: i64) -> Result<i64, String> {
+        if let Some((_, _, _, geo, mats)) = self.shared.iter().find(|(a, t, o, _, _)| Arc::ptr_eq(a, mesh) && t.map(f32::to_bits) == tint.map(f32::to_bits) && o == own).cloned() {
+            self.link(geo, model);
+            for m in mats {
+                self.link(m, model);
+            }
+            self.vertices += mesh.vertices.len();
+            self.triangles += mesh.indices.len() / 3;
+            return Ok(geo);
+        }
+        let geo = self.mesh(name, mesh, tint, own, model)?;
+        self.shared.push((mesh.clone(), tint, own.clone(), geo, self.last_materials.clone()));
+        Ok(geo)
     }
 
     fn mesh(&mut self, name: &str, mesh: &Mesh, tint: [f32; 3], own: &Material, model: i64) -> Result<i64, String> {
@@ -463,6 +483,10 @@ impl Builder {
     }
 }
 
+/// Geometry written once: (mesh, tint, own material, Geometry id, its
+/// Material ids).
+type SharedGeometry = (Arc<Mesh>, [f32; 3], Material, i64, Vec<i64>);
+
 /// glam rotation -> FBX "Lcl Rotation" (XYZ order: X turns first), degrees.
 fn euler_degrees(q: Quat) -> Vec3 {
     let (z, y, x) = q.to_euler(EulerRot::ZYX);
@@ -522,11 +546,14 @@ pub fn export(scene: &Scene, meshes: &MeshLib, opts: &Options) -> Result<crate::
             Some(m) if opts.lods && m.textures.is_some() && cache.is_none() => crate::bake::lods(m, skin.as_deref()),
             _ => Vec::new(),
         };
+        // Blend shapes of this object's mesh (`layers::project_shape`).
+        let shapes: Vec<&crate::gltf::BlendShape> = opts.blend_shapes.iter().filter(|s| s.object == id && mesh.as_ref().is_some_and(|m| m.vertices.len() == s.deltas.len())).collect();
         let model = match (&mesh, rig, skin) {
             (Some(mesh), Some(rig), Some(skin)) if lods.is_empty() => {
                 let holder = b.model(&o.name, "Null", local, parent);
                 let mesh_model = b.model(&format!("{}_mesh", o.name), "Mesh", Mat4::IDENTITY, holder);
                 let geo = b.mesh(&o.name, mesh, o.color, &scene.material_of(o), mesh_model)?;
+                blend_shapes(&mut b, id, &o.name, geo, &shapes);
                 bind_pose.push((mesh_model, world));
                 add_rig(&mut b, o.id, &o.name, rig, &[(geo, &skin)], holder, world, &mut bind_pose, opts);
                 holder
@@ -539,6 +566,8 @@ pub fn export(scene: &Scene, meshes: &MeshLib, opts: &Options) -> Result<crate::
                     let mesh_model = b.model(&format!("{}_LOD{k}", o.name), "Mesh", Mat4::IDENTITY, group);
                     let counts = (b.vertices, b.triangles);
                     let geo = b.mesh(&format!("{}_LOD{k}", o.name), m, o.color, &scene.material_of(o), mesh_model)?;
+                    // The shapes were fitted to LOD0's vertices: LOD1-3 have others.
+                    if k == 0 { blend_shapes(&mut b, id, &o.name, geo, &shapes); }
                     if k > 0 { (b.vertices, b.triangles) = counts; }
                     bind_pose.push((mesh_model, world));
                     if let Some(s) = s { geos.push((geo, s)); }
@@ -552,15 +581,22 @@ pub fn export(scene: &Scene, meshes: &MeshLib, opts: &Options) -> Result<crate::
                 for (k, m) in std::iter::once(mesh.as_ref()).chain(lods.iter().map(|l| &l.0)).enumerate() {
                     let model = b.model(&format!("{}_LOD{k}", o.name), "Mesh", Mat4::IDENTITY, group);
                     let counts = (b.vertices, b.triangles);
-                    b.mesh(&format!("{}_LOD{k}", o.name), m, o.color, &scene.material_of(o), model)?;
+                    let geo = b.mesh(&format!("{}_LOD{k}", o.name), m, o.color, &scene.material_of(o), model)?;
+                    if k == 0 { blend_shapes(&mut b, id, &o.name, geo, &shapes); }
                     if k > 0 { (b.vertices, b.triangles) = counts; }
                 }
                 b.lods.push((o.name.clone(), lods.iter().map(|l| l.0.indices.len() / 3).collect()));
                 group
             }
+            (Some(mesh), _, _) if !shapes.is_empty() => {
+                let model = b.model(&o.name, "Mesh", local, parent);
+                let geo = b.mesh(&o.name, mesh, o.color, &scene.material_of(o), model)?;
+                blend_shapes(&mut b, id, &o.name, geo, &shapes);
+                model
+            }
             (Some(mesh), _, _) => {
                 let model = b.model(&o.name, "Mesh", local, parent);
-                b.mesh(&o.name, mesh, o.color, &scene.material_of(o), model)?;
+                b.shared_mesh(&o.name, mesh, o.color, &scene.material_of(o), model)?;
                 model
             }
             (None, _, _) => b.model(&o.name, "Null", local, parent),
@@ -572,21 +608,7 @@ pub fn export(scene: &Scene, meshes: &MeshLib, opts: &Options) -> Result<crate::
                 let Some(src) = sc.sources.get(inst.source as usize).and_then(|&id| scene.get(id)) else { continue };
                 let Some(src_mesh) = meshes.get(src).filter(|m| !m.vertices.is_empty()) else { continue };
                 let copy = b.model(&format!("{}_{i}", src.name), "Mesh", inst.matrix() * crate::envkit::scatter::source_shape(src), model);
-                match b.shared.get(&src.id).cloned() {
-                    Some((geo, mats)) => {
-                        b.link(geo, copy);
-                        for m in mats {
-                            b.link(m, copy);
-                        }
-                        b.vertices += src_mesh.vertices.len();
-                        b.triangles += src_mesh.indices.len() / 3;
-                    }
-                    None => {
-                        let geo = b.mesh(&src.name, src_mesh, src.color, &scene.material_of(src), copy)?;
-                        let mats = b.last_materials.clone();
-                        b.shared.insert(src.id, (geo, mats));
-                    }
-                }
+                b.shared_mesh(&src.name, src_mesh, src.color, &scene.material_of(src), copy)?;
             }
         }
         for c in scene.children(Some(id)).into_iter().rev() {
@@ -703,6 +725,7 @@ pub fn export(scene: &Scene, meshes: &MeshLib, opts: &Options) -> Result<crate::
         "triangles": b.triangles,
         "skins": b.skins,
         "geometries": b.counts.get("Geometry").copied().unwrap_or(0),
+        "blend_shapes": b.shapes_written.len(),
         "animations": stacks.iter().map(|s| &s.0).collect::<Vec<_>>(),
         "skipped_hidden": skipped,
         "lods": b.lods.iter().map(|(n, t)| (n.clone(), json!({ "lod1_3_triangles": t }))).collect::<serde_json::Map<_, _>>(),
@@ -721,7 +744,35 @@ pub fn export(scene: &Scene, meshes: &MeshLib, opts: &Options) -> Result<crate::
         nc("Connections", vec![], connections),
         nc("Takes", vec![], takes),
     ];
-    Ok(crate::gltf::Export { bytes: file(&nodes), summary, files: b.files })
+    Ok(crate::gltf::Export { bytes: file(&nodes), summary, files: b.files, shapes_written: b.shapes_written })
+}
+
+/// Blend shapes on Geometry `geo`: a BlendShape deformer with one
+/// BlendShapeChannel per shape, each driving a Shape geometry of the
+/// vertices it moves (offsets, at full weight).
+fn blend_shapes(b: &mut Builder, object: u64, name: &str, geo: i64, shapes: &[&crate::gltf::BlendShape]) {
+    if shapes.is_empty() {
+        return;
+    }
+    let deformer = b.id();
+    b.add("Deformer", nc("Deformer", vec![P::I64(deformer), obj_name(name, "Deformer"), s("BlendShape")], vec![n("Version", vec![P::I32(100)])]));
+    b.link(deformer, geo);
+    for shape in shapes {
+        let label = shape.name.replace(':', "_");
+        let mut index: Vec<i32> = shape.deltas.iter().enumerate().filter(|(_, d)| d.iter().any(|x| *x != 0.0)).map(|(i, _)| i as i32).collect();
+        if index.is_empty() {
+            index.push(0);
+        }
+        let vertices: Vec<f64> = index.iter().flat_map(|&i| shape.deltas[i as usize].map(f64::from)).collect();
+        let normals = vec![0.0f64; vertices.len()];
+        let geometry = b.id();
+        b.add("Geometry", nc("Geometry", vec![P::I64(geometry), obj_name(&label, "Geometry"), s("Shape")], vec![n("Version", vec![P::I32(100)]), n("Indexes", vec![P::I32s(index)]), n("Vertices", vec![P::F64s(vertices)]), n("Normals", vec![P::F64s(normals)])]));
+        let channel = b.id();
+        b.add("Deformer", nc("Deformer", vec![P::I64(channel), obj_name(&label, "SubDeformer"), s("BlendShapeChannel")], vec![n("Version", vec![P::I32(100)]), n("DeformPercent", vec![P::F64(0.0)]), n("FullWeights", vec![P::F64s(vec![100.0])])]));
+        b.link(geometry, channel);
+        b.link(channel, deformer);
+        b.shapes_written.push((object, shape.name.clone()));
+    }
 }
 
 /// A Null model with a LodGroup attribute: its children are LOD0, LOD1...
@@ -869,7 +920,7 @@ mod tests {
         let rig = Rig {bones:vec![Bone {name:"base".into(),parent:None,head:Vec3::ZERO,tail:Vec3::Y,deform:true},Bone {name:"painted".into(),parent:Some("base".into()),head:Vec3::Y,tail:Vec3::Y*2.0,deform:true}],weights:vec![WeightStroke {bone:"painted".into(),points:vec![Vec3::ZERO],radius:1.0,strength:0.7,mode:WeightMode::Replace,space:Mat4::IDENTITY}],..Default::default()};
         let skin = crate::rig::skin(&clay,&mesh,&rig);
         let mut builder = Builder::default();
-        add_rig(&mut builder,1,"test",&rig,&[(101,&skin)],100,Mat4::IDENTITY,&mut Vec::new(),&Options {roots:Vec::new(),animations:false,fps:24.0,file_stem:String::new(),lods:false, atlas: true, texel_density: None});
+        add_rig(&mut builder,1,"test",&rig,&[(101,&skin)],100,Mat4::IDENTITY,&mut Vec::new(),&Options {roots:Vec::new(),animations:false,fps:24.0,file_stem:String::new(),lods:false, atlas: true, texel_density: None, gpu_instancing: false, blend_shapes: Vec::new()});
         let cluster = builder.objects.iter().find(|n| n.props.iter().any(|p| matches!(p, P::Str(name) if name.starts_with("painted\0"))) && n.children.iter().any(|n| n.name == "Weights")).unwrap();
         let indexes = &cluster.children.iter().find(|n| n.name == "Indexes").unwrap().props[0];
         let weights = &cluster.children.iter().find(|n| n.name == "Weights").unwrap().props[0];

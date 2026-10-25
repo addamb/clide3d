@@ -432,6 +432,11 @@ pub fn remove(scene: &mut Scene, tag: &str) -> (usize, usize) {
             let n = c.blobs.len();
             c.blobs.retain(|b| !b.name.starts_with(&prefix));
             blobs += n - c.blobs.len();
+            if n != c.blobs.len() {
+                // Inserted meshes take their assets with them (the rest
+                // stay as they were: removing never needs a new one).
+                c.prune_assets();
+            }
         }
     }
     collect_garbage(scene);

@@ -576,7 +576,7 @@ fn build(nodes: &mut Vec<Node>, order: &mut [u32], tris: &[[Vec3; 3]], start: us
 
 /// Closest point on a triangle, and which pseudo normal applies there
 /// (index into `MeshSdf::normals`: 0 face, 1..=3 edges, 4..=6 corners).
-fn closest(p: Vec3, [a, b, c]: &[Vec3; 3]) -> (Vec3, usize) {
+pub(crate) fn closest(p: Vec3, [a, b, c]: &[Vec3; 3]) -> (Vec3, usize) {
     // Ericson, Real-Time Collision Detection 5.1.5, with feature tracking.
     let (ab, ac, ap) = (*b - *a, *c - *a, p - *a);
     let (d1, d2) = (ab.dot(ap), ac.dot(ap));

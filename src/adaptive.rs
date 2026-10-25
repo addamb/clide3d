@@ -433,7 +433,7 @@ struct Crossing {
     edges: [u8; 4],
 }
 
-const OTHER: u8 = u8::MAX;
+pub(crate) const OTHER: u8 = u8::MAX;
 
 fn corner_point(c: usize) -> Vec3 {
     Vec3::new((c & 1) as f32, ((c >> 1) & 1) as f32, ((c >> 2) & 1) as f32)
@@ -442,7 +442,7 @@ fn corner_point(c: usize) -> Vec3 {
 /// A cell's 12 edges as corner pairs; corner c is at (c & 1, c >> 1 & 1,
 /// c >> 2 & 1). Edge `axis * 4 + bu * 2 + bv` runs along `axis` with
 /// coordinate `bu` on axis + 1 and `bv` on axis + 2 (mod 3).
-fn cube_edge(e: usize) -> (usize, usize) {
+pub(crate) fn cube_edge(e: usize) -> (usize, usize) {
     let (axis, bu, bv) = (e / 4, (e >> 1) & 1, e & 1);
     let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
     let a = (bu << u) | (bv << v);
@@ -454,7 +454,7 @@ fn cube_edge(e: usize) -> (usize, usize) {
 /// on a face join up, and a face crossed four times is resolved by its
 /// middle value, a rule the cell on the other side of the face agrees on,
 /// so each piece gets its own vertex and the surface stays manifold.
-fn pieces(f: &[f32; 8]) -> [u8; 12] {
+pub(crate) fn pieces(f: &[f32; 8]) -> [u8; 12] {
     let inside = |c: usize| f[c] < 0.0;
     let crossed: [bool; 12] = std::array::from_fn(|e| { let (a, b) = cube_edge(e); inside(a) != inside(b) });
     let mut root: [usize; 12] = std::array::from_fn(|e| e);

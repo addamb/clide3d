@@ -49,6 +49,9 @@ pub(super) struct Job {
     pub progress: Arc<Progress>,
     /// It edits the scene when done, so edits wait in line behind it.
     pub edits: bool,
+    /// The call's tool, undo label and source: what its finisher changes
+    /// is one history step.
+    pub step: Option<(String, String, crate::ledger::Source)>,
     thread: Option<JoinHandle<Result<Finish, String>>>,
 }
 
@@ -96,6 +99,17 @@ impl Jobs {
         self.watchers = keep;
         for (_,_,reply) in watchers { let _ = reply.send(result.clone()); }
         self.finished.retain(|_,(_,_,at)|at.elapsed()<KEEP_FINISHED);
+    }
+
+    /// A finished call's result (kept for `job_status`).
+    pub fn result(&self, id: u64) -> Option<&ToolResult> {
+        self.finished.get(&id).map(|(_, r, _)| r)
+    }
+
+    /// Where a call is: "queued", "running" or "awaiting_meshes"; None
+    /// once finished (or unknown).
+    pub fn state(&self, id: u64) -> Option<Value> {
+        self.status(id).map(|s| s["state"].clone())
     }
 
     /// Tells calls that waited too long their job id, and `job_status`
@@ -166,7 +180,7 @@ impl ClideApp {
             .name(format!("job {id}"))
             .spawn(move || work(&p))
             .expect("job thread starts");
-        self.jobs.running.push(Job { ticket, progress, edits: false, thread: Some(thread) });
+        self.jobs.running.push(Job { ticket, progress, edits: false, step: None, thread: Some(thread) });
         id
     }
 
@@ -199,11 +213,16 @@ impl ClideApp {
                 continue;
             }
             let mut job = self.jobs.running.remove(i);
+            self.flush_ui_step();
+            let jumps = self.history_jumps;
             let result = match job.thread.take().map(JoinHandle::join) {
                 Some(Ok(Ok(finish))) => finish(self),
                 Some(Ok(Err(e))) => Err(e),
                 Some(Err(_)) | None => Err(format!("job {} ({}) stopped unexpectedly", job.ticket.id, job.ticket.label)),
             };
+            if let Some((tool, label, source)) = job.step.take() {
+                self.agent_step(&tool, label, jumps, source);
+            }
             self.status = format!("Done: {}", job.ticket.label);
             self.jobs.answer(job.ticket, result);
         }
@@ -228,7 +247,7 @@ impl ClideApp {
             let pending:Vec<_>=pending.into_iter().skip(offset).take(limit).collect();
             let finished_count=self.jobs.finished.len();
             let finished: Vec<Value> = self.jobs.finished.iter().skip(offset).take(limit).map(|(id, (label, r, _))| json!({ "job": id, "did": label, "ok": r.is_ok(), "status": if r.is_ok(){"finished"}else{"failed"} })).collect();
-            return Some(Ok(super::tools::text(json!({ "pending": pending, "finished": finished, "pending_count":pending_count, "finished_count":finished_count, "offset":offset, "next_offset":offset.checked_add(limit).filter(|n|*n<pending_count.max(finished_count)) }))));
+            return Some(Ok(super::tools::text(json!({ "pending": pending, "finished": finished, "pending_count":pending_count, "finished_count":finished_count, "offset":offset, "next_offset":offset.checked_add(limit).filter(|n|*n<pending_count.max(finished_count)), "ui_activity": self.ui_activity_json(false) }))));
         };
         if args["cancel"].as_bool().unwrap_or(false) {
             return Some(self.cancel_job(id));

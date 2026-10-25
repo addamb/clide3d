@@ -119,13 +119,6 @@ fn dice(mesh: &Mesh, object: &crate::material::Material, world: glam::Mat4, eyes
     if settings.iter().all(|s| s.is_none()) {
         return Ok(None);
     }
-    // Vertices sharing a place (split normals) must move together: one
-    // smooth normal per place.
-    let key = |p: [f32; 3]| p.map(f32::to_bits);
-    let mut smooth: HashMap<[u32; 3], Vec3> = HashMap::new();
-    for v in &mesh.vertices {
-        *smooth.entry(key(v.pos)).or_default() += Vec3::from(v.normal);
-    }
     // How long an edge should be at a point: a pixel, at least a texel,
     // and only where the displacement would show (else leave it).
     // The displacing materials' (texel size, height), each once. Edges
@@ -148,29 +141,7 @@ fn dice(mesh: &Mesh, object: &crate::material::Material, world: glam::Mat4, eyes
     if refined.parents.is_empty() {
         return Ok(None);
     }
-    // New vertices: the average of their edge's ends.
-    let mut vertices = mesh.vertices.clone();
-    let mut normals: Vec<Vec3> = mesh.vertices.iter().map(|v| smooth[&key(v.pos)].normalize_or(Vec3::from(v.normal))).collect();
-    for &(a, b) in &refined.parents {
-        let (va, vb) = (&vertices[a as usize], &vertices[b as usize]);
-        let avg3 = |x: [f32; 3], y: [f32; 3]| ((Vec3::from(x) + Vec3::from(y)) * 0.5).to_array();
-        let avg4 = |x: [f32; 4], y: [f32; 4]| ((Vec4::from(x) + Vec4::from(y)) * 0.5).to_array();
-        let n = (Vec3::from(va.normal) + Vec3::from(vb.normal)).normalize_or(Vec3::from(va.normal));
-        let tangent = { let t = avg4(va.tangent, vb.tangent); [t[0], t[1], t[2], va.tangent[3]] };
-        let v = Vertex {
-            pos: avg3(va.pos, vb.pos),
-            normal: n.to_array(),
-            color: avg3(va.color, vb.color),
-            uv: [(va.uv[0] + vb.uv[0]) * 0.5, (va.uv[1] + vb.uv[1]) * 0.5],
-            tangent,
-            base: avg4(va.base, vb.base),
-            wear: avg3(va.wear, vb.wear),
-            painted: std::array::from_fn(|k| ((va.painted[k] as u16 + vb.painted[k] as u16) / 2) as u8),
-            ..*va
-        };
-        normals.push((normals[a as usize] + normals[b as usize]).normalize_or(n));
-        vertices.push(v);
-    }
+    let (mut vertices, normals) = interpolate(mesh, &refined.parents);
     // Displace: every vertex of a displacing material, by the map's height
     // filtered to its edge size (coarse far away, sharp up close).
     let mut edge_len = vec![0.0f32; vertices.len()];
@@ -193,6 +164,74 @@ fn dice(mesh: &Mesh, object: &crate::material::Material, world: glam::Mat4, eyes
     }
     let edges = crate::bake::edges(&indices);
     Ok(Some(Mesh { vertices, indices, edges, materials: mesh.materials.clone(), textures: None, imported: None, decals: mesh.decals.clone(), face: mesh.face.clone(), unshaded: None }))
+}
+
+/// A refined mesh's vertices: the old ones, then each new one as the
+/// average of its edge's ends (see `adaptive::Refined`); and one smooth
+/// normal per vertex, the same for vertices sharing a place (split
+/// normals, UV seams), so they move together.
+fn interpolate(mesh: &Mesh, parents: &[(u32, u32)]) -> (Vec<Vertex>, Vec<Vec3>) {
+    let key = |p: [f32; 3]| p.map(f32::to_bits);
+    let mut smooth: HashMap<[u32; 3], Vec3> = HashMap::new();
+    for v in &mesh.vertices {
+        *smooth.entry(key(v.pos)).or_default() += Vec3::from(v.normal);
+    }
+    let mut vertices = mesh.vertices.clone();
+    let mut normals: Vec<Vec3> = mesh.vertices.iter().map(|v| smooth[&key(v.pos)].normalize_or(Vec3::from(v.normal))).collect();
+    for &(a, b) in parents {
+        let (va, vb) = (&vertices[a as usize], &vertices[b as usize]);
+        let avg3 = |x: [f32; 3], y: [f32; 3]| ((Vec3::from(x) + Vec3::from(y)) * 0.5).to_array();
+        let avg4 = |x: [f32; 4], y: [f32; 4]| ((Vec4::from(x) + Vec4::from(y)) * 0.5).to_array();
+        let n = (Vec3::from(va.normal) + Vec3::from(vb.normal)).normalize_or(Vec3::from(va.normal));
+        let tangent = { let t = avg4(va.tangent, vb.tangent); [t[0], t[1], t[2], va.tangent[3]] };
+        let v = Vertex {
+            pos: avg3(va.pos, vb.pos),
+            normal: n.to_array(),
+            color: avg3(va.color, vb.color),
+            uv: [(va.uv[0] + vb.uv[0]) * 0.5, (va.uv[1] + vb.uv[1]) * 0.5],
+            tangent,
+            base: avg4(va.base, vb.base),
+            wear: avg3(va.wear, vb.wear),
+            painted: std::array::from_fn(|k| ((va.painted[k] as u16 + vb.painted[k] as u16) / 2) as u8),
+            ..*va
+        };
+        normals.push((normals[a as usize] + normals[b as usize]).normalize_or(n));
+        vertices.push(v);
+    }
+    (vertices, normals)
+}
+
+/// A baked displacement map (`bake::displacement`) read back as geometry:
+/// `mesh` (the bake's simple mesh) diced until its edges are at most about
+/// `edge` long, then every vertex moved by the map at its UV, along its
+/// smooth normal (height) or in its tangent frame (vector, when there is
+/// one). Shading normals stay the undisplaced ones, for the baked normal
+/// map. Vertices split at UV seams read their own side's texels, so a
+/// seam can open by about the map's rounding.
+pub fn apply_baked(mesh: &Mesh, map: &crate::bake::Displacement, edge: f32, max_triangles: usize) -> Result<Mesh, String> {
+    if !(edge.is_finite() && edge > 0.0) {
+        return Err("edge must be a positive length".into());
+    }
+    let mut positions: Vec<Vec3> = mesh.vertices.iter().map(|v| Vec3::from(v.pos)).collect();
+    let mut indices = mesh.indices.clone();
+    let refined = crate::adaptive::refine(&mut positions, &mut indices, &|_| edge, &|p, _, _| p, max_triangles)?;
+    let (mut vertices, normals) = interpolate(mesh, &refined.parents);
+    for (v, n) in vertices.iter_mut().zip(&normals) {
+        let p = Vec3::from(v.pos);
+        let uv = glam::Vec2::from(v.uv);
+        let offset = if map.vector.is_some() {
+            let t = Vec3::from_slice(&v.tangent);
+            let t = (t - *n * n.dot(t)).normalize_or(n.any_orthonormal_vector());
+            let b = n.cross(t) * v.tangent[3].signum();
+            let d = map.vector_at(uv);
+            t * d.x + b * d.y + *n * d.z
+        } else {
+            *n * map.height_at(uv)
+        };
+        v.pos = (p + offset).to_array();
+    }
+    let edges = crate::bake::edges(&indices);
+    Ok(Mesh { vertices, indices, edges, materials: mesh.materials.clone(), textures: None, imported: None, decals: mesh.decals.clone(), face: mesh.face.clone(), unshaded: None })
 }
 
 #[cfg(test)]

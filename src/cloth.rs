@@ -2702,7 +2702,7 @@ mod tests {
             animations: true,
             fps: 24.0,
             file_stem: "cloth".into(),
-            lods: false, atlas: true, texel_density: None,
+            lods: false, atlas: true, texel_density: None, gpu_instancing: false, blend_shapes: Vec::new(),
         };
         let exported = crate::gltf::export(&scene, &lib, &options).unwrap();
         let loaded = crate::glb_read::from_bytes(&exported.bytes, None, None).unwrap();

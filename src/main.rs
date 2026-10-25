@@ -10,6 +10,8 @@
 mod adaptive;
 mod app;
 mod bake;
+mod band;
+mod brush;
 mod camera;
 mod clay;
 mod cloth;
@@ -34,16 +36,31 @@ mod film;
 mod fire;
 #[cfg(test)]
 mod fire_checks;
+#[cfg(test)]
+mod graphics_checks;
+#[cfg(test)]
+mod instancing_checks;
 mod gltf;
 mod export_atlas;
 mod glb_read;
+mod groups;
 mod hair;
+#[cfg(test)]
+mod harness;
 mod human;
 mod kitbash;
+mod layers;
+mod ledger;
+mod levels;
+mod mask;
 mod material;
 mod mcp;
 mod mesh;
+mod mesh_asset;
+mod mesh_import;
 mod mesh_shading;
+mod outputs;
+mod overlay;
 mod material_management;
 mod replies;
 mod paint;
@@ -52,6 +69,7 @@ mod pose;
 mod pose_tests;
 mod progress;
 mod render;
+mod view_light;
 mod rig;
 mod scene;
 mod sculpt;
@@ -63,6 +81,7 @@ mod smart_check;
 #[cfg(test)]
 mod hard_checks;
 mod surface;
+mod to_clay;
 #[cfg(test)]
 mod texture_check;
 mod weather;

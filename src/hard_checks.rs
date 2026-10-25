@@ -205,6 +205,7 @@ fn pair(spec: &Showcase, c: Clay, rig: Option<Rig>, timings: &mut String) {
                             pixels: img.pixels().map(|p| p.0).collect(),
                             samples: 64,
                             seconds: 0.0,
+                            traced: Default::default(),
                         }
                     })
                     .collect::<Vec<_>>(),
@@ -259,6 +260,7 @@ fn pair(spec: &Showcase, c: Clay, rig: Option<Rig>, timings: &mut String) {
                 pixels: Vec::new(),
                 samples: 0,
                 seconds: 0.0,
+                traced: Default::default(),
             })
             .collect();
         let broad_cameras: Vec<_> = broad.iter().map(|&i| cameras[i]).collect();

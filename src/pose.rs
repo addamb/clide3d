@@ -853,7 +853,7 @@ pub fn transform_form(form: &mut Form, m: Mat4, flip: bool) -> bool {
     let turned = q.angle_between(Quat::IDENTITY) > 1e-5;
     match form {
         Form::Sphere { center, .. } => p(center),
-        Form::Ellipsoid { center, rotate, .. } | Form::Box { center, rotate, .. } | Form::Torus { center, rotate, .. } => {
+        Form::Ellipsoid { center, rotate, .. } | Form::Box { center, rotate, .. } | Form::Torus { center, rotate, .. } | Form::Mesh { center, rotate, .. } => {
             p(center);
             turn(rotate);
         }

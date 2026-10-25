@@ -54,6 +54,20 @@ pub struct Options {
     pub lods: bool,
     pub atlas: bool,
     pub texel_density: Option<f32>,
+    /// Scattered copies as one node per source with EXT_mesh_gpu_instancing
+    /// transforms, instead of a node per copy.
+    pub gpu_instancing: bool,
+    /// Blend shapes (morph targets) for clay objects' meshes.
+    pub blend_shapes: Vec<BlendShape>,
+}
+
+/// One blend shape of an object's exported mesh: how far each vertex
+/// moves at weight 1 (see `layers::project_shape`).
+#[derive(Clone, Debug)]
+pub struct BlendShape {
+    pub object: u64,
+    pub name: String,
+    pub deltas: Arc<Vec<[f32; 3]>>,
 }
 
 /// The file and what it holds.
@@ -62,10 +76,16 @@ pub struct Export {
     pub summary: Value,
     /// Files to write next to the main file (FBX textures): (name, bytes).
     pub files: Vec<(String, Vec<u8>)>,
+    /// Blend shapes the file holds: (object, shape name). One passed in
+    /// `Options` and missing here was not written (its object was hidden,
+    /// or its mesh had other vertices).
+    pub shapes_written: Vec<(u64, String)>,
 }
 
 #[derive(Default)]
 struct Builder {
+    /// Blend shapes written as morph targets: (object, shape name).
+    shapes_written: Vec<(u64, String)>,
     atlas: crate::export_atlas::Atlas,
     bin: Vec<u8>,
     views: Vec<Value>,
@@ -85,9 +105,14 @@ struct Builder {
     triangles: usize,
     /// (object id, bone name) -> (joint node, bone head), for objects on bones.
     joints: std::collections::HashMap<(u64, String), (usize, Vec3)>,
-    /// Meshes written for scatter sources, by object id: every copy's node
-    /// points at the same mesh (glTF instancing).
-    shared: std::collections::HashMap<u64, usize>,
+    /// Meshes written for plain (unskinned) nodes, with what they were
+    /// written from (mesh, tint, own material): scattered copies and
+    /// identical clay objects point at the same glTF mesh.
+    shared: Vec<(Arc<Mesh>, [f32; 3], Material, usize)>,
+    /// Nodes that point at a mesh written for another node.
+    reused: usize,
+    /// Nodes drawing their mesh at many places (EXT_mesh_gpu_instancing).
+    instanced_nodes: usize,
     /// KHR_lights_punctual lights.
     lights: Vec<Value>,
     /// Copies written (nodes sharing a mesh).
@@ -97,6 +122,20 @@ struct Builder {
 }
 
 impl Builder {
+    /// The glTF mesh for an unskinned node: one already written from the
+    /// same mesh, tint and material, else a new one.
+    fn shared_mesh(&mut self, name: &str, mesh: &Arc<Mesh>, tint: [f32; 3], own: &Material) -> Result<usize, String> {
+        if let Some(&(_, _, _, m)) = self.shared.iter().find(|(a, t, o, _)| Arc::ptr_eq(a, mesh) && t.map(f32::to_bits) == tint.map(f32::to_bits) && o == own) {
+            self.vertices += mesh.vertices.len();
+            self.triangles += mesh.indices.len() / 3;
+            self.reused += 1;
+            return Ok(m);
+        }
+        let m = self.mesh(name, mesh, tint, own, None)?;
+        self.shared.push((mesh.clone(), tint, own.clone(), m));
+        Ok(m)
+    }
+
     fn view(&mut self, data: &[u8], target: Option<u32>) -> usize {
         while !self.bin.len().is_multiple_of(4) {
             self.bin.push(0);
@@ -254,6 +293,25 @@ impl Builder {
         Ok(self.meshes.len() - 1)
     }
 
+    /// Morph targets on mesh `m` (every primitive shares its vertices):
+    /// POSITION offsets, weights 0, names in `extras.targetNames`.
+    fn targets(&mut self, m: usize, shapes: &[&BlendShape]) {
+        let targets: Vec<Value> = shapes
+            .iter()
+            .map(|s| {
+                let d: Vec<f32> = s.deltas.iter().flatten().copied().collect();
+                json!({ "POSITION": self.floats(&d, 3, Some(ARRAY_BUFFER), true) })
+            })
+            .collect();
+        let mesh = &mut self.meshes[m];
+        for p in mesh["primitives"].as_array_mut().into_iter().flatten() {
+            p["targets"] = json!(targets);
+        }
+        mesh["weights"] = json!(vec![0.0f32; shapes.len()]);
+        mesh["extras"]["targetNames"] = json!(shapes.iter().map(|s| &s.name).collect::<Vec<_>>());
+        self.shapes_written.extend(shapes.iter().map(|s| (s.object, s.name.clone())));
+    }
+
     fn sampler(&mut self, anim: &str, times: usize, values: &[f32], width: usize, node: usize, path: &str) {
         let output = self.floats(values, width, None, false);
         let (samplers, channels) = self.animations.entry(anim.to_string()).or_default();
@@ -378,6 +436,10 @@ pub fn export(scene: &Scene, meshes: &MeshLib, opts: &Options) -> Result<Export,
     if !b.lods.is_empty() {
         used.push("MSFT_lod");
     }
+    if b.instanced_nodes > 0 {
+        // Used, not required: readers without it still show one copy.
+        used.push("EXT_mesh_gpu_instancing");
+    }
     if !b.lights.is_empty() {
         used.push("KHR_lights_punctual");
         doc["extensions"] = json!({ "KHR_lights_punctual": { "lights": b.lights } });
@@ -400,10 +462,13 @@ pub fn export(scene: &Scene, meshes: &MeshLib, opts: &Options) -> Result<Export,
         "animations": anim_names,
         "skipped_hidden": skipped,
         "scatter_copies": b.copies,
+        "shared_mesh_nodes": b.reused,
+        "instanced_nodes": b.instanced_nodes,
         "lights": b.lights.len(),
+        "blend_shapes": b.shapes_written.len(),
         "lods": b.lods.iter().map(|(n, t)| (n.clone(), json!({ "lod1_3_triangles": t }))).collect::<serde_json::Map<_, _>>(),
     });
-    Ok(Export { bytes: glb(&doc, b.bin), summary, files: Vec::new() })
+    Ok(Export { bytes: glb(&doc, b.bin), summary, files: Vec::new(), shapes_written: b.shapes_written })
 }
 
 /// Triangle indices grouped by material (index into `mesh.materials`;
@@ -523,21 +588,40 @@ fn add_object(b: &mut Builder, o: &Object, own: &Material, node: usize, meshes: 
     }
     // Scattered copies: a node each, sharing their source's mesh.
     if let Some(sc) = o.scatter.as_ref().filter(|_| o.shape == Shape::Scatter) {
-        for (i, inst) in sc.instances.iter().enumerate() {
+        // Or one node per source carrying every copy's placement, for
+        // sources with several copies and no light (lights need a node each).
+        let mut grouped = vec![false; sc.sources.len()];
+        if opts.gpu_instancing {
+            for (k, &id) in sc.sources.iter().enumerate() {
+                let Some(src) = scene.get(id).filter(|s| s.light.is_none()) else { continue };
+                let Some(mesh) = meshes.get(src).filter(|m| !m.vertices.is_empty()) else { continue };
+                let places: Vec<Mat4> = sc.instances.iter().filter(|i| i.source as usize == k).map(|i| i.matrix() * crate::envkit::scatter::source_shape(src)).collect();
+                if places.len() < 2 {
+                    continue;
+                }
+                grouped[k] = true;
+                let m = b.shared_mesh(&src.name, mesh, src.color, &scene.material_of(src))?;
+                let (mut t, mut r, mut s) = (Vec::new(), Vec::new(), Vec::new());
+                for p in &places {
+                    let (sc, rot, tr) = p.to_scale_rotation_translation();
+                    t.extend(tr.to_array());
+                    r.extend(rot.normalize().to_array());
+                    s.extend(sc.to_array());
+                }
+                let attributes = json!({ "TRANSLATION": b.floats(&t, 3, None, false), "ROTATION": b.floats(&r, 4, None, false), "SCALE": b.floats(&s, 3, None, false) });
+                let copy = b.node(json!({ "name": format!("{}_copies", src.name), "mesh": m, "extensions": { "EXT_mesh_gpu_instancing": { "attributes": attributes } } }));
+                children.entry(node).or_default().push(copy);
+                // Counted per copy, like copies written as nodes.
+                b.vertices += mesh.vertices.len() * (places.len() - 1);
+                b.triangles += mesh.indices.len() / 3 * (places.len() - 1);
+                b.copies += places.len();
+                b.instanced_nodes += 1;
+            }
+        }
+        for (i, inst) in sc.instances.iter().enumerate().filter(|(_, i)| !grouped.get(i.source as usize).copied().unwrap_or(false)) {
             let Some(src) = sc.sources.get(inst.source as usize).and_then(|&id| scene.get(id)) else { continue };
             let Some(mesh) = meshes.get(src).filter(|m| !m.vertices.is_empty()) else { continue };
-            let m = match b.shared.get(&src.id) {
-                Some(&m) => {
-                    b.vertices += mesh.vertices.len();
-                    b.triangles += mesh.indices.len() / 3;
-                    m
-                }
-                None => {
-                    let m = b.mesh(&src.name, mesh, src.color, &scene.material_of(src), None)?;
-                    b.shared.insert(src.id, m);
-                    m
-                }
-            };
+            let m = b.shared_mesh(&src.name, mesh, src.color, &scene.material_of(src))?;
             let mut n = trs(&format!("{}_{i}", src.name), inst.matrix() * crate::envkit::scatter::source_shape(src));
             n["mesh"] = json!(m);
             let copy = b.node(n);
@@ -577,8 +661,14 @@ fn add_object(b: &mut Builder, o: &Object, own: &Material, node: usize, meshes: 
     // nodes hang off the LOD0 node only, so readers without the extension
     // show just LOD0).
     let lods = if opts.lods && mesh.textures.is_some() && cache.is_none() { crate::bake::lods(&mesh, skin.as_deref()) } else { Vec::new() };
+    // Blend shapes of this object's mesh (`layers::project_shape`).
+    let shapes: Vec<&BlendShape> = opts.blend_shapes.iter().filter(|s| s.object == o.id && s.deltas.len() == mesh.vertices.len()).collect();
     let (Some(rig), Some(skin)) = (rig, skin.filter(|s| s.joints.len() == mesh.vertices.len())) else {
-        let m = b.mesh(&o.name, &mesh, o.color, own, None)?;
+        // Objects showing the same mesh (identical clay) share it.
+        let m = if lods.is_empty() && cache.is_none() && shapes.is_empty() { b.shared_mesh(&o.name, &mesh, o.color, own)? } else { b.mesh(&o.name, &mesh, o.color, own, None)? };
+        if !shapes.is_empty() {
+            b.targets(m, &shapes);
+        }
         b.nodes[node]["mesh"] = json!(m);
         add_lods(b, node, &o.name, &lods, o.color, own, None)?;
         return Ok(());
@@ -605,6 +695,9 @@ fn add_object(b: &mut Builder, o: &Object, own: &Material, node: usize, meshes: 
     let skin_index = b.skins.len() - 1;
     // glTF ignores a skinned mesh node's own transform; keep it at the root.
     let m = b.mesh(&o.name, &mesh, o.color, own, Some(&*skin))?;
+    if !shapes.is_empty() {
+        b.targets(m, &shapes);
+    }
     let mesh_node = b.node(json!({ "name": format!("{}_skin", o.name), "mesh": m, "skin": skin_index }));
     scene_nodes.push(mesh_node);
     add_lods(b, mesh_node, &o.name, &lods, o.color, own, Some(skin_index))?;
@@ -843,10 +936,10 @@ mod tests {
         o.light = Piece::Torch.light();
         let sc = scene.add(Shape::Scatter);
         let instances = (0..3).map(|i| Instance { source: 0, position: Vec3::new(i as f32, 0.0, 0.0), rotation: Quat::IDENTITY, scale: 1.0 }).collect();
-        scene.get_mut(sc).unwrap().scatter = Some(Scatter { sources: vec![candle], instances, settings: Default::default() });
+        scene.get_mut(sc).unwrap().scatter = Some(Scatter { sources: vec![candle], instances, settings: Default::default(), placed_by: None });
         let mut meshes = MeshLib::new();
         meshes.sync(&scene);
-        let opts = Options { roots: vec![], animations: true, fps: 24.0, file_stem: String::new(), lods: false, atlas: true, texel_density: None };
+        let opts = Options { roots: vec![], animations: true, fps: 24.0, file_stem: String::new(), lods: false, atlas: true, texel_density: None, gpu_instancing: false, blend_shapes: Vec::new() };
         let out = export(&scene, &meshes, &opts).unwrap();
         let (doc, _) = parse(&out.bytes);
         // The torch and one candle mesh; three nodes point at the candle's.
@@ -886,7 +979,7 @@ mod tests {
         let mut meshes = MeshLib::new();
         meshes.sync(&scene);
 
-        let out = export(&scene, &meshes, &Options { roots: vec![], animations: true, fps: 24.0, file_stem: String::new(), lods: false, atlas: true, texel_density: None }).unwrap();
+        let out = export(&scene, &meshes, &Options { roots: vec![], animations: true, fps: 24.0, file_stem: String::new(), lods: false, atlas: true, texel_density: None, gpu_instancing: false, blend_shapes: Vec::new() }).unwrap();
         let (doc, bin) = parse(&out.bytes);
         assert_eq!(doc["meshes"].as_array().unwrap().len(), 2);
         assert_eq!(doc["skins"][0]["joints"].as_array().unwrap().len(), 2);
@@ -953,7 +1046,7 @@ mod tests {
         let mut meshes = MeshLib::new();
         meshes.sync(&scene);
         meshes.bake(&scene, id, settings).unwrap();
-        let opts = Options { roots: vec![], animations: true, fps: 24.0, file_stem: String::new(), lods: true, atlas: true, texel_density: None };
+        let opts = Options { roots: vec![], animations: true, fps: 24.0, file_stem: String::new(), lods: true, atlas: true, texel_density: None, gpu_instancing: false, blend_shapes: Vec::new() };
         let out = export(&scene, &meshes, &opts).unwrap();
         let (doc, _) = parse(&out.bytes);
         assert!(doc["extensionsUsed"].as_array().unwrap().iter().any(|e| e == "MSFT_lod"));
@@ -991,6 +1084,23 @@ mod tests {
             let name = format!("Rock_LOD{k}");
             assert!(fbx.bytes.windows(name.len()).any(|w| w == name.as_bytes()), "{name}");
         }
+        // Blend shapes on a LOD object go on LOD0 (fitted to its vertices),
+        // in both formats; one fitted to other vertices is left out and
+        // not listed as written.
+        let n = meshes.baked(id).unwrap().0.vertices.len();
+        let mut deltas = vec![[0.0f32; 3]; n];
+        deltas[0] = [0.0, 0.01, 0.0];
+        let shape = |name: &str, deltas: Vec<[f32; 3]>| BlendShape { object: id, name: name.into(), deltas: Arc::new(deltas) };
+        let opts = Options { roots: vec![], animations: true, fps: 24.0, file_stem: "rock".into(), lods: true, atlas: true, texel_density: None, gpu_instancing: false, blend_shapes: vec![shape("bump", deltas), shape("other", vec![[0.0; 3]; n + 1])] };
+        let fbx = crate::fbx::export(&scene, &meshes, &opts).unwrap();
+        assert_eq!(fbx.shapes_written, vec![(id, "bump".to_string())]);
+        assert_eq!(fbx.summary["blend_shapes"], 1);
+        assert!(fbx.bytes.windows(17).any(|w| w == b"BlendShapeChannel"));
+        let out = export(&scene, &meshes, &opts).unwrap();
+        assert_eq!(out.shapes_written, vec![(id, "bump".to_string())]);
+        let (doc, _) = parse(&out.bytes);
+        let lod0 = doc["nodes"].as_array().unwrap().iter().find(|n| n["extensions"]["MSFT_lod"].is_object()).expect("a LOD0 node");
+        assert_eq!(doc["meshes"][lod0["mesh"].as_u64().unwrap() as usize]["extras"]["targetNames"], json!(["bump"]));
     }
 
     #[test]
@@ -1004,7 +1114,7 @@ mod tests {
         let mut meshes = MeshLib::new();
         meshes.sync(&scene);
         meshes.bake(&scene, id, settings).unwrap();
-        let out = export(&scene, &meshes, &Options { roots: vec![], animations: true, fps: 24.0, file_stem: String::new(), lods: false, atlas: true, texel_density: None }).unwrap();
+        let out = export(&scene, &meshes, &Options { roots: vec![], animations: true, fps: 24.0, file_stem: String::new(), lods: false, atlas: true, texel_density: None, gpu_instancing: false, blend_shapes: Vec::new() }).unwrap();
         let (doc, bin) = parse(&out.bytes);
         let loaded = crate::glb_read::from_bytes(&out.bytes, None, None).unwrap();
         assert_eq!(loaded.summary["triangles"], out.summary["triangles"]);
@@ -1036,6 +1146,6 @@ mod tests {
     fn empty_scene_is_refused() {
         let scene = Scene::default();
         let meshes = MeshLib::new();
-        assert!(export(&scene, &meshes, &Options { roots: vec![], animations: true, fps: 24.0, file_stem: String::new(), lods: false, atlas: true, texel_density: None }).is_err());
+        assert!(export(&scene, &meshes, &Options { roots: vec![], animations: true, fps: 24.0, file_stem: String::new(), lods: false, atlas: true, texel_density: None, gpu_instancing: false, blend_shapes: Vec::new() }).is_err());
     }
 }

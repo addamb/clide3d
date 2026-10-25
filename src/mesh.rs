@@ -24,7 +24,15 @@ use crate::scene::{Object, Scene, Shape};
 pub enum MeshKey {
     Prim(Shape),
     Own(u64),
+    /// One chunk of a clay drawn in chunks (a sculpt session, see
+    /// `session.rs`): the object and the chunk.
+    Chunk(u64, [i32; 3]),
 }
+
+mod pick;
+mod session;
+pub use pick::{MeshBvh, RayHit};
+pub use session::{SculptChunk, SculptVertex};
 
 /// What an eye's mesh is built from: its settings, its glow and (with
 /// lids) its placement.
@@ -39,6 +47,17 @@ pub struct MeshLib {
     pub geometry_builds: usize,
     #[cfg(test)]
     pub shading_updates: usize,
+    /// Clay objects that took another object's meshes instead of building.
+    #[cfg(test)]
+    pub aliases_installed: usize,
+    #[cfg(test)]
+    pub fine_builds: usize,
+    /// Clay builds `sync` waited for (not finished when it joined them).
+    #[cfg(test)]
+    pub blocking_joins: usize,
+    /// Turns sharing off (every clay object builds and draws its own mesh).
+    #[cfg(test)]
+    pub no_sharing: bool,
     prims: HashMap<Shape, Arc<Mesh>>,
     solids: HashMap<u64, (SolidKey, Arc<Mesh>)>,
     clay: HashMap<u64, ClayEntry>,
@@ -56,8 +75,37 @@ pub struct MeshLib {
     pub show_baked: bool,
     /// Draw fine meshes (clay with a `detail_cell`) instead of clay.
     pub show_fine: bool,
+    /// The mask and group overlay the viewport draws clay with.
+    pub overlay: crate::overlay::Overlay,
+    /// How long the last overlay tint took (ms).
+    #[cfg(test)]
+    pub overlay_ms: f64,
     /// Clay meshes and fine meshes being built on other threads.
     pending: Pending,
+    /// Clay objects drawing the same mesh as a lower id: that id, whose
+    /// `MeshKey` they draw with (see `key_of`).
+    owner_of: HashMap<u64, u64>,
+    /// Clays drawn in chunks (sculpt sessions), and the sessions.
+    chunked: HashMap<u64, session::Chunked>,
+    sessions: session::Sessions,
+    /// Clays a sculpt tool is active on (`set_sculpt_tool`).
+    sculpt_tool: session::ToolOn,
+    /// Clays drawn as a stroke being drawn leaves them (`set_preview`).
+    previews: session::Previews,
+    /// The session clock (None: now); tests set it.
+    pub session_now: Option<std::time::Instant>,
+    /// Ray-picking trees of the meshes picked (see `pick.rs`).
+    bvhs: pick::BvhCache,
+    /// The last chunk build's and draw-ready refresh's times (ms).
+    chunk_timing: (f64, f64),
+    /// Clays whose regular build waits for their strokes to pause (see
+    /// `sculpting_now`); `busy` while any does.
+    deferred: std::collections::HashSet<u64>,
+    /// Chunks built and made draw-ready.
+    #[cfg(test)]
+    pub chunk_builds: usize,
+    #[cfg(test)]
+    pub slim_updates: usize,
 }
 
 /// What a kit piece or terrain mesh was built from.
@@ -66,6 +114,8 @@ enum EnvKey {
     Kit(crate::envkit::kit::Kit, Option<Material>, Vec<Material>, Vec<crate::smart::Decal>),
     Terrain(crate::envkit::terrain::Terrain, Option<Material>, Vec<Material>),
     Part(crate::kitbash::Part, Vec<Material>),
+    /// An imported mesh (`Shape::Mesh`), drawn in its object's material.
+    Imported(crate::mesh_asset::MeshAsset),
 }
 
 /// Background builds by object id. Not copied with the library (a copy is
@@ -74,8 +124,95 @@ enum EnvKey {
 struct Pending {
     /// (what it builds for, object name, start, the thread).
     clay: HashMap<u64, Build<BuildKey, Built>>,
-    /// Fine meshes, by the rest mesh they are made from.
-    fine: HashMap<u64, Build<Arc<Mesh>, Result<Baked, String>>>,
+    /// Fine meshes, by `ClayEntry::fine_slot` (the rest mesh and skin they
+    /// are made from, held in the build so they stay put): objects sharing
+    /// both share its build. Also where each one is handed out (see
+    /// `MeshLib::fine_building`).
+    fine: HashMap<(usize, usize), (Build<(Arc<Mesh>, Option<Arc<Skin>>), Result<Baked, String>>, FineTicket)>,
+    /// Clay objects waiting for another object's build of the same key:
+    /// (the object building it, the key).
+    alias: HashMap<u64, (u64, BuildKey)>,
+    /// `content_hash` of each clay build's key, when it can be shared.
+    hashes: HashMap<u64, u64>,
+}
+
+/// A fine mesh (with its skin) or why it could not be built.
+pub type FineResult = Result<(Arc<Mesh>, Option<Arc<Skin>>), String>;
+
+/// Where a fine mesh build leaves its result for anyone waiting on it
+/// (a film render waits on its own thread, not the window's).
+#[derive(Clone, Default)]
+pub struct FineTicket(Arc<(std::sync::Mutex<Option<FineResult>>, std::sync::Condvar)>);
+
+impl FineTicket {
+    fn finish(&self, result: FineResult) {
+        let (slot, ready) = &*self.0;
+        let mut slot = slot.lock().expect("no panics while locked");
+        slot.get_or_insert(result);
+        ready.notify_all();
+    }
+
+    /// A ticket already holding `result`.
+    #[cfg(test)]
+    pub fn done(result: FineResult) -> Self {
+        let ticket = Self::default();
+        ticket.finish(result);
+        ticket
+    }
+
+    /// The result once built; None while still building at `deadline`.
+    pub fn wait_until(&self, deadline: std::time::Instant) -> Option<FineResult> {
+        let (slot, ready) = &*self.0;
+        let mut slot = slot.lock().expect("no panics while locked");
+        loop {
+            if let Some(r) = slot.as_ref() {
+                return Some(r.clone());
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            slot = ready.wait_timeout(slot, left).expect("no panics while locked").0;
+        }
+    }
+}
+
+/// Finishes a ticket even if its build panics.
+struct Done(FineTicket);
+
+impl Drop for Done {
+    fn drop(&mut self) {
+        self.0.finish(Err("the fine mesh build stopped".into()));
+    }
+}
+
+/// Fine builds that run at once; more wait for a slot. Each holds a grid of
+/// up to millions of blocks, and they share the cores anyway.
+const FINE_AT_ONCE: usize = 2;
+
+static FINE_RUNNING: (std::sync::Mutex<usize>, std::sync::Condvar) = (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+/// One of the `FINE_AT_ONCE` slots, held while a fine mesh builds.
+struct FineSlot;
+
+impl FineSlot {
+    fn take() -> Self {
+        let (running, free) = &FINE_RUNNING;
+        let mut n = running.lock().expect("no panics while locked");
+        while *n >= FINE_AT_ONCE {
+            n = free.wait(n).expect("no panics while locked");
+        }
+        *n += 1;
+        FineSlot
+    }
+}
+
+impl Drop for FineSlot {
+    fn drop(&mut self) {
+        let (running, free) = &FINE_RUNNING;
+        *running.lock().expect("no panics while locked") -= 1;
+        free.notify_one();
+    }
 }
 
 type Build<K, T> = (K, String, std::time::Instant, std::thread::JoinHandle<T>);
@@ -98,6 +235,26 @@ struct BuildKey {
     rig: Option<(Vec<Bone>, bool, Vec<rig::WeightStroke>)>,
 }
 
+/// What a clay object's meshes are built from.
+fn clay_key(scene: &Scene, o: &Object) -> BuildKey {
+    // Stroke ledgers do not shape the mesh (the grids they built do): a
+    // record alone (a label, a disabled stroke replayed to the same grid)
+    // rebuilds nothing, and keys never serialize them. The sculpt and
+    // paint layers do, through their composites (`layers.rs`), which keep
+    // their identity while nothing changes.
+    let mut clay = o.clay.as_ref().map(crate::layers::composed_clay).unwrap_or_default();
+    // Nor do the mask and groups: the viewport tints and clips the built
+    // mesh by them (`overlay`), with no build.
+    (clay.sculpt_mask, clay.groups) = (None, None);
+    let fallback = o.material.clone().unwrap_or_default();
+    let mut library = crate::damage::library(scene, o);
+    let names = clay.material_names();
+    library.retain(|m| names.iter().any(|n| m.name.as_str() == if n.is_empty() { fallback.as_str() } else { n.as_str() }));
+    let palette = clay.palette(&library, &fallback);
+    let rig = o.rig.as_ref().filter(|r| !r.bones.is_empty());
+    BuildKey { clay, cloth: None, palette, library, fallback, rig: rig.map(|r| (r.bones.clone(), r.split, r.weights.clone())) }
+}
+
 /// A clay entry's built meshes.
 struct Built {
     fine: Option<Baked>,
@@ -108,6 +265,35 @@ struct Built {
 }
 
 impl BuildKey {
+    /// A hash of everything the meshes are built from, for finding other
+    /// objects with the same key quickly; None for keys that never share
+    /// (rigged clay, whose shown mesh is posed per object, and cloth).
+    fn content_hash(&self) -> Option<u64> {
+        if self.rig.is_some() || self.cloth.is_some() {
+            return None;
+        }
+        struct Hashing(std::collections::hash_map::DefaultHasher);
+        impl std::io::Write for Hashing {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                std::hash::Hasher::write(&mut self.0, bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // Sculpt and paint grids are compared by identity (see
+        // `clay::Detail`), so their addresses stand in for their bricks:
+        // serializing those would encode every brick each stroke.
+        let mut clay = self.clay.clone();
+        // Mesh assets are named by their hash in the blobs already.
+        clay.assets.clear();
+        let grids = (clay.detail.take().map(|d| d.addr()), clay.paint.take().map(|p| p.addr()), std::mem::take(&mut clay.masks).into_iter().map(|(n, m)| (n, m.addr())).collect::<Vec<_>>());
+        let mut h = Hashing(Default::default());
+        serde_json::to_writer(&mut h, &(&clay, grids, &self.palette, &self.library, &self.fallback)).ok()?;
+        Some(std::hash::Hasher::finish(&h.0))
+    }
+
     fn same_geometry(&self, other: &Self) -> bool {
         if self.cloth != other.cloth { return false; }
         let mut a = self.clay.clone();
@@ -141,6 +327,8 @@ impl BuildKey {
 struct ClayEntry {
     /// What the meshes below were built from.
     key: BuildKey,
+    /// `key.content_hash()`: entries with the same one may share meshes.
+    hash: Option<u64>,
     rest: Arc<Mesh>,
     /// The clay as one shell (`rest` unless a split rig replaced it).
     whole: Arc<Mesh>,
@@ -161,7 +349,12 @@ struct ClayEntry {
     /// Why the fine mesh for this rest mesh could not be built (it is not
     /// tried again until the clay changes).
     fine_error: Option<(Arc<Mesh>, String)>,
+    /// The drawn mesh with the mask and group overlay (see `overlay.rs`),
+    /// and what it was made from: (drawn mesh, mask, groups, overlay).
+    tinted: Option<(TintKey, Arc<Mesh>)>,
 }
+
+type TintKey = (usize, Option<usize>, Option<usize>, crate::overlay::Overlay);
 
 /// A mesh made from a clay entry's `rest`: a baked game mesh (see
 /// `bake.rs`) or a fine mesh.
@@ -178,7 +371,7 @@ struct Baked {
 
 impl MeshLib {
     pub fn new() -> Self {
-        Self { #[cfg(test)] geometry_builds:0, #[cfg(test)] shading_updates:0, solids: HashMap::new(), prims: Mesh::all().into_iter().map(|(s, m)| (s, Arc::new(m))).collect(), clay: HashMap::new(), eyes: HashMap::new(), hairs: HashMap::new(), fires: HashMap::new(), kits: HashMap::new(), scatter_bounds: HashMap::new(), frame: None, show_baked: false, show_fine: false, pending: Pending::default() }
+        Self { #[cfg(test)] geometry_builds:0, #[cfg(test)] shading_updates:0, #[cfg(test)] aliases_installed:0, #[cfg(test)] fine_builds:0, #[cfg(test)] blocking_joins: 0, #[cfg(test)] no_sharing:false, #[cfg(test)] overlay_ms: 0.0, overlay: crate::overlay::Overlay::default(), owner_of: HashMap::new(), solids: HashMap::new(), prims: Mesh::all().into_iter().map(|(s, m)| (s, Arc::new(m))).collect(), clay: HashMap::new(), eyes: HashMap::new(), hairs: HashMap::new(), fires: HashMap::new(), kits: HashMap::new(), scatter_bounds: HashMap::new(), frame: None, show_baked: false, show_fine: false, pending: Pending::default(), chunked: HashMap::new(), sessions: Default::default(), sculpt_tool: Default::default(), previews: Default::default(), session_now: None, bvhs: Default::default(), chunk_timing: (0.0, 0.0), deferred: Default::default(), #[cfg(test)] chunk_builds: 0, #[cfg(test)] slim_updates: 0 }
     }
 
     pub fn prims(&self) -> impl Iterator<Item = (MeshKey, Arc<Mesh>)> + '_ {
@@ -188,28 +381,59 @@ impl MeshLib {
     /// Brings every mesh up to date with the scene, waiting for any build
     /// (what tools use: they read the meshes right after).
     pub fn sync(&mut self, scene: &Scene) {
-        self.sync_with(scene, true);
+        self.sync_with(scene, true, true);
+    }
+
+    /// Like `sync`, but fine meshes only start building (see
+    /// `fine_building`): a film render waits for them on its own thread.
+    pub fn sync_shown(&mut self, scene: &Scene) {
+        self.sync_with(scene, true, false);
     }
 
     /// Like `sync`, but slow builds (clay meshes, skin weights, fine meshes)
     /// run on other threads; until they finish the old meshes stay shown.
     /// What the window calls every frame.
     pub fn sync_background(&mut self, scene: &Scene) {
-        self.sync_with(scene, false);
+        self.sync_with(scene, false, false);
     }
 
     /// Whether builds are running (see `sync_background`).
     pub fn busy(&self) -> bool {
-        !self.pending.clay.is_empty() || !self.pending.fine.is_empty()
+        !self.pending.clay.is_empty() || !self.pending.fine.is_empty() || !self.deferred.is_empty()
+    }
+
+    /// Whether `sync` would build anything now: a clay's meshes are not
+    /// for its shape as it is (its build not started yet, or deferred),
+    /// or a fine mesh it shows is not built. `busy` covers builds already
+    /// running; the window waits for neither before a call that syncs.
+    pub fn stale(&self, scene: &Scene) -> bool {
+        scene.objects.iter().filter(|o| o.shape == Shape::Clay).any(|o| match self.clay.get(&o.id) {
+            None => true,
+            Some(e) => {
+                let fine = e.fine.as_ref().is_some_and(|f| Arc::ptr_eq(&f.from, &e.rest)) || e.fine_error.as_ref().is_some_and(|f| Arc::ptr_eq(&f.0, &e.rest));
+                e.key != clay_key(scene, o) || (self.show_fine && !e.use_baked && e.key.clay.detail_cell.is_some() && !fine)
+            }
+        })
+    }
+
+    /// `sync`, then joins sculpt sessions' chunk builds (which `sync`
+    /// leaves running: tools never read chunks).
+    #[cfg(test)]
+    pub fn sync_joined(&mut self, scene: &Scene) {
+        self.sync(scene);
+        let clays: Vec<&Object> = scene.objects.iter().filter(|o| o.shape == Shape::Clay).collect();
+        let keys: Vec<BuildKey> = clays.iter().map(|o| clay_key(scene, o)).collect();
+        self.sync_chunks(&clays, &keys, true);
     }
 
     /// Running builds: (what, seconds so far).
     pub fn building(&self) -> Vec<(String, f32)> {
         let clay = self.pending.clay.values().map(|(_, n, t, _)| (format!("Building mesh {n}"), t.elapsed().as_secs_f32()));
-        clay.chain(self.pending.fine.values().map(|(_, n, t, _)| (format!("Building fine mesh {n}"), t.elapsed().as_secs_f32()))).collect()
+        clay.chain(self.pending.fine.values().map(|((_, n, t, _), _)| (format!("Building fine mesh {n}"), t.elapsed().as_secs_f32()))).collect()
     }
 
-    fn sync_with(&mut self, scene: &Scene, wait: bool) {
+    fn sync_with(&mut self, scene: &Scene, wait: bool, wait_fine: bool) {
+        self.deferred.clear();
         let objects = &scene.objects;
         let live: std::collections::HashSet<u64> = objects.iter().map(|o| o.id).collect();
         self.eyes.retain(|id, _| live.contains(id));
@@ -259,51 +483,148 @@ impl MeshLib {
         let live: std::collections::HashSet<u64> = objects.iter().filter(|o| matches!(o.shape, Shape::Clay | Shape::Cloth)).map(|o| o.id).collect();
         self.clay.retain(|id, _| live.contains(id));
         self.pending.clay.retain(|id, _| live.contains(id));
-        self.pending.fine.retain(|id, _| live.contains(id));
-        for o in objects.iter().filter(|o| o.shape == Shape::Clay) {
-            let clay = o.clay.clone().unwrap_or_default();
-            let fallback = o.material.clone().unwrap_or_default();
-            let mut library = crate::damage::library(scene, o);
-            let names = clay.material_names();
-            library.retain(|m| names.iter().any(|n| m.name.as_str() == if n.is_empty() { fallback.as_str() } else { n.as_str() }));
-            let palette = clay.palette(&library, &fallback);
-            let rig = o.rig.as_ref().filter(|r| !r.bones.is_empty());
-            let key = BuildKey { clay, cloth: None, palette, library, fallback, rig: rig.map(|r| (r.bones.clone(), r.split, r.weights.clone())) };
-            if !self.clay.get(&o.id).is_some_and(|e| e.key == key) {
-                if !self.pending.clay.get(&o.id).is_some_and(|p| p.0 == key || (p.0.same_geometry(&key) && p.0.rig==key.rig)) {
-                    // Only the rig changed: keep the shell, redo the skin.
-                    let reuse = self.clay.get(&o.id).filter(|e| e.key.clay == key.clay && e.key.palette == key.palette && e.key.library == key.library && e.key.fallback == key.fallback).map(|e| e.whole.clone());
-                    let shading = self.clay.get(&o.id).filter(|e| e.key.same_geometry(&key) && e.key.rig == key.rig)
-                        .map(|e| (e.whole.clone(), e.rest.clone(), e.parts.clone(), e.skin.clone(), e.fine.as_ref().filter(|f|Arc::ptr_eq(&f.from,&e.rest)).cloned()));
-                    #[cfg(test)]
-                    {if shading.is_some(){self.shading_updates+=1;}else if reuse.is_none(){self.geometry_builds+=1;}}
-                    let k = key.clone();
-                    let handle = std::thread::Builder::new().name(format!("mesh {}", o.name)).spawn(move || {
-                        if let Some((whole, rest, parts, skin, fine)) = shading {
-                            let shared = Arc::ptr_eq(&whole, &rest);
-                            let whole = Arc::new(crate::mesh_shading::refresh(&k.clay, &k.library, &k.fallback, &whole, &[]));
-                            let rest = if shared { whole.clone() } else {
-                                Arc::new(crate::mesh_shading::refresh(&k.clay, &k.library, &k.fallback, &rest, &parts))
-                            };
-                            let fine=fine.map(|mut f| {
-                                let refreshed=Arc::new(crate::mesh_shading::refresh(&k.clay,&k.library,&k.fallback,&f.mesh,&[]));
-                                f.mesh=refreshed.clone();f.shown=refreshed;f.from=rest.clone();f.posed_for=None;f
-                            });
-                            Built { fine, whole, rest, parts, skin }
-                        } else { k.build(reuse) }
-                    }).expect("mesh thread starts");
-                    // A build for older settings is dropped (it finishes unseen).
-                    self.pending.clay.insert(o.id, (key.clone(), o.name.clone(), std::time::Instant::now(), handle));
+        self.pending.alias.retain(|id, _| live.contains(id));
+        self.pending.hashes.retain(|id, _| live.contains(id));
+        let clays: Vec<&Object> = objects.iter().filter(|o| o.shape == Shape::Clay).collect();
+        let keys: Vec<BuildKey> = clays.iter().map(|o| clay_key(scene, o)).collect();
+        // Sculpt sessions' chunks first: in the background, the regular
+        // mesh of a clay a sculpt tool is on starts building once its
+        // chunks are drawn. Nothing waits for chunks here (see
+        // `sync_joined`). A clay with a live preview draws the preview.
+        self.previews.shown.retain(|id, _| live.contains(id));
+        if self.previews.shown.is_empty() {
+            self.sync_chunks(&clays, &keys, false);
+        } else {
+            let shown: Vec<Object> = clays.iter().filter_map(|o| self.previews.shown.get(&o.id).map(|(_, c)| Object { clay: Some(c.clone()), ..(*o).clone() })).collect();
+            let chunk_clays: Vec<&Object> = clays.iter().map(|o| shown.iter().find(|s| s.id == o.id).unwrap_or(o)).collect();
+            let chunk_keys: Vec<BuildKey> = chunk_clays.iter().zip(&keys).map(|(o, k)| if self.previews.shown.contains_key(&o.id) { clay_key(scene, o) } else { k.clone() }).collect();
+            self.sync_chunks(&chunk_clays, &chunk_keys, false);
+        }
+        // Objects with the same key share one build and one set of meshes
+        // (duplicates cost nothing until edited). Hashes of the keys still
+        // to build, and who builds each one.
+        let sharing = self.sharing();
+        // (Hashed once per key: builds running for it keep theirs.)
+        let hashes: Vec<Option<u64>> = clays.iter().zip(&keys).map(|(o, key)| {
+            if !sharing || self.clay.get(&o.id).is_some_and(|e| e.key == *key) || self.pending.alias.get(&o.id).is_some_and(|a| a.1 == *key) {
+                None
+            } else if self.pending.clay.get(&o.id).is_some_and(|p| p.0 == *key) {
+                self.pending.hashes.get(&o.id).copied()
+            } else {
+                key.content_hash()
+            }
+        }).collect();
+        let mut building: HashMap<u64, u64> = HashMap::new();
+        for ((o, key), h) in clays.iter().zip(&keys).zip(&hashes) {
+            if let Some(h) = h && self.pending.clay.get(&o.id).is_some_and(|p| p.0 == *key) {
+                building.entry(*h).or_insert(o.id);
+            }
+        }
+        // Every stale build starts first, then they are joined: objects
+        // build at once (sharing the cores, see `clay::par_chunks`).
+        for ((o, key), h) in clays.iter().zip(&keys).zip(&hashes) {
+            if self.clay.get(&o.id).is_some_and(|e| e.key == *key) {
+                self.pending.alias.remove(&o.id);
+                // Back to the meshes shown (an undo while a build ran): that
+                // build is for older settings and is dropped, or `busy`
+                // would never clear.
+                if self.pending.clay.remove(&o.id).is_some() {
+                    self.pending.hashes.remove(&o.id);
                 }
-                let ready = self.pending.clay.get(&o.id).is_some_and(|p| p.3.is_finished());
-                if wait || ready {
-                    let (built_key, _, _, handle) = self.pending.clay.remove(&o.id).expect("pending");
-                    let built = handle.join().expect("mesh build");
-                    let stale = built_key != key;
-                    self.install(o.id, built_key, built);
-                    if stale && wait { self.sync_with(scene, true); return; }
+                continue;
+            }
+            // Still waiting for another object's build of this key.
+            if self.pending.alias.get(&o.id).is_some_and(|a| a.1 == *key) {
+                continue;
+            }
+            if let Some(h) = *h {
+                // Another object has these meshes: take them.
+                if let Some(owner) = self.clay.iter().find(|(id, e)| **id != o.id && e.hash == Some(h) && e.key == *key).map(|(id, _)| *id) {
+                    self.share(o.id, owner);
+                    continue;
+                }
+                // Another object is building them: wait for that build.
+                if let Some(&owner) = building.get(&h).filter(|&&b| b != o.id) {
+                    self.pending.clay.remove(&o.id);
+                    self.pending.alias.insert(o.id, (owner, key.clone()));
+                    continue;
                 }
             }
+            self.pending.alias.remove(&o.id);
+            // A clay being sculpted builds its regular mesh once its strokes
+            // pause (its chunks show them meanwhile): each would start a
+            // whole remesh, competing with the chunks for the cores.
+            if !wait && self.sculpting_now(o.id) {
+                self.deferred.insert(o.id);
+                continue;
+            }
+            if !self.pending.clay.get(&o.id).is_some_and(|p| p.0 == *key || (p.0.same_geometry(key) && p.0.rig==key.rig)) {
+                // Only the rig changed: keep the shell, redo the skin.
+                let reuse = self.clay.get(&o.id).filter(|e| e.key.clay == key.clay && e.key.palette == key.palette && e.key.library == key.library && e.key.fallback == key.fallback).map(|e| e.whole.clone());
+                // A shell shared with another object (see `share`) is copied
+                // before a rig skins it: the rest mesh it becomes is this
+                // object's own, posed and weighted apart from the others.
+                let copy = key.rig.is_some() && reuse.as_ref().is_some_and(|w| self.clay.iter().any(|(id, e)| *id != o.id && (Arc::ptr_eq(&e.whole, w) || Arc::ptr_eq(&e.rest, w))));
+                let shading = self.clay.get(&o.id).filter(|e| e.key.same_geometry(key) && e.key.rig == key.rig)
+                    .map(|e| (e.whole.clone(), e.rest.clone(), e.parts.clone(), e.skin.clone(), e.fine.as_ref().filter(|f|Arc::ptr_eq(&f.from,&e.rest)).cloned()));
+                #[cfg(test)]
+                {if shading.is_some(){self.shading_updates+=1;}else if reuse.is_none(){self.geometry_builds+=1;}}
+                let k = key.clone();
+                let handle = std::thread::Builder::new().name(format!("mesh {}", o.name)).spawn(move || {
+                    if let Some((whole, rest, parts, skin, fine)) = shading {
+                        let shared = Arc::ptr_eq(&whole, &rest);
+                        let whole = Arc::new(crate::mesh_shading::refresh(&k.clay, &k.library, &k.fallback, &whole, &[]));
+                        let rest = if shared { whole.clone() } else {
+                            Arc::new(crate::mesh_shading::refresh(&k.clay, &k.library, &k.fallback, &rest, &parts))
+                        };
+                        let fine=fine.map(|mut f| {
+                            let refreshed=Arc::new(crate::mesh_shading::refresh(&k.clay,&k.library,&k.fallback,&f.mesh,&[]));
+                            f.mesh=refreshed.clone();f.shown=refreshed;f.from=rest.clone();f.posed_for=None;f
+                        });
+                        Built { fine, whole, rest, parts, skin }
+                    } else { k.build(reuse.map(|w| if copy { Arc::new(Mesh::clone(&w)) } else { w })) }
+                }).expect("mesh thread starts");
+                // A build for older settings is dropped (it finishes unseen).
+                self.pending.clay.insert(o.id, (key.clone(), o.name.clone(), std::time::Instant::now(), handle));
+                match h {
+                    Some(h) => self.pending.hashes.insert(o.id, *h),
+                    None => self.pending.hashes.remove(&o.id),
+                };
+            }
+            if let Some(h) = *h && self.pending.clay.get(&o.id).is_some_and(|p| p.0 == *key) {
+                building.entry(h).or_insert(o.id);
+            }
+        }
+        let mut stale = false;
+        for (o, key) in clays.iter().zip(&keys) {
+            if self.clay.get(&o.id).is_some_and(|e| e.key == *key) || self.pending.alias.contains_key(&o.id) {
+                continue;
+            }
+            let ready = self.pending.clay.get(&o.id).is_some_and(|p| p.3.is_finished());
+            if wait || ready {
+                #[cfg(test)]
+                {self.blocking_joins += usize::from(!ready);}
+                let (built_key, _, _, handle) = self.pending.clay.remove(&o.id).expect("pending");
+                let built = handle.join().expect("mesh build");
+                stale |= built_key != *key;
+                self.install(o.id, built_key, built);
+            }
+        }
+        // Objects waiting on another's build take it once it is in; if
+        // that build was dropped they build their own next time.
+        let waiting: Vec<(u64, u64)> = self.pending.alias.iter().map(|(id, (owner, _))| (*id, *owner)).collect();
+        for (id, owner) in waiting {
+            let key = &self.pending.alias[&id].1;
+            if self.clay.get(&owner).is_some_and(|e| e.key == *key) {
+                self.share(id, owner);
+            } else if !self.pending.clay.get(&owner).is_some_and(|p| p.0 == *key) {
+                self.pending.alias.remove(&id);
+                stale = true;
+            }
+        }
+        if stale && wait { self.sync_with(scene, true, wait_fine); return; }
+        for o in objects.iter().filter(|o| o.shape == Shape::Clay) {
+            let rig = o.rig.as_ref().filter(|r| !r.bones.is_empty());
             let Some(e) = self.clay.get_mut(&o.id) else { continue };
             // Pose only with a skin made for these bones (one may be on its way).
             let Some(rig) = rig.filter(|r| e.skin.as_ref().is_some_and(|(b, _, _)| *b == r.bones)) else {
@@ -387,7 +708,83 @@ impl MeshLib {
             self.solids.insert(o.id,(key,Arc::new(mesh)));
         }
         self.sync_env(scene);
-        self.sync_fine(scene, wait);
+        self.sync_fine(scene, wait_fine);
+        self.sync_overlays(scene);
+        // Who draws with whose mesh: the lowest id among objects showing
+        // the same one (a tinted mesh is its own).
+        self.owner_of.clear();
+        let mut first: HashMap<*const Mesh, u64> = HashMap::new();
+        let mut ids: Vec<u64> = self.clay.keys().copied().collect();
+        ids.sort_unstable();
+        // Skinned clay is drawn (posed, weight-painted) on its own.
+        for id in ids.into_iter().filter(|id| self.clay[id].skin.is_none()) {
+            let owner = *first.entry(Arc::as_ptr(self.clay[&id].display())).or_insert(id);
+            if owner != id {
+                self.owner_of.insert(id, owner);
+            }
+        }
+    }
+
+    /// Tints the drawn clay meshes with the mask and groups overlay (or
+    /// drops the tint): a copy of the drawn mesh, made again only when
+    /// the mesh, the mask, the groups or the overlay changed. No mesh is
+    /// built.
+    fn sync_overlays(&mut self, scene: &Scene) {
+        let overlay = self.overlay;
+        for o in scene.objects.iter().filter(|o| o.shape == Shape::Clay) {
+            let Some(e) = self.clay.get_mut(&o.id) else { continue };
+            let clay = o.clay.as_ref();
+            let mask = clay.and_then(|c| c.sculpt_mask.as_ref()).filter(|_| overlay != crate::overlay::Overlay::None);
+            let groups = clay.and_then(|c| c.groups.as_ref()).filter(|g| overlay == crate::overlay::Overlay::Groups || !g.hidden().is_empty());
+            if mask.is_none() && groups.is_none() {
+                e.tinted = None;
+                continue;
+            }
+            let key = (Arc::as_ptr(e.drawn()) as usize, mask.map(|m| m.addr()), groups.map(|g| g.addr()), overlay);
+            if e.tinted.as_ref().is_some_and(|t| t.0 == key) {
+                continue;
+            }
+            #[cfg(test)]
+            let t = std::time::Instant::now();
+            let mesh = crate::overlay::tint(e.drawn(), e.unposed(), mask, groups, overlay == crate::overlay::Overlay::Groups);
+            #[cfg(test)]
+            {
+                self.overlay_ms = t.elapsed().as_secs_f64() * 1000.0;
+            }
+            e.tinted = Some((key, Arc::new(mesh)));
+        }
+    }
+
+    /// The mesh the viewport draws and picks for an object: as `get`, with
+    /// a clay's mask and group overlay (hidden groups left out).
+    pub fn display(&self, o: &Object) -> Option<&Arc<Mesh>> {
+        match Self::key(o) {
+            MeshKey::Own(id) => self.clay.get(&id).map(ClayEntry::display).or_else(|| self.get(o)),
+            _ => self.get(o),
+        }
+    }
+
+    fn sharing(&self) -> bool {
+        #[cfg(test)]
+        return !self.no_sharing;
+        #[cfg(not(test))]
+        true
+    }
+
+    /// Gives object `id` the meshes of `owner`, built from the same key.
+    /// The entry is its own copy (sharing the meshes), so baking, posing or
+    /// editing either object later touches only that object.
+    fn share(&mut self, id: u64, owner: u64) {
+        let mut e = self.clay[&owner].clone();
+        e.shown = e.rest.clone();
+        e.posed_for = None;
+        (e.baked, e.use_baked) = (None, false);
+        self.clay.insert(id, e);
+        self.pending.clay.remove(&id);
+        self.pending.alias.remove(&id);
+        self.pending.hashes.remove(&id);
+        #[cfg(test)]
+        {self.aliases_installed += 1;}
     }
 
     /// Builds kit pieces and terrains whose settings changed, and measures
@@ -404,6 +801,7 @@ impl MeshLib {
                     let lib=p.roles(&scene.materials).into_iter().map(|(m,_)|m).collect();
                     EnvKey::Part(p,lib)
                 },
+                (Shape::Mesh, _, _) if o.mesh.is_some() => EnvKey::Imported(o.mesh.clone().expect("checked")),
                 _ => continue,
             };
             if self.kits.get(&o.id).is_some_and(|(k, _)| *k == key) {
@@ -421,6 +819,7 @@ impl MeshLib {
                 EnvKey::Kit(k, m, lib, _) => k.build(lib, m.as_ref()),
                 EnvKey::Terrain(t, m, lib) => t.build(lib, m.as_ref()),
                 EnvKey::Part(p, lib) => p.build(lib),
+                EnvKey::Imported(a) => Mesh::imported(a),
             };
             if !o.damage.is_empty() {crate::damage::displace_mesh(&mut mesh,&o.damage);}
             self.kits.insert(o.id, (key, Arc::new(mesh)));
@@ -452,53 +851,93 @@ impl MeshLib {
     /// Puts freshly built meshes in place (a new rest mesh makes bakes and
     /// fine meshes stale).
     fn install(&mut self, id: u64, key: BuildKey, b: Built) {
+        // Hashed when the build started (None when sharing is off).
+        let hash = self.pending.hashes.remove(&id);
         match self.clay.get_mut(&id) {
             Some(e) => {
-                (e.key, e.whole, e.rest, e.parts, e.skin) = (key, b.whole, b.rest, b.parts, b.skin);
+                (e.key, e.hash, e.whole, e.rest, e.parts, e.skin) = (key, hash, b.whole, b.rest, b.parts, b.skin);
                 e.fine=b.fine; e.fine_error=None;
                 e.shown = e.rest.clone();
                 e.posed_for = None;
             }
             None => {
-                let entry = ClayEntry { key, shown: b.rest.clone(), whole: b.whole, rest: b.rest, skin: b.skin, posed_for: None, parts: b.parts, baked: None, use_baked: false, fine: b.fine, use_fine: false, fine_error: None };
+                let entry = ClayEntry { key, hash, shown: b.rest.clone(), whole: b.whole, rest: b.rest, skin: b.skin, posed_for: None, parts: b.parts, baked: None, use_baked: false, fine: b.fine, use_fine: false, fine_error: None, tinted: None };
                 self.clay.insert(id, entry);
             }
         }
     }
 
     /// Builds (when shown and stale) and poses fine meshes. They are skinned
-    /// from the rest mesh's nearest vertex, so they move like it.
+    /// from the rest mesh's nearest vertex, so they move like it. Every
+    /// stale build starts before any is joined, so objects build at once
+    /// (at most `FINE_AT_ONCE` of them: each holds a large grid).
     fn sync_fine(&mut self, scene: &Scene, wait: bool) {
-        for o in scene.objects.iter().filter(|o| o.shape == Shape::Clay) {
-            let Some(e) = self.clay.get_mut(&o.id) else { continue };
+        let show = self.show_fine;
+        let stale = |e: &ClayEntry| {
             let fresh = e.fine.as_ref().is_some_and(|f| Arc::ptr_eq(&f.from, &e.rest)) || e.fine_error.as_ref().is_some_and(|f| Arc::ptr_eq(&f.0, &e.rest));
-            if self.show_fine && !e.use_baked && e.key.clay.detail_cell.is_some() && !fresh {
-                if !self.pending.fine.get(&o.id).is_some_and(|p| Arc::ptr_eq(&p.0, &e.rest)) {
-                    let (key, rest, skin) = (e.key.clone(), e.rest.clone(), e.skin.as_ref().map(|s| s.2.clone()));
-                    let from = rest.clone();
-                    let handle = std::thread::Builder::new()
-                        .name(format!("fine mesh {}", o.name))
-                        .spawn(move || {
-                            let mesh = key.clay.build_fine(&key.library, &key.fallback)?;
-                            let skin = skin.map(|s| {
-                                let near = rig::NearestVertex::new(&rest, key.clay.cell_size().unwrap_or(0.01) * 2.0);
-                                let pick: Vec<usize> = mesh.vertices.iter().map(|v| near.index(Vec3::from(v.pos)).unwrap_or(0)).collect();
-                                Arc::new(Skin { joints: pick.iter().map(|&i| s.joints[i]).collect(), weights: pick.iter().map(|&i| s.weights[i]).collect() })
-                            });
-                            let mesh = Arc::new(mesh);
-                            Ok(Baked { settings: bake::Settings::default(), from: rest, shown: mesh.clone(), mesh, skin, posed_for: None })
-                        })
-                        .expect("fine mesh thread starts");
-                    self.pending.fine.insert(o.id, (from, o.name.clone(), std::time::Instant::now(), handle));
-                }
-                if wait || self.pending.fine.get(&o.id).is_some_and(|p| p.3.is_finished()) {
-                    let (from, _, _, handle) = self.pending.fine.remove(&o.id).expect("pending");
-                    match handle.join().expect("fine mesh build") {
-                        Ok(f) => (e.fine, e.fine_error) = (Some(f), None),
-                        Err(why) => (e.fine, e.fine_error) = (None, Some((from, why))),
+            show && !e.use_baked && e.key.clay.detail_cell.is_some() && !fresh
+        };
+        // Builds for rest meshes no object shows any more finish unseen.
+        let clay = &self.clay;
+        self.pending.fine.retain(|slot, _| clay.values().any(|e| e.fine_slot() == *slot));
+        for o in scene.objects.iter().filter(|o| o.shape == Shape::Clay) {
+            let Some(e) = self.clay.get(&o.id).filter(|e| stale(e)) else { continue };
+            // Objects sharing a rest mesh and skin (see `share`) share its
+            // fine mesh: one build, taken from whoever has it or is making it.
+            let (rest, slot) = (e.rest.clone(), e.fine_slot());
+            if let Some((fine, error)) = self.clay.values().find(|x| x.fine_slot() == slot && (x.fine.as_ref().is_some_and(|f| Arc::ptr_eq(&f.from, &rest)) || x.fine_error.as_ref().is_some_and(|f| Arc::ptr_eq(&f.0, &rest)))).map(|x| (x.fine.clone(), x.fine_error.clone())) {
+                let e = self.clay.get_mut(&o.id).expect("checked");
+                (e.fine, e.fine_error) = (fine, error);
+                continue;
+            }
+            if self.pending.fine.contains_key(&slot) {
+                continue;
+            }
+            #[cfg(test)]
+            {self.fine_builds += 1;}
+            let (key, rest, skin) = (e.key.clone(), e.rest.clone(), e.skin.as_ref().map(|s| s.2.clone()));
+            let from = (rest.clone(), skin.clone());
+            let ticket = FineTicket::default();
+            let done = ticket.clone();
+            let handle = std::thread::Builder::new()
+                .name(format!("fine mesh {}", o.name))
+                .spawn(move || {
+                    let done = Done(done);
+                    let built = {
+                        let _slot = FineSlot::take();
+                        key.clay.build_fine(&key.library, &key.fallback)
+                    };
+                    let baked = built.map(|mesh| {
+                        let skin = skin.map(|s| {
+                            let near = rig::NearestVertex::new(&rest, key.clay.cell_size().unwrap_or(0.01) * 2.0);
+                            let pick: Vec<usize> = mesh.vertices.iter().map(|v| near.index(Vec3::from(v.pos)).unwrap_or(0)).collect();
+                            Arc::new(Skin { joints: pick.iter().map(|&i| s.joints[i]).collect(), weights: pick.iter().map(|&i| s.weights[i]).collect() })
+                        });
+                        let mesh = Arc::new(mesh);
+                        Baked { settings: bake::Settings::default(), from: rest, shown: mesh.clone(), mesh, skin, posed_for: None }
+                    });
+                    done.0.finish(baked.as_ref().map(|b| (b.mesh.clone(), b.skin.clone())).map_err(Clone::clone));
+                    baked
+                })
+                .expect("fine mesh thread starts");
+            self.pending.fine.insert(slot, ((from, o.name.clone(), std::time::Instant::now(), handle), ticket));
+        }
+        for o in scene.objects.iter().filter(|o| o.shape == Shape::Clay) {
+            if let Some(slot) = self.clay.get(&o.id).filter(|e| stale(e)).map(|e| e.fine_slot())
+                && let Some(p) = self.pending.fine.get(&slot)
+                && (wait || p.0.3.is_finished())
+            {
+                let (((from, _), _, _, handle), _) = self.pending.fine.remove(&slot).expect("pending");
+                let built = handle.join().expect("fine mesh build");
+                // Every object showing this rest mesh and skin gets it.
+                for e in self.clay.values_mut().filter(|e| e.fine_slot() == slot) {
+                    match &built {
+                        Ok(f) => (e.fine, e.fine_error) = (Some(f.clone()), None),
+                        Err(why) => (e.fine, e.fine_error) = (None, Some((from.clone(), why.clone()))),
                     }
                 }
             }
+            let Some(e) = self.clay.get_mut(&o.id) else { continue };
             e.use_fine = self.show_fine && !e.use_baked && e.fine.as_ref().is_some_and(|f| Arc::ptr_eq(&f.from, &e.rest));
             let Some(f) = e.fine.as_mut().filter(|_| e.use_fine) else { continue };
             let rig = o.rig.as_ref().filter(|r| !r.bones.is_empty());
@@ -514,6 +953,19 @@ impl MeshLib {
         }
     }
 
+    /// The fine mesh still being built for an object shown fine (by
+    /// `sync_background` or `sync_shown`), to wait for off this thread:
+    /// the ticket, seconds so far, and the skin matrices of the pose shown.
+    pub fn fine_building(&self, o: &Object) -> Option<(FineTicket, f32, Option<Vec<Mat4>>)> {
+        let e = self.clay.get(&o.id).filter(|e| self.show_fine && !e.use_baked && !e.use_fine)?;
+        // Objects sharing a rest mesh wait on the same build.
+        let ((_, _, started, _), ticket) = self.pending.fine.get(&e.fine_slot())?;
+        let rig = o.rig.as_ref().filter(|r| !r.bones.is_empty());
+        let frame = rig.and_then(|r| r.is_posed(self.frame).then_some(self.frame).flatten());
+        let pose = rig.filter(|_| frame.is_some()).map(|r| r.skin_matrices(frame));
+        Some((ticket.clone(), started.elapsed().as_secs_f32(), pose))
+    }
+
     /// Bakes a clay object into a game mesh with textures (slow: seconds),
     /// unless a bake with the same settings is still fresh. Call `sync` first.
     #[cfg(test)]
@@ -527,12 +979,20 @@ impl MeshLib {
     /// What a bake needs, owned so it can run on another thread; None if a
     /// bake with these settings is still fresh.
     pub fn bake_job(&self, scene: &Scene, id: u64, settings: bake::Settings) -> Result<Option<BakeJob>, String> {
-        let o = scene.get(id).ok_or("object vanished")?;
+        scene.get(id).ok_or("object vanished")?;
         let e = self.clay.get(&id).ok_or("not a clay object")?;
         if e.baked.as_ref().is_some_and(|b| b.settings == settings && Arc::ptr_eq(&b.from, &e.rest)) {
             return Ok(None);
         }
-        Ok(Some(BakeJob {
+        self.bake_inputs(scene, id, settings).map(Some)
+    }
+
+    /// What a bake of `id` reads, owned, whether or not a fresh bake exists
+    /// (displacement maps of a fresh bake read the same inputs).
+    pub fn bake_inputs(&self, scene: &Scene, id: u64, settings: bake::Settings) -> Result<BakeJob, String> {
+        let o = scene.get(id).ok_or("object vanished")?;
+        let e = self.clay.get(&id).ok_or("not a clay object")?;
+        Ok(BakeJob {
             id,
             settings,
             clay: e.key.clay.clone(),
@@ -545,7 +1005,7 @@ impl MeshLib {
             // A fine mesh already made for this rest mesh saves the bake
             // building it again.
             fine: e.fine.as_ref().filter(|f| Arc::ptr_eq(&f.from, &e.rest)).map(|f| f.mesh.clone()),
-        }))
+        })
     }
 
     /// Keeps a finished bake, unless the clay changed while it ran.
@@ -584,8 +1044,19 @@ impl MeshLib {
         e.baked.as_ref().filter(|b| Arc::ptr_eq(&b.from, &e.rest)).map(|b| (&b.mesh, b.skin.as_ref()))
     }
 
+    /// Which mesh an object draws with, ignoring sharing (see `key_of`).
     pub fn key(o: &Object) -> MeshKey {
         if o.shape.own_mesh() || crate::damage::own_primitive(o) { MeshKey::Own(o.id) } else { MeshKey::Prim(o.shape) }
+    }
+
+    /// Which GPU mesh an object draws with: clay showing the same mesh as
+    /// another object draws with that object's key, so the viewport
+    /// uploads it once and draws every copy in one instanced call.
+    pub fn key_of(&self, o: &Object) -> MeshKey {
+        match Self::key(o) {
+            MeshKey::Own(id) => MeshKey::Own(self.owner_of.get(&id).copied().unwrap_or(id)),
+            key => key,
+        }
     }
 
     /// The mesh as drawn (posed if the object's rig is playing a clip).
@@ -593,7 +1064,8 @@ impl MeshLib {
         match Self::key(o) {
             MeshKey::Prim(s) => self.prims.get(&s),
             MeshKey::Own(id) => self.solids.get(&id).map(|e|&e.1).or_else(||self.clay.get(&id).map(ClayEntry::drawn)).or_else(|| self.eyes.get(&id).map(|e| &e.1)).or_else(|| self.hairs.get(&id).map(|e| &e.1)).or_else(|| self.kits.get(&id).map(|e| &e.1)).or_else(|| self.fires.get(&id).map(|e| &e.3)),
-
+            // `key` never names a chunk (chunks are drawn, never read).
+            MeshKey::Chunk(..) => None,
         }
     }
 
@@ -612,7 +1084,8 @@ impl MeshLib {
 
     /// Every per-object mesh (clay as drawn, eyes).
     pub fn own_meshes(&self) -> Vec<(MeshKey, Arc<Mesh>)> {
-        let clay = self.clay.iter().map(|(id, e)| (MeshKey::Own(*id), e.drawn().clone()));
+        // Objects drawing another's mesh draw with its key (see `key_of`).
+        let clay = self.clay.iter().filter(|(id, _)| !self.owner_of.contains_key(id)).map(|(id, e)| (MeshKey::Own(*id), e.display().clone()));
         let eyes = self.eyes.iter().map(|(id, e)| (MeshKey::Own(*id), e.1.clone()));
         clay.chain(eyes).chain(self.solids.iter().map(|(id,e)|(MeshKey::Own(*id),e.1.clone()))).chain(self.hairs.iter().map(|(id, e)| (MeshKey::Own(*id), e.1.clone()))).chain(self.kits.iter().map(|(id, e)| (MeshKey::Own(*id), e.1.clone()))).chain(self.fires.iter().map(|(id, e)| (MeshKey::Own(*id), e.3.clone()))).collect()
     }
@@ -644,15 +1117,66 @@ impl BakeJob {
         let src = bake::Source { clay: &self.clay, rest: &self.rest, skin: self.skin.as_deref(), parts: &self.parts, library: &self.library, fallback: &self.fallback, fine: self.fine.as_deref() };
         bake::bake(&src, self.settings, progress)
     }
+
+    /// Displacement maps of `mesh` (this job's bake) against the clay.
+    pub fn displacement(&self, mesh: &Mesh, maps: bake::Maps, progress: &crate::progress::Progress) -> Result<bake::Displacement, String> {
+        if self.cloth {
+            return Err("cloth bakes have no displacement maps".into());
+        }
+        let src = bake::Source { clay: &self.clay, rest: &self.rest, skin: self.skin.as_deref(), parts: &self.parts, library: &self.library, fallback: &self.fallback, fine: self.fine.as_deref() };
+        bake::displacement(&src, mesh, maps, progress)
+    }
+
+    /// The clay's cell (the displacement check's unit).
+    pub fn cell(&self) -> Option<f32> {
+        self.clay.cell_size()
+    }
+
+    /// How far each point is from the clay's surface (|field|).
+    pub fn distances(&self, points: &[glam::Vec3]) -> Vec<f32> {
+        let Some(cell) = self.clay.cell_size() else { return vec![f32::INFINITY; points.len()] };
+        let field = crate::clay::Field::new(&self.clay, cell);
+        let all: Vec<u32> = (0..field.prim_count() as u32).collect();
+        let mut out: Vec<f32> = vec![0.0; points.len()];
+        crate::clay::par_chunks(&mut out, 4096, |chunk, out| {
+            for (k, d) in out.iter_mut().enumerate() {
+                let p = points[chunk * 4096 + k];
+                let reach = glam::Vec3::splat(cell * 4.0);
+                let near = field.near(p - reach, p + reach);
+                *d = field.sample(p, if near.is_empty() { &all } else { &near }).0.abs();
+            }
+        });
+        out
+    }
 }
 
 impl ClayEntry {
+    /// What a fine mesh is made from, by address: the rest mesh and skin.
+    /// Objects with the same slot can share one.
+    fn fine_slot(&self) -> (usize, usize) {
+        (Arc::as_ptr(&self.rest) as usize, self.skin.as_ref().map_or(0, |s| Arc::as_ptr(&s.2) as usize))
+    }
+
     fn drawn(&self) -> &Arc<Mesh> {
         match (&self.baked, &self.fine) {
             (Some(b), _) if self.use_baked => &b.shown,
             (_, Some(f)) if self.use_fine => &f.shown,
             _ => &self.shown,
         }
+    }
+
+    /// `drawn` unposed (the same vertices in the clay's space).
+    fn unposed(&self) -> &Arc<Mesh> {
+        match (&self.baked, &self.fine) {
+            (Some(b), _) if self.use_baked => &b.mesh,
+            (_, Some(f)) if self.use_fine => &f.mesh,
+            _ => &self.rest,
+        }
+    }
+
+    /// What the viewport draws: `drawn`, with the overlay if it has one.
+    fn display(&self) -> &Arc<Mesh> {
+        self.tinted.as_ref().map_or_else(|| self.drawn(), |t| &t.1)
     }
 }
 
@@ -758,6 +1282,26 @@ impl Mesh {
         Some((Mesh {vertices,indices,..Mesh::default()},remap))
     }
 
+    /// An imported mesh as drawn: welded where bit-equal, normals
+    /// smooth over shared corners, the object's material (as primitives).
+    pub fn imported(asset: &crate::mesh_asset::MeshAsset) -> Mesh {
+        let mut m = Mesh::default();
+        let (points, tris) = (asset.points(), asset.tris());
+        let mut normals = vec![Vec3::ZERO; points.len()];
+        for t in tris {
+            let [a, b, c] = t.map(|i| points[i as usize]);
+            let n = (b - a).cross(c - a);
+            for &i in t {
+                normals[i as usize] += n;
+            }
+        }
+        for (p, n) in points.iter().zip(&normals) {
+            m.vert(*p, *n);
+        }
+        m.indices = tris.iter().flatten().copied().collect();
+        m
+    }
+
     pub fn all() -> HashMap<Shape, Mesh> {
         Shape::ALL.iter().map(|&s| (s, Mesh::build(s))).collect()
     }
@@ -770,7 +1314,7 @@ impl Mesh {
             Shape::Cone => Mesh::cone(),
             Shape::Plane => Mesh::plane(),
             Shape::Torus => Mesh::torus(),
-            Shape::Group | Shape::Clay | Shape::Eye | Shape::Hair | Shape::Cloth | Shape::Fire | Shape::Kit | Shape::Terrain | Shape::Scatter | Shape::Part => Mesh::default(),
+            Shape::Group | Shape::Clay | Shape::Eye | Shape::Hair | Shape::Cloth | Shape::Fire | Shape::Kit | Shape::Terrain | Shape::Scatter | Shape::Part | Shape::Mesh => Mesh::default(),
         };
         mesh.dedupe_edges();
         mesh.orient_faces();
@@ -973,11 +1517,13 @@ impl Mesh {
 
     /// Nearest hit distance along the ray (Möller–Trumbore, both sides).
     /// `dir` does not need to be normalized; the result is in units of `dir`.
+    #[cfg(test)]
     pub fn ray_hit(&self, origin: Vec3, dir: Vec3) -> Option<f32> {
         self.ray_hit_triangle(origin, dir).map(|(t, _)| t)
     }
 
-    /// `ray_hit`, plus which triangle was hit.
+    /// `ray_hit`, plus which triangle was hit (brute force: see `pick.rs`).
+    #[cfg(test)]
     pub fn ray_hit_triangle(&self, origin: Vec3, dir: Vec3) -> Option<(f32, usize)> {
         let mut best: Option<(f32, usize)> = None;
         for (n, tri) in self.indices.chunks_exact(3).enumerate() {
@@ -1043,6 +1589,49 @@ mod tests {
             assert_eq!(bs.weights[i],skin.weights[j]);
             assert_eq!(bs.joints[i],skin.joints[j]);
         }
+    }
+
+    /// Fine builds start without blocking the caller, all at once; a film
+    /// render's ticket gets the very mesh the library installs later.
+    #[test]
+    fn fine_meshes_build_behind_tickets() {
+        let mut scene = Scene::default();
+        let ids: Vec<u64> = (0..3).map(|i| {
+            let id = scene.add(Shape::Clay);
+            scene.get_mut(id).unwrap().clay = Some(serde_json::from_value(serde_json::json!({"blobs":[{"type":"array","source":{"type":"box","center":[0,0,0],"size":[0.05,0.3,0.05]},"count":24,"step":[0.08,0,0.01 * i as f32],"blend":0}],"detail_cell":0.004})).unwrap());
+            id
+        }).collect();
+        let mut lib = MeshLib::new();
+        lib.show_fine = true;
+        lib.sync_shown(&scene);
+        assert!(lib.busy());
+        let tickets: Vec<FineTicket> = ids.iter().map(|&id| lib.fine_building(scene.get(id).unwrap()).expect("building").0).collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        let meshes: Vec<Arc<Mesh>> = tickets.iter().map(|t| t.wait_until(deadline).expect("built").expect("fine mesh").0).collect();
+        lib.sync(&scene);
+        for (&id, mesh) in ids.iter().zip(&meshes) {
+            let o = scene.get(id).unwrap();
+            assert!(lib.fine_building(o).is_none());
+            assert!(Arc::ptr_eq(lib.get(o).unwrap(), mesh), "the ticket's mesh is the one shown");
+            assert!(mesh.indices.len() > lib.rest(id).unwrap().0.indices.len() / 4);
+        }
+    }
+
+    /// An undo back to the shown meshes while a build runs drops that
+    /// build: the library is not left busy for good.
+    #[test]
+    fn going_back_to_the_shown_meshes_drops_the_running_build() {
+        let mut scene = Scene::default();
+        let id = scene.add(Shape::Clay);
+        scene.get_mut(id).unwrap().clay = Some(serde_json::from_value(serde_json::json!({"blobs":[{"type":"sphere","center":[0,0,0],"radius":0.5,"blend":0}],"resolution":32})).unwrap());
+        let mut lib = MeshLib::new();
+        lib.sync(&scene);
+        let shown = scene.clone();
+        scene.get_mut(id).unwrap().clay.as_mut().unwrap().resolution = 40;
+        lib.sync_background(&scene);
+        assert!(lib.busy(), "the edit builds in the background");
+        lib.sync_background(&shown);
+        assert!(!lib.busy(), "back to what is shown: nothing to wait for");
     }
 
     #[test]

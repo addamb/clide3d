@@ -380,7 +380,7 @@ fn two_bone_parts_stay_attached_in_the_exported_gltf() {
     scene.frame = None;
     let mut meshes = MeshLib::new();
     meshes.sync(&scene);
-    let opts = crate::gltf::Options { roots: Vec::new(), animations: true, fps: 24.0, file_stem: String::new(), lods: false, atlas: true, texel_density: None };
+    let opts = crate::gltf::Options { roots: Vec::new(), animations: true, fps: 24.0, file_stem: String::new(), lods: false, atlas: true, texel_density: None, gpu_instancing: false, blend_shapes: Vec::new() };
     let out = crate::gltf::export(&scene, &meshes, &opts).unwrap();
     assert_eq!(out.summary["skins"], 2, "{}", out.summary);
     let hose_verts = scene.get(hose).unwrap().part.as_ref().unwrap().build(&scene.materials).vertices.len();
