@@ -49,6 +49,10 @@ pub enum Brush {
     TrimDynamic,
     /// Presses both ways onto the area's plane with a sharp edge (hPolish).
     Polish,
+    /// Curvature flow under each dab that keeps creases, edges and long
+    /// lines (`sculpt::flow`): lumps go, intended lines stay. Strength
+    /// sets the passes per dab; `angle` and `keep_volume` tune it.
+    ClayPolish,
     /// Pulls a horn out along the path from its first point, curling it
     /// by `curl_deg` on the way.
     Snakehook,
@@ -69,7 +73,7 @@ impl Brush {
     /// Brushes applied as separate dabs spaced along the path; the others
     /// (paint too) sweep the whole path at once.
     pub fn dabs(self) -> bool {
-        matches!(self, Brush::Standard | Brush::Clay | Brush::ClayBuildup | Brush::TrimDynamic | Brush::Polish | Brush::Vdm)
+        matches!(self, Brush::Standard | Brush::Clay | Brush::ClayBuildup | Brush::TrimDynamic | Brush::Polish | Brush::Vdm | Brush::ClayPolish)
     }
 
     /// Dab brushes that work toward the plane of the area under the dab.
@@ -155,6 +159,59 @@ pub enum Frame {
     },
     /// Rays into the view hit the clay; see `Screen`.
     Screen(Box<Screen>),
+    /// Each point (in the call's space) cast onto the clay along a ray; see
+    /// `Project`. The record keeps the points where they landed.
+    Project(Box<Project>),
+}
+
+/// A projected frame: each point goes to where a ray from it first meets
+/// the clay, so a path drawn a little off the surface stays on the sheet
+/// under it (nearest-point snapping jumps between two blobs at a concave
+/// junction).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct Project {
+    /// The ray's direction: [x, y, z] in the call's space, "view:front"
+    /// (back, left, right, top, bottom: that view's rays), or "plane": in
+    /// `plane` through each point, across the path there.
+    pub along: Along,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plane: Option<ProjectPlane>,
+    /// Also cast the other way; the nearer hit wins (default true).
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub both_ways: bool,
+    /// Hits farther than this are misses (default 4 radii).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach: Option<f32>,
+    /// Lift each point this far along the surface normal.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub offset: f32,
+}
+
+/// `Project::along`: a direction, or a word (`view:<name>`, `plane`).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(untagged)]
+pub enum Along {
+    Dir(Vec3),
+    Word(String),
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectPlane {
+    pub normal: Vec3,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+fn is_zero(v: &f32) -> bool {
+    *v == 0.0
 }
 
 /// Screen points: `at` [h, v] pairs in a named orthographic view (world
@@ -424,6 +481,13 @@ pub struct StrokeSpec {
     /// call fills it in from the clay's active level and stores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<u8>,
+    /// clay_polish: degrees; a normal turning faster than this across a
+    /// cell is a crease and is kept (default 30).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angle: Option<f32>,
+    /// clay_polish: keep the enclosed volume (default true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_volume: Option<bool>,
 }
 
 /// What a stroke may be read from: the canonical fields plus today's.
@@ -493,6 +557,10 @@ struct SpecFile {
     cell: Option<f32>,
     #[serde(default)]
     level: Option<u8>,
+    #[serde(default)]
+    angle: Option<f32>,
+    #[serde(default)]
+    keep_volume: Option<bool>,
 }
 
 impl TryFrom<SpecFile> for StrokeSpec {
@@ -555,6 +623,8 @@ impl TryFrom<SpecFile> for StrokeSpec {
             transform: f.transform,
             cell: f.cell,
             level: f.level,
+            angle: f.angle,
+            keep_volume: f.keep_volume,
         })
     }
 }
@@ -591,6 +661,8 @@ impl StrokeSpec {
             transform: None,
             cell: None,
             level: None,
+            angle: None,
+            keep_volume: None,
         }
     }
 }
@@ -634,6 +706,8 @@ mod tests {
             transform: Some(Affine { translate: Some(Vec3::X), rotate: Some(Vec3::new(0.0, 30.0, 0.0)), scale: Some(Scale::Uniform(1.5)), pivot: Some(Vec3::Y), matrix: None }),
             cell: Some(0.001),
             level: Some(2),
+            angle: Some(25.0),
+            keep_volume: Some(false),
         }
     }
 
@@ -653,6 +727,11 @@ mod tests {
         vdm.kind = StrokeKind::Curve { closed: true };
         vdm.alpha = Some(AlphaRef { name: Some("horn".into()), rotate: 30.0, ..AlphaRef::default() });
         specs.push(vdm);
+        let mut projected = StrokeSpec::new(Brush::ClayPolish, &[Vec3::ZERO, Vec3::X], 0.1);
+        projected.frame = Some(Frame::Project(Box::new(Project { along: Along::Word("plane".into()), plane: Some(ProjectPlane { normal: Vec3::X }), both_ways: false, reach: Some(0.3), offset: 0.01 })));
+        specs.push(projected.clone());
+        projected.frame = Some(Frame::Project(Box::new(Project { along: Along::Dir(Vec3::NEG_Z), plane: None, both_ways: true, reach: None, offset: 0.0 })));
+        specs.push(projected);
         for s in specs {
             let text = serde_json::to_value(&s).unwrap();
             let back: StrokeSpec = serde_json::from_value(text.clone()).unwrap();

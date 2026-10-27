@@ -3,6 +3,7 @@
 
 use egui::{Align, Color32, Layout, Modifiers, RichText, Sense, Stroke, Ui, Vec2};
 use glam::Vec3;
+use serde_json::{Value, json};
 
 use super::icons::{self, Icon};
 use super::{ClideApp, RightTab, theme};
@@ -365,6 +366,7 @@ impl ClideApp {
         let parent_name = self.scene.get(id).and_then(|o| o.parent).and_then(|p| self.scene.get(p)).map(|p| p.name.clone());
         let mut new_pivot = None;
         let mut center = false;
+        let mut stylise: Option<(&'static str, Value)> = None;
         let Some(obj) = self.scene.get_mut(id) else { return };
         let is_mesh = obj.shape.is_mesh();
         let material = format!("lambert{}", obj.id + 1);
@@ -435,6 +437,23 @@ impl ClideApp {
                     egui::color_picker::color_edit_button_rgb(ui, &mut obj.color);
                 });
             });
+            // Stage 4d: the stylised looks, as the agent sets them
+            // (set_material preset with apply_to; an eye's style).
+            egui::CollapsingHeader::new("Stylised Look").default_open(true).show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for (label, preset) in STYLIZED_LOOKS {
+                        if ui.button(label).on_hover_text(format!("set_material {{name: {preset}, preset: {preset}, apply_to: this object}}")).clicked() {
+                            stylise = Some(stylised_look_request(id, Some(preset)));
+                        }
+                    }
+                    if obj.shape == Shape::Eye && ui.button("Stylised eye").on_hover_text("update_object {eye: {style: stylized}}: big clear iris, catch-light").clicked() {
+                        stylise = Some(stylised_look_request(id, None));
+                    }
+                });
+            });
+        }
+        if let Some((tool, args)) = stylise {
+            self.send_ui_call(tool, args);
         }
         if let Some(p) = new_pivot {
             self.scene.set_pivot_world(id, p);
@@ -456,6 +475,19 @@ impl ClideApp {
         });
     }
 }
+
+/// What a Stylised Look button sends for object `id`: the material
+/// preset on it (set_material with apply_to), or with None the stylised
+/// eye (update_object eye style).
+pub(super) fn stylised_look_request(id: u64, preset: Option<&str>) -> (&'static str, Value) {
+    match preset {
+        Some(p) => ("set_material", json!({ "name": p, "preset": p, "apply_to": id })),
+        None => ("update_object", json!({ "target": id, "eye": { "style": "stylized" } })),
+    }
+}
+
+/// The material tab's stylised looks (Stage 4d): (button, preset).
+pub(super) const STYLIZED_LOOKS: [(&str, &str); 4] = [("Skin", "skin_stylized"), ("Lips", "lips_stylized"), ("Blush", "cheek_blush"), ("Fabric", "fabric_soft")];
 
 enum RowAction {
     Click(u64, Modifiers),

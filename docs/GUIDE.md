@@ -52,7 +52,7 @@ claude mcp add --transport http clide3d http://127.0.0.1:7878/mcp
 
 Inside this repo, `.mcp.json` already registers it.
 
-It serves 72 tools; the README lists them all by area, and each section
+It serves 79 tools; the README lists them all by area, and each section
 below covers its own. The basics: `get_scene`, `create_object`,
 `update_object`, `delete_object`, `duplicate_object`, `select_object`
 (multi), `group_objects`, `parent_objects`, `set_pivot`, `set_camera`,
@@ -81,14 +81,96 @@ surface. Each blob can `add` or `carve`, has a `blend` radius, and can be
 - `project_reference`: shine the reference image onto the model from a view,
   lined up like `compare_reference`. Only visible surfaces that face the view
   get color.
-- `set_reference`: load the image to copy (absolute `.png`/`.jpg`). It finds
-  the subject, returns its main colors (palette), and overlays it on a
-  viewport pane.
+- `set_reference`: load an image to copy (absolute `.png`/`.jpg`) into a
+  view slot (`view`: front, back, left, right, top, three_quarter; default
+  front), one reference per view. It finds the subject, returns its main
+  colors (palette), and overlays it on a viewport pane (front, side for
+  left and right, top; `overlay` picks another or none). Without `path` it
+  changes that slot's overlay; `clear: true` removes the slot (every slot
+  without `view`, and a sheet's image plane of it). The reply's `slots`
+  lists the loaded views. Old calls still work: a path alone fills front,
+  `side` is the right slot, and `persp` the front slot shown on the
+  perspective pane.
+- **Turnaround sheets** (`set_reference {sheet: {path, views, boxes,
+  height, threshold}, planes, plane_opacity}`; File > Load Turnaround
+  Sheet… sends the same call): one image holding several views of the
+  subject. It is split into one slot per view (`views`, in reading order,
+  default front, right, back; front, back, left and right only) by the
+  subjects' boxes: 8-connected parts of the subject mask, parts under 15%
+  of the tallest one's height (captions, arrows) ignored, parts whose
+  columns overlap merged, left to right. A sheet that does not split into
+  as many views as named is refused with the boxes found; pass `boxes`
+  (one `[x0, y0, x1, y1]` per view, sheet pixels, inclusive) and each
+  view's subject is found inside its box. Every view gets **one scale**,
+  the tallest subject's height in pixels over `height` (default the
+  model's height at rest; needed in an empty scene), and stands on its own
+  ground line (its subject's lowest edge) at the model's lowest point.
+  `compare_reference` and `quality_report` then line the model up once at
+  that scale for every view (`aligned_by: "sheet"`) instead of fitting each
+  view on its own, so a model 10% too big, or too deep in profile, fails
+  where a per-view fit would pass; single images keep the per-view fit.
+  Each view also stands in the scene as an **image plane** behind the
+  model at the same scale (`planes`, default true; `plane_opacity` 0-1,
+  default 0.6), seen only from its own side, unlit and casting no shadow.
+  Planes are references, not geometry: exports, print, film (unless
+  `render_film show_references`), silhouettes, close-ups, framing and
+  picking leave them out; `render_views` draws them (`include_reference:
+  false` hides them). A saved scene keeps them, and opening it fills the
+  slots again. Sheets are at most 8192 pixels a side (checked before
+  decoding) and are split at 4096 at most; each view's image is at most
+  1024 a side, every view scaled by the same factor. The reply lists each
+  view's subject box, cut, ground line and pixels per unit, with an image
+  of the split. Caption-like parts big enough to pass the 15% filter
+  (wider than tall, under 40% of a view's tallest part, clear of it by a
+  gap of rows) are left out of the views' boxes and listed in
+  `captions_left_out` with a warning; pass `boxes` if one belongs to the
+  subject. Undo, redo and `history goto` bring the slots back with the
+  planes (or take them away), deleting a plane removes its slot, rays
+  (`surface_point`, picking) pass through planes, and objects parented
+  under a plane stay (under its parent) when the plane is replaced.
 - `render_views`: one contact sheet of the model from several cameras,
   rendered off screen.
-- `compare_reference`: lines the model up with the image from one view and
-  returns how well the outlines overlap (IoU), which regions are missing or
-  extra, a pixel-to-world mapping, and reference | model | overlap images.
+- `compare_reference` (in the rest pose, as `quality_report`): lines the
+  model up with the image from one view and returns how well the outlines overlap (IoU), which regions are missing or
+  extra, the contour distance, a pixel-to-world mapping, and
+  reference | model | overlap images. Each view compares against its own
+  slot's image (`front` against the front image), the slot a view object
+  names (`{view, slot}`, `{dir: [x, y, z], slot}`), or the only image
+  loaded. `views: [...]` (up to 12; default every loaded slot) compares
+  several at once and replies per view with `mean_iou` and `worst_view`,
+  one row of panels per view; one view replies flat, as before.
+  The contour distance (`contour`, default on) goes outline to outline
+  both ways: `mean` and the larger 95th percentile `p95`, in world units
+  and as `mean_pct` / `p95_pct` of the subject's height. IoU hides a thin
+  missing ear; the contour does not (a 60-pixel antenna the model lacks
+  moves IoU by 0.8% and the p95 by 48 pixels).
+  Close-ups also compare **feature lines** (`features`, default on with
+  `center`): Canny edges of the reference (its drawn lines) against the
+  model's lines (edges of its concave curvature measured on the field,
+  where creases and grooves are, plus occluding contours and normal
+  breaks), inside both outlines (2 pixels in, so the silhouette is left to
+  IoU and the contour). The reply's `features` gives `chamfer` (the mean
+  distance between the two line maps, both ways; world units and
+  `chamfer_pct` of the crop's radius), `recall` (the share of the
+  reference's lines within 2 pixels of a model line) and `precision` (the
+  share of the model's within 2 pixels of a reference line; many creases
+  everywhere would raise recall but not precision), and a fourth panel
+  draws both (red reference, cyan model, white both). A model with no
+  line where the reference has some matches none of them (recall 0, the
+  chamfer the crop's diagonal); `features` is skipped only when the
+  reference crop has no line. Drawn lines match
+  best where the drawing shows the groove as seen (a groove 2 cells deep on
+  a head sits inward of the surface drawn around it).
+  For a close-up, add `center` (a world point, such as an eye found with
+  `surface_point`) and `radius` (half the crop's size in world units): the
+  same lineup, cut to that square. The model is rendered again there at
+  `size` pixels (64–1024, default 512) and the reference is cut from its own
+  pixels, so small features compare at full detail. The reply's `closeup`
+  gives `crop_px` (the square on the whole-model panel),
+  `reference_px_per_unit` and `interior` (true when the crop is nearly all
+  inside both outlines, where a silhouette says little); the IoU, regions
+  and `pixel_to_world` are the crop's. A crop under 8 reference pixels
+  across is refused.
 
 The loop is: block out blobs, compare, fix, repeat; then sculpt the details;
 then fill a base color from the palette, project the reference, and paint the rest.
@@ -117,10 +199,27 @@ sheets can disappear between grid samples, and `thin_blobs` reports this.
   object (`material` in `create_object` / `update_object`; for clay it is the
   default for blobs that name none). Presets: `clay` (default), `skin`,
   `lips`, `cloth`, `velvet`, `leather`, `scales`, `hair`, `wood`, `plastic`, `rubber`, `metal`,
-  `polished_metal`, `gloss`. `set_material` defines new ones or changes a
+  `polished_metal`, `gloss`, `glow`, `glass`, `water`, `crystal`, and the
+  stylised `skin_stylized`, `lips_stylized`, `cheek_blush`, `fabric_soft`. `set_material` defines new ones or changes a
   preset for this scene (roughness, metallic, clearcoat, sheen, subsurface,
   pores, mottling, skin_specular, detail) and lists what each object uses. The viewport shades them (GGX highlights, a soft
   studio, a weak light near the camera for catchlights).
+- Stylised looks (the soft, saturated, forgiving skin of feature
+  animation) are presets too: `skin_stylized` (subsurface 0.6 with
+  `subsurface_radius` 1.6, a saturated scatter, no pores, mottling 0.1,
+  roughness 0.45, skin_specular 0.4, sheen 0.15 for a soft rim),
+  `lips_stylized`, `cheek_blush` (redder skin for cheeks, the nose tip and
+  ears) and `fabric_soft` (soft sheen, no weave). Use the name as a
+  material, or `set_material {name, preset, ...overrides, apply_to}`:
+  `preset` starts again from the preset's values (even over a scene
+  material of that name), the other fields override them, `apply_to` (an
+  object or up to 64) puts it on objects in the same undo step (it is
+  refused with a listing, rename, replace or delete_unused), and the
+  reply gives the stored values. `subsurface_radius` (0.1-4, default 1)
+  scales any material's scatter distances: wider, softer light under the
+  surface; in film its shadow edges measure 1.5x as wide as `skin`'s and
+  backlit ears glow through. The attribute editor's material tab has the
+  same looks as Stylised Look buttons.
 - Detail textures give surfaces real structure: a built-in library of CC0
   scanned PBR maps from [ambientCG](https://ambientcg.com) (see
   `assets/textures/LICENSE.md`): `linen`, `jersey`, `knit`, `felt`,
@@ -260,10 +359,13 @@ lip paint first. The 20 micrometer cover follows the existing lip shape.
   `scale` in the reply; `"exr"` holds 32-bit floats in the clay's units.
   `map_size` is 512, 1024, 2048 or 4096 (default the texture size, at most
   2048). `verify: true` reapplies the maps as geometry and reports
-  `max_error_cells` and `mean_error_cells`. The bake looks for the surface
-  only along the simple mesh's normal, so the vector map's R and G are
-  about 0: it is the height in vector form and keeps no overhangs (VDM
-  stamps keep those). The maps are one-off files, not saved on the object.
+  `max_error_cells` and `mean_error_cells`. With the default `lowpoly:
+  "meshopt"` the bake looks for the surface only along the simple mesh's
+  normal, so the vector map's R and G are about 0: it is the height in
+  vector form and keeps no overhangs. With `lowpoly: {poly, level}` (a
+  retopology as the game mesh, below) the maps follow the Poly's
+  projection and do keep sideways detail and overhangs. The maps are
+  one-off files, not saved on the object.
 
 ```json
 {"target":"Head", "triangles":30000, "maps":["displacement","vector_displacement"], "map_format":"exr", "save_dir":"/abs/out/maps", "verify":true}
@@ -342,6 +444,47 @@ lip paint first. The 20 micrometer cover follows the existing lip shape.
   the head. A clay braid or existing hair cap remains visible in film;
   remove an old cap if its hard edge defeats the softer hairline.
 
+- `groom` shapes the guides directly, the way a groomer combs: each stroke
+  is a brush along a path of world points (or one `point`) with `radius`,
+  `strength` and a `falloff` as in sculpt. Brushes: `comb` (turn segments
+  toward `direction`, or along the path's own direction; lengths kept),
+  `lengthen` / `shorten` (by `length`), `cut` (keep at most `length`, or
+  trim at a `plane` whose normal points at what goes), `clump` (gather the
+  guides in the brush toward their centre), `twist` (turn them about that
+  centre by `angle` degrees), `smooth` (straighten kinks), `puff` (lift the
+  root side off the scalp) and `relax` (even out the spacing between
+  neighbours). `affect: tips | roots | all` sets where along each guide the
+  brush acts (comb, clump and twist default to tips, puff to roots, the
+  rest to all); roots never move. `mirror` (default the hair's own) also
+  runs the stroke across the hair's x = 0. After every brush the guides are
+  kept at least `hair.lift` outside the clay the hair is under (`collide`
+  names another or turns it off), segment lengths restored from the root;
+  segments are checked too (sampled at the clay's cell), so a guide cannot
+  cross a thin part such as an ear between two outside points: the segment
+  turns about the point before it, around the surface. `hair.lift` is what
+  `grow` used (0.0015 for scalp hair, 0.0001 for brows and lashes); a hair
+  made without grow, or saved before groom, has lift 0.
+  The reply gives the guides changed, the mean and largest move, the mean
+  length before and after, the points pushed out, and a front and right
+  picture (`render: false` leaves it out). Each call is one undo step;
+  grooms are not stroke records (no `stroke_log`). At most 64 strokes a
+  call, 256 points a stroke, 4,096 guides of 512 points a hair, and a total
+  work bound (guide points times path points per stroke, more with a head
+  and for smooth and relax): a call over it is refused before anything
+  changes; split it.
+- Film strands are kept out of the clay the hair is under the same way, at
+  `hair.lift`: every strand point near the scalp is pushed out and every
+  segment that dips in turns around it, when the strands are built, so
+  `render_film` and the hair summary's `strands_inside_head` agree. Strands
+  the head does not reach are unchanged. `render_film` replies with
+  `hair_kept_out` (per hair: the head and how many strands moved, or why
+  they could not be kept out, also a warning). The viewport and exports
+  show cards, which are not kept out.
+- The Groom tool (toolbox, or `brush_preset set_current {tool: groom,
+  groom: comb}`): select a Hair and drag over it; the drag runs across the
+  view at the depth you pressed and sends the same `groom` call with the
+  HUD's radius, strength and falloff and the shelf's groom brush.
+
 Useful starting settings (meters; supply `grow.on` and appropriate colors):
 
 | Groom | `grow` | Film settings | Game settings |
@@ -371,6 +514,11 @@ uses the R/TT/TRT decomposition described in [PBRT's hair model](https://pbr-boo
   detail").
 - `surface_point` finds exact surface points: look in from a view at screen
   coordinates, cast rays, or snap points to the nearest clay surface.
+  One call takes up to 1024 rays and 1024 points; more is refused, never
+  cut short, so send batches. A long `at` list is read a page at a time
+  with `offset` and `limit` (at most 1024); the reply's `next_offset`
+  (null at the end) starts the next page; `at` needs a `view`. Replies
+  past about 8k characters are summarized unless `verbose: true`.
   `paint` and `sculpt` strokes take `snap: true` to do the same. These
   tools (and `render_views` / `render_film` unless given a `frame`) always
   work in the rest pose, so points stay right while a clip plays.
@@ -380,6 +528,67 @@ uses the R/TT/TRT decomposition described in [PBRT's hair model](https://pbr-boo
   crisp edge and its own color and material, and moves with the rig.
 - `color_blend` on a blob sets how wide its color fades into earlier blobs;
   0 gives a crisp color edge (a sleeve end) while the shape blends smoothly.
+
+#### Fur over a body
+
+`hair.grow {fur: true}` covers a whole clay (or chosen parts) with short
+fur. Parent the Hair to the clay:
+
+```json
+{ "shape": "Hair", "name": "Pip_fur", "parent": "Pip", "hair": { "grow": {
+    "fur": true, "on": "Pip",
+    "exclude": ["nose", "mouth", "mouth_line"],
+    "lengths": [{ "blobs": ["brow.L"], "length": 0.026 },
+                { "center": [0, 0.72, 0.17], "radius": 0.12, "length": 0.005 }] } } }
+```
+
+- Roots: `count` guides (default 2,000, at most 4,096) spread evenly over
+  the surface by area: area-weighted candidates thinned by weighted sample
+  elimination (blue noise; the reply's `root_spacing_cv` is the
+  nearest-neighbour spacing's variation, about 0.1, where random roots
+  give 0.5). Film strands (`strands`, default 160,000, at most the
+  200,000 budget; or `density` per square unit, refused when the clay's
+  area needs more) grow in each guide's cell on the surface, a sunflower
+  spiral cut to the cell, so they cover the body evenly with no bald gap.
+- Where: `exclude` and `include` take blob names (the blob making the
+  surface at a root decides; `brow.L` also names `brow.R`) or `{center,
+  radius}` spheres. The clay's Eye objects are left bare by themselves (no
+  root within 1.15 eye radii plus the length) and no strand may enter an
+  eye (`eyes: false` turns that off). Exclude the nose and mouth by name.
+- Lids: the caps of the clay's `lid` blobs grow very short, dense fur
+  (`lid_length`, default 0.35 of the length, at most 0.06 of the lid's
+  radius; a few strands a root) lying down the lid toward its margin and
+  stopping short of it, so the lid reads as part of the furred face and
+  its edge stays a clean bare line over the eye (the eye's bare sphere does
+  not apply on its own lid's cap). `lid_length: 0` or excluding a lid by
+  name leaves it bare. On bare skin left on a furred character (the lid's
+  margin, the ring round the eye) a matte, velvety skin material (Pip:
+  `roughness` 0.75, `sheen` 0.6, `skin_specular` 0.2) reads better than
+  gloss; give a glossy part such as the nose its own material.
+- Comb: a flow field from the rig, by the bone of the blob at each root:
+  down the body, out along the limbs (toward each bone's tail), and on the
+  head away from the nose (back over the head, out over the cheeks);
+  smoothed between neighbours. `direction: [{blobs or center/radius,
+  direction}]` overrides it. `lie` (default 0.8) lays the fur flat.
+- Length: `length` (default 1.2% of the clay's size) and `lengths`
+  regions (first match wins: keep the face short). Regions (and
+  `direction` regions) apply to every short strand by its own root, not
+  only to the guides rooted in them, so a small part few guides land on
+  grows its own fur: darker brow blobs with `lengths {blobs: brow.L,
+  0.026}` and a `direction` sphere on each brow (outward and up) read as
+  tufts of fur. A blob name names both sides, so give each side its own
+  sphere to comb the two brows apart.
+- Colour: each strand takes the clay's colour at its root (a blue body
+  grows blue fur, a pale belly pale fur); `tint` multiplies it, `tip_color`
+  and `tip_mix` shift the tips (default slightly lighter tips).
+- Kept out of the clay as other strands are (`groom`'s keep-out), and the
+  guides can be groomed. `update_object hair {fur: {...}}` edits the fur
+  settings later.
+- The viewport shows one short card a guide lying on the surface in the
+  clay's colour (48,000 triangles at 2,000 guides, built off the window's
+  thread); film draws the strands (on the CPU under `device: auto`).
+- Create > Fur on Selected Clay and Create > Eyelids on Selected Clay send
+  the same requests.
 
 ### Crisp anatomy, thin tips and cloth
 
@@ -447,7 +656,35 @@ whatever the camera or selection):
 - `frame`: `world` (the call's `space`), `object`, `{surface: {offset}}`
   (points snapped onto the clay, then lifted by offset) or `{screen: {view,
   at: [[h, v], ..]}}` (rays from a named view, like `surface_point`) or
-  `{screen: {camera: {view, proj, viewport}, px: [[x, y], ..]}}`.
+  `{screen: {camera: {view, proj, viewport}, px: [[x, y], ..]}}`, or
+  `{project: {along, plane, both_ways, reach, offset}}` (below).
+- `frame: {project: ...}` casts each point (in the call's space) onto the
+  clay instead of snapping it to the nearest surface point. Where two
+  blobs meet at a concave junction, nearest-point snapping leaves a
+  strand's plane and bunches points up at the junction; a projected stroke
+  stays where it was drawn. `along` is a direction `[x, y, z]`,
+  `"view:front"` (back, left, right, top, bottom: that view's rays) or
+  `"plane"` with `plane: {normal}`: the rays then lie in the plane through
+  each point, across the path there (its direction over a radius each
+  way, so the rays fan across a bend). `both_ways` (default true) casts
+  backward too and the nearer hit wins; with false, plane rays go toward
+  the clay's middle. `reach` (default 4 radii) is the farthest hit taken
+  and `offset` lifts each point along the surface normal. Each ray starts
+  a quarter radius behind its point (distances still count from the
+  point), so a point already on the surface lands where it is, not on the
+  far side of a thin sheet. Points that hit nothing are refused by index
+  before anything is recorded. A curve's smooth path is cast again after
+  it is made, and a spray's jittered dabs are each cast along their
+  center's ray (a dab that lands on nothing is left out, the same ones on
+  every replay). The record keeps the points
+  where they landed (a replay casts nothing), and its spec keeps
+  `project`, so `stroke_edit replace` with it projects again (onto the
+  surface as it is then).
+
+  ```json
+  {"target":"Head", "strokes":[{"brush":"crease", "points":[[0.1,0.16,-0.15],[0.1,0.02,-0.25],[0.1,-0.05,-0.4]], "kind":{"curve":{}},
+   "radius":0.03, "strength":0.002, "frame":{"project":{"along":"plane", "plane":{"normal":[1,0,0]}}}}]}
+  ```
 - `paint: {color, hardness, strength}` on a sculpt stroke colors the same
   stroke as it sculpts (MRGB); a `paint` call's strokes are the same spec
   with color.
@@ -468,8 +705,8 @@ A `chain` blob creates connected ellipsoidal beads evenly along its path,
 joined by a narrow core. `size` gives full bead width, length along the
 path and depth; `twist` rotates successive beads about the tangent in
 degrees; `taper` is end/start size ratio (default 1); `tilt` leans the
-beads left and right in turn (degrees). Paths have 2–128
-points and at most 512 beads; long paths increase spacing at that limit.
+beads left and right in turn (degrees). Paths have 2–512
+points (as do sweep, band and array paths) and at most 512 beads; long paths increase spacing at that limit.
 Keep the connecting core at least two mesh cells across; `thin_blobs`
 warns about undersampled links. Color, material, blend, mirror, carve, cover and rigging work as for other
 blobs. For a braid, use flat beads that lean in turn:
@@ -495,6 +732,205 @@ than the feature spacing, and render a fine mesh to inspect details):
 ]}
 ```
 
+### ClayPolish: lumps off, creases kept
+
+`smooth` blurs the field, so it rounds a lip line or a hard edge as fast
+as a lump. ClayPolish (`edit_clay polish` over a region or the whole clay,
+or the `clay_polish` brush under each dab) is mean-curvature flow on the
+sculpted surface with a guard read again before every pass: where the
+normal turns by more than `angle` (default 30 degrees) across a detail
+cell, a crease or an edge, the surface stays; where it is a long,
+strongly curved line (one principal curvature at least 0.15 per cell and
+much larger than the other: lip and lid lines, grooves) it stays too;
+short isotropic lumps flow away. With `keep_volume` (default true) each
+pass is shifted back to the volume it had, so a polished ball keeps its
+size. On a lumpy box with a crease groove, `amount: 0.6` took the lumps
+to 23% of their height and kept the 90-degree edge to 0.1 degrees and the
+groove's depth to 99.5%; plain smooth for as long rounded the edge to 147
+degrees and filled the groove to 17% of its depth.
+
+```json
+{"target":"Head", "polish":{"amount":0.5, "region":{"center":[0,1.62,0.08], "radius":0.06}}}
+```
+
+- `amount` 0..1 is how long it flows: amount x 128 passes (default 0.1,
+  13 passes: it takes the lumps `quality_report` reads, up to about 4
+  cells across, and keeps short grooves on a curved head; 0.5 rounds
+  them to 36-52% of their depth); `passes` (a whole number 1-256; 20.0 counts) overrides it. The flow is a heat equation
+  on the surface, so small lumps go first: lumps two cells across fall to
+  about a quarter by 0.6, wide swells take longer.
+- `region` is `{center, radius or radii (along the clay's axes), space}`,
+  world space by default (`space: "object"` for the clay's own); it fades
+  out over its outer fifth and is clipped to the clay, so a region larger
+  than the clay polishes all of it. Without it the whole clay polishes.
+- The persistent mask and hidden polygroups hold points still, as they do
+  a stroke's (the record keeps what it read by hash, so it replays the
+  same after the mask changes); the surface around them flows up to them.
+- It runs on what you see (the blobs and every enabled sculpt layer) at
+  the detail cell and in every detail region it reaches, and writes
+  offsets to `layer` (default the recording layer, else base).
+- It is one record on that layer's ledger (`stroke_log`: kind `action`,
+  with the call's polish and, with `full`, the resolved action: region in
+  the clay's space, passes and the cell it ran at). It replays with the
+  same kernel, the same on any thread count; `stroke_edit` disables,
+  deletes or moves it.
+- At most 3M surface points in each detail level it reaches (the coarse
+  grid and each detail region count apart): the bound is checked while
+  the surface is read, which stops at the cap, and the call is refused
+  naming a smaller region or a coarser cell. A level's working memory
+  stays under about 135 MB (a smooth 1M-point band takes about 35 MB).
+- About 1M points take 0.16 s for 8 passes (1.3 s at the default 64).
+  With `polish`, `edit_clay` runs as a background job: the window stays
+  live, later edits wait in line behind it, and the reply waits for the
+  mesh up to `wait_s` as without polish (past about 40 s it answers with
+  a job id; see `job_status`).
+- The guard keeps any long, strongly curved ridge, a seam between two
+  blobs too: lower `angle` or polish that region alone.
+
+### Measuring quality: lumpiness, curvature and quality_report
+
+`quality_report` measures a clay in one call and says where to fix it.
+The loop is: `quality_report`, fix the worst (an `edit_clay polish` with
+the region it names, a stroke, a blob), and report again until it passes.
+
+```json
+{"target":"Head", "regions":[{"name":"face", "center":[0,1.62,0.08], "radius":0.08}]}
+```
+
+- **Lumpiness** is measured on the clay's field, not on the mesh or a
+  camera (D12), so it reads the same at any mesh resolution. At points
+  spread evenly over the surface (`samples`, default 40,000; 1,000 to
+  200,000), it fits a smooth surface through the surface around each point
+  (24 heights within 4 cells, a weighted quadric) and takes how far the
+  surface lies off it: a band-pass residual that reads lumps up to about
+  4 cells across in full, longer swells less. The score is the RMS in
+  cells, the finest sculpt cell at each point (else `detail_cell`, else the
+  mesh cell). A sphere with lumps of RMS 0.05 to 0.4 cells scores 0.034 to
+  0.29 against its surface's own RMS of 0.035 to 0.27; a clean sphere 0.0002.
+- **Intended detail** is left out: the footprints of texture strokes
+  (`noise`, `crease`, `pinch`, `vdm`, any brush with an alpha) and sharp
+  edges. Along a line (a groove, a ridge, a thin tube, an edge: one strong
+  principal curvature), the fit runs along the line, so the line's own
+  section is kept and lumps along it still count. A carve that is meant to
+  be there (a dimple) can be left out with `regions: [{..., exclude: true}]`.
+- The reply gives `pass`, `failures` (`"lumpiness face 0.081 > 0.05"`),
+  `hints` (a ready-made polish at the worst lump, at polish's default
+  amount 0.1, a light pass that keeps short grooves;
+  legacy sweeps that own lumps, with the update that upgrades them),
+  `lumpiness {overall, regions [{name, score, worst_at}], worst}`,
+  `curvature {p95_abs_h_cell}` and `topology {watertight, non_manifold,
+  min_wall, thin_at, triangles}`. `min_wall` is in world units along each
+  point's normal through the object's scale (a squashed shell is as thin
+  as it looks). A report that measured nothing does not pass: no point
+  measured, most samples unfit, every point intended detail or excluded,
+  or a region holding no counted point each fail as `unmeasured`. `worst` lists up to 8 points lumpier
+  than the threshold, at least 16 cells apart, with their residual in cells
+  (+ above the smooth surface, - below). Points are world space at rest,
+  as `sculpt` and `polish.region` take them.
+- **Close-ups:** `closeups: [{name, center, radius, view, size}]` (up to
+  16) compare each square as `compare_reference` does with `center`, with
+  feature lines: `closeups [{name, view, iou, feature_pct, recall,
+  precision, reference_line_px, model_line_px, interior}]`, failing
+  `feature_pct` over the threshold, or no model lines where the reference
+  has some.
+- **Silhouettes:** with reference images loaded (`set_reference`, one per
+  view slot), each view is compared as `compare_reference` does, drawing
+  only the target and the objects under it: `silhouette {views [{view,
+  slot, iou, contour_pct, contour_p95_pct, missing, extra, regions}],
+  mean_iou, worst_view}`. `views` picks them (default every loaded slot;
+  none loaded: skipped). More than 6 views run as a job.
+- Thresholds (D14) default to lumpiness 0.05, silhouette IoU 0.95,
+  contour 1% of the subject's height (the mean, `contour_pct`) and 3% (the
+  95th percentile, `contour_p95_pct`: a thin missing antenna or limb that
+  IoU and the mean barely see), close-up features 1.5% of the crop radius
+  and walls 0.002 units; `thresholds: {...}` overrides any.
+- `images: true` adds the curvature and lumpiness sheets of the target:
+  the mesh the viewport draws (fine or baked when shown), colored from
+  what was measured and drawn at rest (a job draws the clay as it
+  measured it).
+- Over 40,000 samples it runs as a background job. The reply is the same
+  every time and on any thread count.
+
+`render_views shade` draws the same measures: `curvature` (mean curvature
+x cell, blue concave, white flat, red convex, clamped at +-0.3), `lumpiness`
+(white smooth to magenta at 0.2 cells, intended detail grey), `normals` and
+`wire` (mesh edges over the beauty render). Without `shade` it draws the
+viewport's (`set_display shade`, wire too); an explicit one wins over the
+viewport's. `set_display shade` (and
+Shading > Quality in the viewport menu, which sends the same call) shows
+one in the viewport, as does the Shade row in the brush HUD. Curvature and
+lumpiness are measured again when a clay's mesh changes, on another thread
+and only while a shade is on: while strokes come in the clay draws without
+the colors (its sculpt chunks), and they show again once the strokes pause
+and the mesh is measured.
+
+### Proportion guides: head units, lines and targets
+
+`guides` keeps proportion guides with the scene (saved; `set` and `clear`
+are undo steps) and measures the model against them. Guides are not
+objects: they are drawn over the viewport (`set_display guides`, on by
+default; Display > Proportion Guides) and over `render_views guides:
+true` tiles after the render, so exports, print, film, masks, silhouettes
+and rays never see them.
+
+```json
+{ "action": "set", "target": "Creature",
+  "head_units": { "count": 3 },
+  "lines": [{ "name": "eye_line", "y": 0.62 }, { "name": "center", "x": 0 }],
+  "targets": [
+    { "name": "head_ratio", "of": ["head"], "value": 0.4, "tolerance": 0.02 },
+    { "name": "eye_spacing", "between": ["eye.L", "eye.R"], "per": "head_unit", "value": 0.35, "tolerance": 0.02 },
+    { "name": "eyes_on_line", "between": ["eye_line", "eye.L"], "value": 0, "tolerance": 0.01 }
+  ] }
+```
+
+- `head_units {count 2-8, bottom, top}`: a line every (top - bottom) /
+  count (world y). Without `bottom` or `top` they come from `target`'s
+  height and are stored as numbers, so the guides stay put while the model
+  changes.
+- `lines`: at most 32 named planes, `{name, y}`, `{name, x}` or `{name, z}`.
+- `targets`: at most 32, each `{name, value, tolerance}` and either a
+  ratio, `of: [parts]` over `to` (the parts' extent along `axis`, default
+  y, together; `to` is `total_height` (default), `total_width`,
+  `total_depth`, `head_unit`, `sheet_height` or a part), or a distance,
+  `between: [end, end]` (a part's centre, a line's plane or a world point;
+  euclidean, or signed along `axis`, or along the line's axis), perhaps
+  `per` a length (`total_height`, `total_width`, `total_depth`,
+  `head_unit`, `sheet_height` or a part: the part's height, whatever
+  axis the distance takes, unless `per_axis` names another; `set` stores
+  the y, and guides saved before `per_axis` keep their old meaning, the
+  distance's axis).
+- A part is a blob of the measured clay by name (both sides of a mirrored
+  blob; `eye.L` with mirror on is the side as written and `eye.R` its
+  copy), else an object by name (eye objects, other clays by their field,
+  the rest by their mesh).
+- Each `set` replaces the parts it names (null clears one); `clear {parts}`
+  removes some or all; `get` lists them.
+
+`measure {target}` replies the model's height, width and depth; with head
+units, the unit, the model's height in heads and every named blob's top
+and bottom in heads counted down from the top line; each target's
+measured value, error and pass (or the problem: a name that resolves to
+nothing); `pass` and `failures`. With a turnaround sheet loaded, `sheet`
+gives each view's subject height (and in heads), the model's height over
+it, and at each y line the sheet subject's width and the model's section
+across the view. Extents are measured on the field, not the mesh: a
+blob's on its own shape (all of it, also where it is buried in another
+blob), the model's on the composed surface, to about 1e-5 at any mesh
+resolution. The search goes box by box from the outside in, skipping only
+boxes the field shows to be empty, down to a quarter of the clay's cell
+(or 1/1024 of the model, when that is coarser), so a thin part reaching
+past the rest (a horn, an ear tip, a finger) is found even where it is
+about as thin as the cell; a part much thinner than that can still be
+missed. For a part sunk into another, pick landmarks with
+`surface_point` and measure `between` the points. The reply is the same
+every time.
+
+`quality_report` includes the guides as `proportions` when any are set,
+and every target out of tolerance is a failure (`proportions: false`
+leaves them out). Display > Measure Proportions sends `guides measure`
+for the selection and shows the reply in the Proportions window.
+
 ### Clay brushes, alphas, presets and posable symmetry
 
 The plane brushes work dab by dab toward the plane of the area under the
@@ -511,6 +947,10 @@ form and fill or cut against it:
 - `trim_dynamic` cuts what stands above the plane (never adds) and
   `polish` presses both ways onto it; both have a flat, sharp-edged
   falloff unless given one.
+- `clay_polish` is curvature flow under each dab that keeps creases, hard
+  edges and long lines (see ClayPolish below); strength sets its passes
+  per dab (1 to 8), `angle` (default 30) and `keep_volume` (default true)
+  tune it.
 - `snakehook` pulls a horn out of the surface along `points` (the first on
   the surface, the rest out in the air, up to 16 radii; or one point and
   `delta`). `curl_deg` curls it about `normal` (default level, across the
@@ -641,7 +1081,9 @@ Scale gizmo sends this same stroke on release instead of moving the
 object.
 
 Polygroups are ids on the surface with a name and visibility each; the
-`group` tool's actions are records on the group ledger: `"from_blobs"`,
+`group` tool's actions are records on the group ledger: `"from_blobs"`
+(group n + 1 is blob n, both sides of a mirrored blob in one, named after
+the blob or `blob n`),
 `{from_mask: {threshold, id}}`, `{from_normals: {angle}}`, `{paint: {id,
 strokes}}`, `{rename: {id, name}}`, `{show|hide|isolate: {ids}}`,
 `"show_all"`, `"clear"`, `"list"`. Brushes skip hidden groups and the
@@ -755,10 +1197,25 @@ takes it out again.
 `export_print {path}` writes `.stl`, `.obj`, `.ply` or `.3mf` for a
 slicer: one welded mesh of the targets (default every visible solid) in
 millimeters, Z up, on the plate. `size_mm: {axis, value}` scales it to a
-size, `hollow: {wall_mm}` hollows clay inward, `fine` uses fine meshes.
+size, `hollow: {wall_mm}` hollows clay inward, `fine` uses fine meshes
+(with `detail_regions`, fine only where they are, so a whole figure can
+print with 0.25 mm pores on the face and hands at a few percent of a
+uniform 0.25 mm mesh). `max_triangles` (default 20,000,000, at most
+50,000,000) refuses the export before anything is built when the estimate
+(made on the clay as shown, every sculpt layer) is larger, and refuses it
+again, writing nothing, when the mesh built (after `simplify`) is larger:
+the estimate can run low, so leave headroom. `simplify: {error_mm}`
+(0.001–1) simplifies the welded mesh to within that many millimeters and
+checks it again, writing the unsimplified mesh with a warning if it would
+not stay watertight. Where two sheets of a
+fine mesh touch at a single point (a pore's rim, two parts meeting), the
+copies of the shared corners are moved apart by max(0.005 mm, 0.02 x the
+edges there), above slicers' weld tolerance, so the file stays manifold.
 The reply says whether it is `watertight` (every edge used by exactly two
-triangles) and gives `non_manifold_edges`, `volume_cm3` and `bbox_mm`.
-File > Export for Print… sends it.
+triangles) and gives `non_manifold_edges`, `non_manifold_by_kind {open,
+over_used, pinched}`, `pinches_separated` (copies moved) and `pinch_offset_mm`,
+`estimated_triangles`, `simplified_from`, `warnings`, `volume_cm3` and
+`bbox_mm`. File > Export for Print… sends it.
 
 #### 3D printing workflow
 
@@ -861,6 +1318,8 @@ is on. Every control is a front end for a tool call:
   previews while it drags and sends one `sculpt_layer amount` on release);
 - mask and group controls (`set_display overlay`, `mask` actions,
   `group show | hide | isolate | show_all`);
+- the quality shade (`set_display shade`: beauty, curvature, lumpiness,
+  normals or wire, as Shading > Quality sends it);
 - Adjust Last (`stroke_edit {action: scale, last: true}`), a history
   scrubber (`history goto` and `mark`) and Save brush (`brush_preset save`).
 
@@ -880,7 +1339,7 @@ The request carries the pressure in its samples and names the source in
 the samples before they are sent, so a replay smooths nothing again.
 
 The brushes are standard, clay, clay_buildup, clay_tubes, trim_dynamic,
-polish, add, carve, inflate, deflate, smooth, flatten, crease, pinch,
+polish, clay_polish, add, carve, inflate, deflate, smooth, flatten, crease, pinch,
 layer, grab, snakehook, vdm and (for the Mask tool) mask_paint; the
 Sculpting shelf has the preset list, brush, radius, strength, invert, X
 symmetry and the Paint tool's color. Agents read and set the same brush
@@ -976,6 +1435,300 @@ version 2: every record made by the version-1 kernel (before detail
 levels) is reported `engine_stale` in `stroke_log`, and `stroke_edit
 {action: rebase}` replays it with the current kernel.
 
+### Polygon objects: subdivision levels and creases
+
+A Poly object is a polygon cage (mostly quads; triangles and n-gons are
+fine) with Catmull-Clark subdivision levels and semi-sharp creases. Clay
+stays the place to sculpt; a Poly is made from a clay and is what later
+stages retopologize, project detail onto and export with maps. One tool,
+`poly`, does everything with an `action`:
+
+```json
+{"action":"from_clay", "source":"Head"}
+{"action":"subdivide", "target":"Head_poly", "levels":3}
+{"action":"set_level", "target":"Head_poly", "level":1}
+{"action":"crease", "target":"Head_poly", "angle":40, "sharpness":2}
+{"action":"crease", "target":"Head_poly", "edges":[[12, 13], [13, 40]], "sharpness":10}
+{"action":"info", "target":"Head_poly"}
+```
+
+- `from_clay` (a background job) makes a new Poly in the clay's place from
+  its rest surface-nets mesh: the triangle pairs the mesher wrote for each
+  quad become quads again, points are welded, pinched sheets get their own
+  corners and points where parts touch are split, so every edge is in two
+  faces. It is dense and unclean (about half its points are not
+  four-way): a quick start, not a retopology. The reply has the `info`
+  below plus `hausdorff_cells` and `mean_distance_cells`, the largest and
+  mean distance from the cage's points to the clay (in its mesh cells),
+  measured at `distance_samples` of them: at most 20,000 evenly picked, so
+  the largest is a sampled one-sided Hausdorff distance, not the exact
+  one. The clay is hidden unless
+  `hide_source: false`. A clay whose mesh fell back to marching
+  tetrahedra (ambiguous cells) gives a cage of triangle pairs.
+- `subdivide {levels}` keeps 0-6 levels. Every level makes one quad per
+  face corner, so faces grow four-fold; a call whose finest level would pass
+  16,000,000 faces is refused from the counts, before anything is built,
+  and says how many levels fit. It shows the finest kept level of at most
+  4,000,000 faces.
+- `set_level {level}` picks the level the viewport draws and renders and
+  exports take (0 is the cage). Its drawn mesh (up to 4,000,000 faces)
+  builds in the background: the old level shows until it is in, and later
+  calls wait in line for it (read-only ones go ahead). Page Up and Page Down step it for the
+  selected Poly; Modify > Poly from Clay and Modify > Subdivide Poly send
+  `from_clay` and `subdivide`.
+- `crease` (a short background job) sets semi-sharp creases on cage edges, by point pairs (`edges`,
+  up to 65,536 a call, each point 0 to `info`'s `cage_points` less one) or
+  by `angle` (every edge whose faces meet more sharply; refused when that
+  picks more than 65,536 edges, and with sharpness 0 it picks only edges
+  creased now). A crease of sharpness s uses the sharp rules for s levels and
+  then the smooth ones (fractions blend; DeRose, Kass and Truong 1998), so 2
+  is a tight bevel, 0.5 a soft one, 10 stays sharp at every level and 0
+  removes the crease. Open borders always stay sharp, and a border corner
+  stays put.
+- `info` (a short background job: it builds the cage's adjacency off the
+  window's thread): `points` (those the faces use) and `cage_points` (every
+  index), faces, edges, quads_pct, the valence histogram, irregular_pct
+  (interior points without four edges), boundary loops, open,
+  non-manifold and flipped edges, `non_manifold_points` (where parts meet
+  only at a point), components, Euler characteristic and genus (a
+  non-manifold point counts once per fan of faces around it, as if split
+  the way `from_clay` splits them), the levels and each level's faces,
+  creases, `made_by` and a content hash.
+- `rebuild` runs the call that made the cage (`from_clay` or `retopo`,
+  kept in `made_by`) again on the clay it came from (levels kept while
+  they fit; creases kept if the faces are the same).
+  `to_clay` (with `resolution`, `mode`, `blur` and `polish`) turns the
+  shown level into clay in place, as `to_clay` does.
+
+A Poly is drawn, picked, rendered and exported (`export_glb`,
+`export_fbx`, `export_print`) at its shown level as triangles, with its
+quads' sides as the wireframe. It saves compactly (the cage, its creases
+and the level count; levels are rebuilt on load) and every action is an
+undo step. `quality_report` on a Poly reports its topology, `quads_pct`,
+`irregular_pct` and `hausdorff_cells` (the shown level's points, edge
+middles and face middles against its source clay, at most 20,000 evenly
+picked, as `retopo` measures; threshold 1 cell), with silhouettes and
+close-ups as for clay. A linked mirror copy of a Poly follows its levels
+and creases. Damage stamps are not drawn on a Poly (the `damage` tool
+refuses one, as it does an imported mesh).
+
+### Retopology: a clean quad cage
+
+`retopo` (a background job) turns a clay into a clean, mostly four-way
+quad cage: a new Poly object in the clay's place, ready for `poly
+subdivide`, creases and (later stages) projection and export. It is
+in-house field-aligned retopology (Instant Meshes, Jakob et al. 2015):
+an orientation field that follows the form and a lattice position field,
+both solved coarse to fine on the clay's remeshed surface; quads are
+taken where the lattices meet, odd faces are paired away, a final split
+makes every face a quad (`pure_quads`, default on), and the points are
+fitted onto the clay. The same call gives the same cage on any machine
+thread count.
+
+```json
+{"target":"Head", "faces":8000}
+{"target":"Head", "faces":4000, "guides":[[[0.09,1.84,0.33], [0.0,1.86,0.34], [-0.09,1.84,0.33]]], "density":[{"center":[0,1.9,0.3], "radius":0.1, "scale":0.5}]}
+{"target":"Bolt", "faces":2000, "keep_creases":30, "symmetry":"none"}
+```
+
+- `faces` (500-200,000, default 8000) is the quad count after the final
+  split; the cleaned cage before it has about a quarter of that.
+- The edge flow follows the clay's principal curvature, and lines it must
+  follow become edge loops: creases (edges whose faces meet at more than
+  `keep_creases` degrees, default 40: a box's edges and a cylinder's rims;
+  their corners stay), `guides` (world polylines at rest, up to 64 of 2-256
+  points; lay them on the surface, from `surface_point`), polygroup
+  borders (`keep_group_borders`, default on) and the symmetry plane.
+  Where two lines cross, the crossing is a fixed corner.
+- `symmetry`: `x` mirrors the clay's x >= 0 half (in its own space), so the
+  cage is exactly symmetric; `none` does not; the default does when the
+  clay and its polygroups are X-symmetric within a cell. When the edge flow
+  finds no clean loop on the plane the cage is made whole and a note says
+  so.
+- `adaptive` (0-1, default 0.3) makes curved parts denser; `density`
+  regions (up to 16 `{center, radius, scale}`, scale 0.25-4) scale the
+  edge length near a point. `source: fine` fits the fine detail surface
+  (for parts under two cells thick).
+- The reply has the object, `faces`, `quads_pct`, `irregular_pct`
+  (interior points without four edges), `before_split` (the cleaned cage's
+  faces, quads, triangles, pentagons and valences), `edge_cv` (edge length
+  deviation over mean), `hausdorff_cells` and `mean_distance_cells` (the
+  cage's points, edge middles and face middles to the clay, in its cells),
+  `coverage_cells` (the clay's surface to the cage), `symmetric`,
+  `symmetric_error`, the cage's topology, timings and a wireframe image of
+  the front and right views (`images: false` leaves it out).
+- Sizes are checked before any work: faces, guides, density regions and
+  the input the faces need (8 points per face, at most 2,000,000).
+- Loose crumbs (separate bits of the clay's mesh smaller than four output
+  faces, as a strong crease stroke can leave) are dropped before
+  remeshing, and a note says how many; the largest part always stays.
+- Modify > Retopologize… sends the same call; `poly rebuild` runs it
+  again (guides and density are kept in the clay's own space), and
+  `quality_report` on the result measures it against the clay.
+
+### Projecting detail onto levels, UVs and maps
+
+A retopologized cage is smooth; the clay's sculpted detail goes onto the
+Poly's subdivision levels with `poly project`, as tangent-space vector
+displacement per level, and from there into maps with `bake`.
+
+```json
+{"action":"uv", "target":"Head_retopo"}
+{"action":"project", "target":"Head_retopo", "levels":4}
+{"target":"Head", "lowpoly":{"poly":"Head_retopo", "level":2}, "maps":["vector_displacement","displacement"], "map_size":4096, "map_format":"exr", "save_dir":"/abs/out/maps", "verify":true}
+```
+
+- `poly project` (a background job) works coarse to fine: each level's
+  points are subdivided from the level above as projected, moved onto the
+  clay, and the move kept in the point's own frame. Each level holds only
+  its own band of detail, the finest lies on the clay, and the detail
+  turns with the cage when the cage is edited. `source` defaults to the
+  clay the Poly was made from; the clay's unchecked strokes settle first
+  (`settled`).
+- `levels` (1-6, default the levels kept) subdivides as needed (refused
+  above 16M faces). `mode: "vector"` (default) moves each point to the
+  surface along its normal, or to the nearest surface point within `cone`
+  degrees of the normal (default 45) when that is under half as far or
+  the normal finds nothing; `"scalar"` uses the normal only. `reach`
+  (default 3 mean cage edges) is the farthest a point moves: detail
+  farther out than that is missed and counted (`per_level[].missed`,
+  `notes`); send a larger reach for big overhangs.
+- The clay holds no detail finer than its sculpt cell, and its surface
+  turns in small steps at the cell's faces. Where a level's edges are
+  shorter than the cell, the level's moves are smoothed over about half a
+  cell (`per_level[].smoothing_passes`), so the fine levels do not copy
+  those steps into renders; levels with edges of a cell or more are not
+  touched.
+- The reply has, per level, the RMS and largest move in cells and how
+  each point was placed; for the finest level `hausdorff_cells`,
+  `mean_distance_cells`, `rms_cells`, `normal_rms_deg` and
+  `coverage_cells` (the clay to the level). It shows the finest projected
+  level. `info` lists `displaced_levels` and `projected`. A 5,000-quad
+  cage over four levels (1.3M points) takes about a second.
+- `poly uv` (a background job) unwraps the cage into one UV tile (`size`
+  512-8192, default 2048; `padding_px` 0-32, default 4) with every face
+  whole in one chart; levels take face-varying linear UVs, so seams stay
+  seams. The reply has charts, seams, `utilization`, `area_spread` and a
+  picture of the layout. `udim: true` spreads the charts over UDIM tiles
+  (see UDIM texture tiles below).
+- `bake` with `lowpoly: {poly, level}` uses that level of the Poly,
+  subdivided with no displacement (what another program's Catmull-Clark
+  makes of the cage), as the game mesh: two triangles a quad, the Poly's
+  UVs (or an unwrap made for the bake). Each texel of the maps finds the
+  Poly's projected surface at the same place and snaps it onto the clay,
+  so vector maps reapplied to that level reproduce the projection,
+  overhangs included, where a height map cannot. The bake is made again
+  when the Poly changes.
+- Modify > Unwrap Poly UVs and Modify > Project Clay Detail… send the
+  same calls. A linked mirror copy keeps the levels' detail and the UVs.
+
+### Exporting the subdivision cage and maps
+
+`export_poly` (a background job) writes what a studio pipeline takes from
+a Poly: geometry another renderer subdivides, plus maps that put the
+sculpt back on. File > Export Subdivision Cage… sends the same call for
+the lead Poly.
+
+```json
+{"target":"Head_retopo", "path":"/abs/out/head.obj"}
+{"target":"Head_retopo", "path":"/abs/out/head.obj", "maps":["vector_displacement","displacement","normal","color","ao"], "map_size":4096}
+{"target":"Head_retopo", "path":"/abs/out/head.glb", "maps":["normal","color","ao"]}
+{"target":"Head_retopo", "path":"/abs/out/head.usda", "maps":["displacement","normal"], "space":"tangent"}
+```
+
+- The geometry is `level` (default 0, the cage; a `.glb` defaults to the
+  shown level) with no displacement. `.obj` keeps the polygons (quads,
+  n-gons), a `vt` per face corner (v up) and the creases as OpenSubdiv's
+  `t crease 2/1/0 i j sharpness` tags (0-based points). `.glb` holds the
+  level as triangles with the baked textures, and the cage itself in the
+  mesh's `extras.clide3d_cage`. `.usda` is a Catmull-Clark `Mesh` with
+  `creaseIndices`/`creaseLengths`/`creaseSharpnesses`, a faceVarying
+  `primvars:st` and a `UsdPreviewSurface` reading the maps. A finer level
+  carries the cage's creases less one per level, so subdividing it
+  further gives what subdividing the cage gives.
+- The conventions are Catmull-Clark with edge-and-corner borders,
+  semi-sharp creases (sharpness s stays sharp for s levels; 10 is
+  infinite) and linear face-varying UVs; `<stem>.json` beside the file
+  (the sidecar) states them with each map's file, format, scale and
+  decoding.
+- Maps (default `vector_displacement` and `normal`; `[]` for none) sit on
+  `map_level` (default the finest projected level; a `.glb`'s on the
+  level it holds): the written level subdivided `map_level - level` more
+  times with no displacement. Vector maps are 32-bit EXR and height maps
+  16-bit PNG by default (`map_format` sets both); normal, color and AO are
+  8-bit PNG. `space: "tangent"` (default) has R along +u, G up the image
+  (the bitangent), B along the normal; `"object"` is the Poly's x, y, z
+  and needs no frame to match. Values are in the Poly's units. Maps need
+  `poly uv` first and the clay (`source`, default the one the Poly was
+  projected or made from; its unchecked strokes settle first), and the
+  Poly placed like the clay up to a move, a turn and an even scale.
+  `map_size` is 512-4096.
+- `verify` (default on) reads the files back alone: the cage against the
+  one written, then the cage subdivided to `map_level` with the map from
+  its file added (diced to half a cell), measured against the clay
+  (`max_error_cells`) and the Poly's shown level (`to_shown_level`).
+- Nothing is overwritten but this writer's own kind of file (or an empty
+  one): a folder, a link, an unreadable file or another format at any of
+  the paths is refused before any work.
+- `import_mesh` with `as: "poly"` reads an `.obj` (or the `.glb` and
+  `.usda` this writes) back as a Poly with the same cage, creases and
+  UVs.
+- `udim: true` (`.obj` or `.usda`) also writes the Poly's texture tiles
+  and per-tile maps (next section).
+
+### UDIM texture tiles: painting, baking and exporting
+
+A Poly can carry texture maps on UDIM tiles 1001-1100 (ten a row: tile
+1001 + u + 10 v by the UVs' whole parts), painted with the same strokes
+as clay paint and exported as standard UDIM files.
+
+```json
+{"tool":"poly", "target":"Head_retopo", "action":"uv", "udim":true, "tiles":4, "size":4096}
+{"tool":"bake", "target":"Head", "lowpoly":{"poly":"Head_retopo"}, "udim":true, "texture":4096}
+{"tool":"paint", "target":"Head_retopo", "resolution":4096, "strokes":[{"points":[[0,1.6,0.1],[0.05,1.62,0.1]], "radius":0.02, "color":[0.8,0.3,0.3], "snap":true}]}
+{"tool":"paint", "target":"Head_retopo", "channel":"roughness", "value":0.3, "strokes":[{"point":[0,1.7,0.1], "radius":0.05, "snap":true}]}
+{"tool":"export_poly", "target":"Head_retopo", "path":"/abs/out/head.obj", "udim":true}
+```
+
+- `poly uv` with `udim: true` packs the charts at `texel_density`
+  texels per unit of surface on tiles of `size` texels (or, without it,
+  at the density that fills about `tiles` tiles, 1-100, default 4); each
+  chart stays on one tile. The reply's `udim` lists the tiles, the
+  density and each chart's (`chart_density`), and how many charts cross
+  a tile (0). A chart larger than a tile at the density is refused.
+- Channels: `color` (sRGB), `roughness` and `mask` are painted;
+  `normal` and `ao` come from a bake. Each channel has one resolution
+  for all its tiles (256-8192 texels a side; `bake udim` bakes at
+  512-8192), kept as 256 x 256 pages of
+  16-bit RGBA made where something is written; a Poly holds at most
+  4 GiB of them, and a call that would pass that is refused before it
+  writes.
+- `paint` on a Poly resolves its strokes on the shown level (frames,
+  snapping, pressure, symmetry, falloff as clay paint) and paints each
+  texel whose point on that level is under the stroke and faces the way
+  the surface under it does. Both sides of a UV seam (and of a tile
+  border) see the same stroke, and texels just outside each face are
+  painted too, so seams do not show. Each stroke is a record: undo,
+  save and load keep it, and a new `poly uv` paints the strokes again in
+  the new layout. Alphas, masks, layers and fills are clay paint's.
+- Two colour sources: paint on the clay before the retopology, `bake
+  udim: true` to the tiles (it replaces colour, roughness, normal and AO,
+  and drops strokes on colour and roughness, saying how many), then paint
+  on the Poly. A later `poly project` does not touch the tiles.
+- The colour tiles show in the viewport and in `render_film` (as the
+  colour of the diced surface, so about a pixel fine there; both
+  tracers). Roughness, mask, normal and AO tiles are exported, not
+  rendered.
+- `export_poly` with `udim: true` writes `<stem>.<channel>.<UDIM>.png`
+  for each tile with texels (16-bit RGBA, straight alpha: A is the
+  coverage over the material) and the displacement maps per tile as
+  `<stem>.<map>.<UDIM>.<ext>`; the sidecar lists every file. In the
+  `.obj` and `.usda` each tile's v is flipped in place, so tile 1011
+  stays above 1001. `import_mesh as: "poly"` reads the tiles the sidecar
+  lists back texel for texel.
+- The Paint tool works on a Poly in the editor (other brushes are for
+  clay) and sends the same `paint` call.
+
 ### Viewport graphics: shadows, ambient occlusion, bloom and sky
 
 The viewport (and `render_views` and `render_animation`, which draw
@@ -1030,6 +1783,26 @@ before and after pictures for each feature.
   share one ray tree and take turns adding samples, so each view gets an
   equal share of `time_limit`. Any view (here, in `render_views` and
   `check_export`) may frame its own point: `{view, center, radius}`.
+- Poly objects (see Polygon objects) render as their Catmull-Clark
+  surface with their projected displacement, every stored level included
+  (not only the shown one), diced so edges are about `dice_rate` pixels
+  (default 1) where the cameras see them. Each cage face takes the level
+  its size on screen asks for, up to `subdiv_max_level` (default 6, and
+  at most 8M evaluated faces); faces next to coarser ones snap their
+  points along the shared edge to the coarser side's, so the surface stays
+  watertight. `displacement: false` renders the smooth surface;
+  `subdiv_max_level: 0` renders the shown level as before. `max_diced`
+  (default 24,000,000 triangles, the sum over all Polys of the render) is
+  kept by dicing every face of every Poly a level coarser (the reply's
+  note says so). When level 1 everywhere still does not fit, the Poly
+  with the most triangles renders at its shown level instead, as before
+  subdivision existed (its `note` says so and names `max_diced`), and so
+  on until the rest fit; a Poly whose level 1 passes the evaluation bound
+  renders at its shown level too. The render itself is never refused for
+  this. The frame's width and height both decide what is on screen, and a
+  large face partly on screen is diced for the part the camera sees. The reply's `subdivision` lists each Poly's levels,
+  `evaluated_level`, `triangles` and `displaced`. Both tracers trace the
+  same triangles. A shown baked mesh (`baked: true`) renders as baked.
 - GPU: `device` (`auto` default, `gpu`, `cpu`). Auto traces on the GPU
   (`src/film/gpu.rs` + `trace.wgsl`, the same light paths as the CPU
   tracer, checked by `gpu_matches_cpu`) when the scene has no hair strands
@@ -1361,6 +2134,113 @@ from `create_human`, dressed with cover blobs and posed with `animate`
 (render with `frame`). An 8 x 8 m room with 20 lights and about a million
 triangles renders 1600 x 900 at 256 samples in about a minute on an M2 Max GPU.
 
+### Stylised character bases
+
+`create_character` makes a cartoon character base from proportions alone
+(original and generic: no existing design is involved). It is an ordinary
+clay of named, blended blobs, ready to shape with `edit_clay` and `sculpt`,
+`polish`, rig, retopologise and render:
+
+```json
+{ "name": "Buddy", "build": "biped",
+  "proportions": { "height": 1.0, "head_units": 2.5, "head_width": 1.0, "body": "round",
+                   "limb_length": 1.0, "limb_thickness": 1.0, "hands": "four_finger",
+                   "feet": "round", "eye_size": 1.0, "eye_spacing": 1.0, "ears": "round", "nose": "button",
+                   "mouth": "smile" },
+  "eyes": true, "rig": true, "symmetry": true, "guides": true, "look": "stylized" }
+```
+
+- Every field is optional; the defaults are a friendly 2.5-head creature
+  (the plan's benchmark proportions). Ranges: `height` 0.1-10, `head_units`
+  2-5 (need not be whole), `head_width` 0.5-1.5, `limb_length` 0.6-1.4,
+  `limb_thickness` 0.6-1.6, `eye_size` 0.5-2, `eye_spacing` 0.5-1.5;
+  `body` round, pear or slim; `hands` mitten, four_finger (three fingers
+  and a thumb) or five_finger (bipeds only); `feet` round or long; `ears`
+  none, round or pointed; `nose` none or button (a round, blended button
+  blushed toward pink); `mouth` smile (a soft smile line carved under the
+  nose, its corners turned up), grin (wider) or none. `build: quadruped` stands
+  the same kit on four legs with a neck and a tail.
+- Everything is measured in head units, u = height / head_units, the
+  head's height. The soles stand on y = 0 and the crown is the model's top
+  (ears and tails stay under it), so `guides measure` reads the head's
+  share of the height as exactly 1 / head_units.
+- Blobs are named (pelvis, torso, neck, head, ear.L, nose, mouth,
+  mouth_line, eye_socket.L, thigh.L, shin.L, foot.L, upper_arm.L,
+  forearm.L, hand.L, finger1.L, thumb.L; a
+  quadruped's front_ and hind_upper_leg.L, _lower_leg.L, _paw.L and tail).
+  With `symmetry` each pair of sides is one mirrored .L blob; `symmetry:
+  false` writes both sides out (the same surface) to sculpt each alone.
+  Legs are capsules; arms, fingers and tails are exact round tubes (arms
+  full at the shoulder, swelling past the elbow, slim at the wrist).
+- `eyes` carves sockets and seats Eye objects `NAME_eye.L` / `.R` in them,
+  riding the head bone. A socket is a cone from the eye's centre (62
+  degrees round from its axis), so its wall meets the eyeball square-on
+  and no gap or dark ring shows round the eye; its blended edge reads as
+  a soft lid. `look: stylized` (default) makes them stylised eyes and
+  puts the `skin_stylized` preset on the clay as `NAME_skin` (or the
+  first free `NAME_skin2`, ...), its `subsurface_radius` scaled to the
+  height (0.45 per unit), so the film tracer's subsurface gather stays
+  within the gaps between arm and body (at the preset's 1.6 a 1 m base
+  showed dark red patches there).
+- `lids` (with eyes): `upper` (default), `both` or `none`. Each lid is a
+  shell wrapping the eyeball (a `lid` blob, below): it clears the cornea's
+  bulge, covers `upper_cover` of the eye's height seen from the front
+  (default 0.3; 0.5 reads sleepy) down to a rounded margin, and is
+  blended into the socket and the brow in the skin's colour, on the head
+  bone (`lid.L`, and `lid_lower.L` covering `lower_cover`, default 0.15,
+  from below; together at most 0.9). They are mirrored blobs: `edit_clay
+  {split: ["lid.L"]}` then an update of `lid.R` closes one eye more.
+- `rig` places bones inside the blobs (hips, spine, a neck helper, head,
+  arms and hands, legs and feet; a quadruped's legs, paws and tail), each
+  blob on its bone.
+- `guides` replaces the scene's proportion guides with the base's: head
+  units counted down from the crown in whole heads (for 2.5 heads the
+  last line falls under the soles), center and eye_line lines, and the
+  targets `head_ratio`, `eye_size` (eye height over head height),
+  `eye_spacing` (per head unit) and `eyes_on_line`. The reply carries the
+  measure, so the call shows at once that the base is what was asked.
+- The resolution is chosen so the thinnest round parts (fingers, ear
+  tips) are at least 2.6 cells thick (192-384 cells; `resolution`
+  overrides it, and those parts are thickened to 2.6 cells if needed).
+- The same arguments give the same blobs, bit for bit. Out-of-range
+  values, unknown keys, eyes too big for the head, a name already in the
+  scene and hands on a quadruped are refused with nothing changed. One
+  call is one undo step. Create > Character Base sends the call with the
+  defaults.
+
+#### Eyelids on any clay and Eye object
+
+A `lid` blob wraps an eyeball in skin: a spherical shell round the Eye
+object, its inside clear of the cornea's bulge, a few cells thick,
+covering the eye from the top (or the bottom) down to a rounded margin,
+blended into the socket. Name the eye and the rest is filled from it:
+
+```json
+{ "target": "Pip", "remove": ["lid.L"],
+  "add": [{ "type": "lid", "eye": "Pip_eye.L", "upper_cover": 0.42, "mirror": true }] }
+```
+
+- `upper_cover` (or `lower_cover` for a lower lid) is how much of the
+  eye's height the lid hides seen along the eye's forward: 0 open, 1
+  closed. The margin is where a lid turning about the eye's sideways
+  axis stops: an arch over the iris below half, a dip past it (sleepy).
+  `tilt` (degrees) turns the margin, raising its +x end (the outer corner
+  of a `.L` eye; a mirrored copy raises its own outer corner).
+- From the eye as it sits at rest in the clay's space: the centre, radius
+  and forward, and `gap` = the cornea's bulge (`cornea` + 0.012 eye
+  widths) + `clearance` (default half a cell). `thickness` defaults to
+  0.08 of the eye, at least three cells; `blend` to twice the thickness
+  (at most a fifth of the eye), so the dome rolls into the brow with no
+  crease round it; the colour is the skin's over the eye; the bone the
+  eye's; the name `lid.L` / `lid_lower.L` from the eye's side (`lid_EYE`
+  without one). The stored blob is geometric (`{center, radius, gap,
+  thickness, forward, up, cover, lower, tilt}`), so it saves, poses (it
+  rides its bone exactly) and mirrors like any blob. Put it after socket
+  carves.
+- One eye more closed: `{split: ["lid.L"], update: [{blob: "lid.R", eye:
+  "Pip_eye.R", upper_cover: 0.6}]}` (the split side is filled from its
+  own eye). A head tilt by `pose_bone` splits the mirrored lid by itself.
+
 ### Human bases
 
 - `create_human` starts a character from a correct human: MakeHuman's CC0
@@ -1426,6 +2306,16 @@ skin.
   where the lids meet it, a wet tear line runs along the lower lid and a
   pink caruncle fills the inner corner; these stay with the lids as the eye
   turns.
+- Stylised eyes: `eye: {style: "stylized"}` gives the big, clear, catch-lit
+  eyes of animation: a clean radial iris (lighter toward the pupil, a few
+  soft fibers, a crisp limbal ring), no veins, a flatter cornea, and a
+  catch-light, a small glowing spot on the iris up and to the right in the
+  eye's own frame, seen through the cornea whatever the lighting.
+  Switching stores `iris_scale` 1.3 (1-1.6: scales `iris_size`, at most
+  0.9 of the eye), `cornea` 0.03, `veins` 0, `limbal_ring` 0.8 and
+  `catchlight: true`, except what the same call sets; `pupil` is
+  `pupil_size` (0.05-0.95). The material tab's "Stylised eye" button sends the same
+  `update_object`.
 - `bake` on a face head defaults to 4096 textures, so pores, lines, lips and
   color variation survive in the exported color, normal and roughness maps
   (the oily coat goes into roughness).
@@ -1439,7 +2329,16 @@ served in parallel, so other calls answer while a job runs. Clay mesh
 rebuilds, skin weights and fine meshes are built on other threads too: the
 window keeps showing the old mesh, agent calls wait in line (calls that read
 no meshes, such as `screenshot`, go ahead), and edits that report the new
-mesh answer once it is built.
+mesh answer once it is built. `edit_clay` waits at most `wait_s` (default
+20 s, 0 answers at once) for its rebuild: a slower one answers with
+`mesh_pending: true`, `estimated_build_s` (the object's last build of that
+kind: regular or fine; shading-only refreshes do not count) and
+`build {object, fine, started, fraction}` instead of the bounds, while the
+build goes on. `object` is whose build it is (an object with the same shape
+as one already building waits for that build), `fine` says it is the fine
+mesh's, and `started` and `fraction` are seconds since it began and 0–1
+done. `job_status` without an id lists running mesh `builds` with their
+`fraction` done.
 
 No agent call waits more than 40 s (agent connections give up after about a
 minute). Past that it answers with a job id and a status: `running` (a
@@ -1682,7 +2581,7 @@ New blob forms, accepted in `create_object blobs` and `edit_clay`:
 | --- | --- | --- |
 | `extrude` | `profile`, `depth`, `center` (0), `axis` (+Z), `bevel` (0) | Polygon plate, diamond blade, buckle |
 | `lathe` | `profile`, `center` (0), `axis` (+Y) | Helmet, pommel, ring, stud; profile is radius/height |
-| `sweep` | `profile`, `points`, `taper` (1), `twist` (0 degrees total), `path_smooth` (true) | Trim, strap, ridged horn; transported section frame |
+| `sweep` | `profile` (a polygon, or `{circle: r}`), `points`, `taper` (1), `twist` (0 degrees total), `path_smooth` (true), `radii` (circle only), `field` (`segments` for new sweeps) | Trim, strap, ridged horn; wires, cables, strands, piping and grooves with a circle |
 | `shell` | `source` (geometry form), `thickness` | Hollow one form inward, preserving its exterior |
 | `array` | `source`, `count`, `step` | Repeat along a line; `radius`, `center`, `axis` select a circle; `points` selects an arc-length path; with `orient: "path"` copies turn with the path (the first copy as authored), so grousers wrap around a track loop |
 | `band` | `points`, `width`, `normal` (+Z) | Use with `op:"engrave"` or `"emboss"`; `wall` is constant depth |
@@ -1701,6 +2600,34 @@ taper and twist by arc length. Sweep paths use distance-weighted cubic
 splines, sampled at about 2 mm intervals (8–96 steps per input segment),
 and interpolate transported frames. A perpendicular-section solve follows the continuous curve, avoiding
 internal segment caps and seams. Set `path_smooth:false` for a deliberate angular path.
+
+That describes the `legacy` field, which sweeps saved without `field` keep so
+old scenes mesh as they did. Sweeps an agent adds (`create_object blobs`,
+`edit_clay add` or `replace`) without a `field` get `field: "segments"`.
+`get_clay` (verbose) shows a saved sweep's `field: "legacy"`, so blobs read
+there and sent back with `replace` keep their mesh (and sculpt and morphs
+made on them stay in sync); saved files still leave it out. Segments: the path is cut once
+into straight spans short enough that each chord strays at most 1/128 of the
+thinnest radius from the curve (at most 4,096 spans; a path too curved for
+its radius loosens that), and the field is the union of one exact piece per
+span. With `profile: {circle: r}` (0.0005–10) each piece is a round cone, so
+the tube is exact and smooth at any size and counts as a smooth form (no
+192-cell floor, no sharp-feature placement), like a capsule. `radii` gives
+one radius per path point instead of `taper`; twist does not apply to a
+circle. Polygon profiles become rigid prisms on rotation-minimising frames,
+joined by mitre planes; past a 120° turn each span ends square, which leaves
+a notch on the outside of the bend. `edit_clay update [{blob, field:
+"segments"}]` upgrades a legacy sweep. A circle profile is exact only with
+segments: `update [{blob, profile: {circle: r}}]` on a legacy sweep keeps it
+legacy, a hard 16-gon that refuses `radii`, and the reply's `notes` say how
+to upgrade it. Use a circle sweep for thin tubes
+rather than a 16-point polygon or a chain of spheres: on a 4–6 mm tube along
+a curved path the legacy 16-gon's field changes up to six times faster than
+distance (lumpy, fuzzy normals), the circle's never faster.
+
+Carves and tubes are cheap far from their path: a carve is looked up only as
+near as could still change the value there, and a tube's lookup walks a tree
+of its spans, so dozens of carve sweeps at a fine cell rebuild in seconds.
 `path_smooth` belongs to sweep geometry; the numeric blob `smooth` controls
 body fitting. Fine cells and sufficiently round profiles still matter: a
 hexagonal profile makes a ridged horn, a 20–32 point circle a round horn. Arrays accept 1–512 copies;
@@ -1965,6 +2892,24 @@ Symmetric parts and posed props without hand-made matrices:
   strokes, kitbash groups, and the ends of two-bone parts on those bones.
   Clips keep their keys. `mirror: true` does the mirrored move on the
   other side. Sculpt and paint grids of the rig clay stay put (noted).
+- Mirrored blobs pose per side. A blob with `mirror: true` stores one side
+  and reflects it across x = 0, so a move that is not its own mirror (a
+  head tilt `rotate: [-4, 0, 9]`, or `upper_arm.L` alone) cannot move it
+  as one blob: `pose_bone` first writes it out as its two sides (the blob
+  keeps its name, bone and place in the list; its copy, `.L`/`.R` swapped
+  in the name and the bone, comes right after it, `mirror` off, `flip`
+  on), then moves each side by its own bone, the `.R` side by the `.R`
+  bone when the rig has one. Symmetric moves (`mirror: true` on a side
+  bone, a nod or lift on the centre line) keep the blob one blob. The
+  reply lists `split_blobs: [{from, into: [kept, copy], why}]`. Masks
+  (`by_blobs`), weight strokes (by bone) and `blobs` names still mean the
+  side they named; one undo gives the single mirrored blob back.
+  `edit_clay {split: ["lid.L"]}` does the same split by hand (then
+  `update` one side only: one eye more closed, one brow raised).
+- `approximate_blobs: [{name, why}]` lists what a turn can only follow
+  approximately: extrudes and polygon-profile sweeps, whose profile roll
+  is set by the path, not stored. Round tubes (`profile: {circle}`,
+  `field: segments`), capsules, spheres and ellipsoids move exactly.
 
 Reproduce `pose_check/` (the mech's scene is not in the repository: pass a
 copy; the copy is never overwritten, the result is saved next to it):

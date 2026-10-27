@@ -233,6 +233,31 @@ pub fn weld(points: &[Vec3], tris: &[[u32; 3]]) -> (Vec<Vec3>, Vec<[u32; 3]>) {
 /// How the edges of a welded mesh are used: (edges, edges used by other
 /// than exactly two triangles, edges two triangles use the same way round).
 pub fn edge_use(tris: &[[u32; 3]]) -> (usize, usize, usize) {
+    let (edges, kinds, flipped) = edge_report(tris);
+    (edges, kinds.open + kinds.over_used + kinds.pinched, flipped)
+}
+
+/// Why edges of a welded mesh are not used exactly twice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct EdgeKinds {
+    /// Used by one triangle: a hole or a crack.
+    pub open: usize,
+    /// Used by an odd number of triangles above two.
+    pub over_used: usize,
+    /// Used by four, six, ... triangles: sheets pinched together at one
+    /// pair of positions (each sheet would be closed on its own).
+    pub pinched: usize,
+}
+
+/// `edge_use`'s non-manifold edges by kind.
+#[cfg(test)]
+pub fn edge_use_kinds(tris: &[[u32; 3]]) -> EdgeKinds {
+    edge_report(tris).1
+}
+
+/// (edges, the ones not used twice by kind, edges two triangles use the
+/// same way round), in one pass; degenerate triangles are skipped.
+pub fn edge_report(tris: &[[u32; 3]]) -> (usize, EdgeKinds, usize) {
     let mut uses: HashMap<(u32, u32), (u32, i32)> = HashMap::with_capacity(tris.len() * 2);
     for t in tris {
         if t[0] == t[1] || t[1] == t[2] || t[0] == t[2] {
@@ -245,9 +270,17 @@ pub fn edge_use(tris: &[[u32; 3]]) -> (usize, usize, usize) {
             e.1 += if a < b { 1 } else { -1 };
         }
     }
-    let bad = uses.values().filter(|u| u.0 != 2).count();
-    let flipped = uses.values().filter(|u| u.0 == 2 && u.1 != 0).count();
-    (uses.len(), bad, flipped)
+    let mut kinds = EdgeKinds::default();
+    let mut flipped = 0;
+    for &(n, way) in uses.values() {
+        match n {
+            2 => flipped += (way != 0) as usize,
+            1 => kinds.open += 1,
+            n if n % 2 == 0 => kinds.pinched += 1,
+            _ => kinds.over_used += 1,
+        }
+    }
+    (uses.len(), kinds, flipped)
 }
 
 /// Whether a mesh is closed and consistently wound once welded: every

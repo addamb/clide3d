@@ -420,19 +420,7 @@ pub fn export(scene: &Scene, meshes: &MeshLib, opts: &Options) -> Result<Export,
         doc["textures"] = json!(b.textures);
         doc["samplers"] = json!([{ "magFilter": 9729, "minFilter": 9987, "wrapS": 33071, "wrapT": 33071 }]);
     }
-    let mut used = Vec::new();
-    if b.materials.iter().any(|m| m.0.clearcoat > 0.0) {
-        used.push("KHR_materials_clearcoat");
-    }
-    if b.materials.iter().any(|m| m.0.sheen > 0.0) {
-        used.push("KHR_materials_sheen");
-    }
-    if b.materials.iter().any(|m| m.0.emission > 0.0 && m.0.emission != 1.0) {
-        used.push("KHR_materials_emissive_strength");
-    }
-    if b.materials.iter().any(|m| m.0.transmission > 0.0) {
-        used.extend(["KHR_materials_transmission", "KHR_materials_ior"]);
-    }
+    let mut used = material_extensions(&b);
     if !b.lods.is_empty() {
         used.push("MSFT_lod");
     }
@@ -868,6 +856,87 @@ fn add_clips(b: &mut Builder, rig: &Rig, joints: &[usize], fps: f32) {
             }
         }
     }
+}
+
+/// The extensions the materials written use.
+fn material_extensions(b: &Builder) -> Vec<&'static str> {
+    let mut used = Vec::new();
+    if b.materials.iter().any(|m| m.0.clearcoat > 0.0) {
+        used.push("KHR_materials_clearcoat");
+    }
+    if b.materials.iter().any(|m| m.0.sheen > 0.0) {
+        used.push("KHR_materials_sheen");
+    }
+    if b.materials.iter().any(|m| m.0.emission > 0.0 && m.0.emission != 1.0) {
+        used.push("KHR_materials_emissive_strength");
+    }
+    if b.materials.iter().any(|m| m.0.transmission > 0.0) {
+        used.extend(["KHR_materials_transmission", "KHR_materials_ior"]);
+    }
+    used
+}
+
+/// One Poly level as a .glb (`export_poly`): `mesh` (with its textures,
+/// if baked) under one node at `world`, and the subdivision cage in the
+/// mesh's `extras.clide3d_cage`: the points as a float VEC3 accessor, the
+/// UVs (per corner, top-left origin as glTF's) as a VEC2 accessor, and
+/// the integer arrays as plain buffer views (little-endian u32: face
+/// sizes, corners, and creases as (u32 a, u32 b, f32 sharpness)
+/// records), since glTF keeps UNSIGNED_INT accessors for indices.
+/// `extras` adds the conventions.
+pub(crate) fn poly_glb(name: &str, mesh: &Mesh, own: &Material, world: Mat4, cage: &crate::poly::export::Cage, extras: Value) -> Result<Vec<u8>, String> {
+    let mut b = Builder::default();
+    let m = b.mesh(name, mesh, [1.0; 3], own, None)?;
+    let points: Vec<f32> = cage.points.iter().flat_map(|p| p.to_array()).collect();
+    let mut x = json!({ "points": b.floats(&points, 3, None, true) });
+    let sizes: Vec<u32> = cage.face_start.windows(2).map(|w| w[1] - w[0]).collect();
+    x["face_sizes"] = json!({ "bufferView": b.view(bytemuck::cast_slice(&sizes), None), "count": sizes.len(), "componentType": "u32" });
+    x["corners"] = json!({ "bufferView": b.view(bytemuck::cast_slice(&cage.corners), None), "count": cage.corners.len(), "componentType": "u32" });
+    if let Some(uv) = &cage.uv {
+        let flat: Vec<f32> = uv.iter().flatten().copied().collect();
+        x["uv"] = json!(b.floats(&flat, 2, None, false));
+    }
+    if !cage.creases.is_empty() {
+        let mut rec = Vec::with_capacity(cage.creases.len() * 12);
+        for &(a, c, s) in &cage.creases {
+            rec.extend(a.to_le_bytes());
+            rec.extend(c.to_le_bytes());
+            rec.extend(s.to_le_bytes());
+        }
+        x["creases"] = json!({ "bufferView": b.view(&rec, None), "count": cage.creases.len(), "layout": "u32 a, u32 b, f32 sharpness" });
+    }
+    for (k, v) in extras.as_object().into_iter().flatten() {
+        x[k] = v.clone();
+    }
+    b.meshes[m]["extras"] = json!({ "clide3d_cage": x });
+    let mut node = trs(name, world);
+    node["mesh"] = json!(m);
+    let node = b.node(node);
+    let mut doc = json!({
+        "asset": { "version": "2.0", "generator": "Clide3D export_poly" },
+        "scene": 0,
+        "scenes": [{ "nodes": [node] }],
+        "nodes": b.nodes,
+        "meshes": b.meshes,
+        "materials": b.materials.iter().map(|(m, set, tint)| material_json(m, set.map(|s| (b.texture_sets[s].1, b.texture_sets[s].0.alpha)), tint.map(f32::from_bits))).collect::<Vec<_>>(),
+        "accessors": b.accessors,
+        "bufferViews": b.views,
+        "buffers": [{ "byteLength": b.bin.len() }],
+    });
+    if !b.textures.is_empty() {
+        doc["images"] = json!(b.images);
+        doc["textures"] = json!(b.textures);
+        doc["samplers"] = json!([{ "magFilter": 9729, "minFilter": 9987, "wrapS": 33071, "wrapT": 33071 }]);
+    }
+    let used = material_extensions(&b);
+    if !used.is_empty() {
+        doc["extensionsUsed"] = json!(used);
+    }
+    // A .glb's lengths are 32-bit.
+    if b.bin.len() as u64 + (1 << 20) > u32::MAX as u64 {
+        return Err("the .glb would pass 4 GiB: write a lower level".into());
+    }
+    Ok(glb(&doc, b.bin))
 }
 
 /// Packs the JSON and the binary buffer into a .glb file.

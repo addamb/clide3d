@@ -32,6 +32,8 @@ use crate::paint::Paint;
 mod membrane;
 #[path = "hard_surface.rs"]
 mod hard_surface;
+#[path = "tube.rs"]
+pub(crate) mod tube;
 pub(crate) mod base_cache;
 pub(crate) mod chunks;
 pub(crate) mod sculptris;
@@ -200,12 +202,20 @@ pub enum Form {
         #[serde(default = "y_axis")] axis: Vec3,
     },
     Sweep {
-        #[serde(deserialize_with = "hard_surface::profile")]
-        profile: Vec<hard_surface::Corner>,
+        /// A polygon, or `{circle: r, sides}`: an exact round tube (see `tube.rs`).
+        #[serde(deserialize_with = "tube::profile")]
+        profile: tube::SweepProfile,
         #[serde(deserialize_with = "chain_points")] points: Vec<Vec3>,
         #[serde(default = "one")] taper: f32,
         #[serde(default)] twist: f32,
         #[serde(default = "yes", rename = "path_smooth")] smooth: bool,
+        /// Circle tubes: a radius per path point (overrides `taper`).
+        #[serde(default, skip_serializing_if = "Option::is_none")] radii: Option<Vec<f32>>,
+        /// Absent in saved files when `legacy` (the old field), so saved
+        /// sweeps mesh and save as they did; agent JSON without it gets
+        /// `segments` (`fill_field`), and `get_clay` writes `legacy` out
+        /// (`show_field`) so blobs sent back keep it (D5).
+        #[serde(default, skip_serializing_if = "tube::SweepField::is_legacy")] field: tube::SweepField,
     },
     Shell { source: Box<Form>, thickness: f32 },
     Array {
@@ -287,6 +297,33 @@ pub enum Form {
         #[serde(default)]
         rotate: Vec3,
     },
+    /// An eyelid: a spherical shell round an eyeball, `gap` outside it
+    /// (clear of the cornea's bulge) and `thickness` thick, covering the
+    /// eye from the top (or from the bottom when `lower`) down to a
+    /// rounded margin, so it reads as skin wrapping the eye. The margin is
+    /// where a lid turning about the eye's sideways axis would stop: seen
+    /// along `forward`, its middle covers `cover` of the eye's height
+    /// (0 open, 1 closed) and it arches over the ball to the eye's
+    /// corners. `tilt` (degrees) turns the margin about `forward`, raising
+    /// its +x end. `up` is the eye's up (made square to `forward`).
+    /// `edit_clay` fills it from an Eye object (`eye: NAME`).
+    Lid {
+        center: Vec3,
+        radius: f32,
+        #[serde(default)]
+        gap: f32,
+        thickness: f32,
+        #[serde(default = "z_axis")]
+        forward: Vec3,
+        #[serde(default = "y_axis")]
+        up: Vec3,
+        #[serde(default = "half")]
+        cover: f32,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        lower: bool,
+        #[serde(default)]
+        tilt: f32,
+    },
     /// A human body from the built-in base (see `human.rs`), in this
     /// object's space with the feet at y = 0. `part` keeps the whole body,
     /// just the head (cut at the neck, for a fine head clay), or the body
@@ -312,6 +349,15 @@ pub enum Form {
         #[serde(default = "one")]
         scale: f32,
     },
+}
+
+impl Form {
+    /// A sweep with an exact round section (`{circle: r}`, `field:
+    /// segments`): a smooth form like a capsule chain. A legacy circle is
+    /// its faceted polygon, so it stays a hard form.
+    pub(crate) fn round_tube(&self) -> bool {
+        matches!(self, Form::Sweep { profile: tube::SweepProfile::Circle { .. }, field: tube::SweepField::Segments, .. })
+    }
 }
 
 /// One array blob as copies of a single shape (see `Clay::instancing`).
@@ -400,6 +446,18 @@ impl Blob {
     pub(crate) fn validate(&self) -> Result<(), String> {
         // Mesh forms (nested ones too) are checked in `hard_surface::validate`.
         hard_surface::validate(&self.form)?;
+        if let Form::Lid { center, radius, gap, thickness, forward, up, cover, tilt, .. } = self.form {
+            let fine = |v: f32| v.is_finite() && v > 0.0;
+            if !center.is_finite() || !fine(radius) || !fine(thickness) || !gap.is_finite() || gap < 0.0 {
+                return Err("a lid needs a finite center, radius and thickness above 0 and a gap of 0 or more".into());
+            }
+            if !(0.0..=1.0).contains(&cover) || !tilt.is_finite() || tilt.abs() > 80.0 {
+                return Err("a lid's cover must be 0 (open) to 1 (closed) and its tilt -80 to 80 degrees".into());
+            }
+            if !forward.is_finite() || forward.length() < 1e-6 || !up.is_finite() || forward.normalize().cross(up).length() < 1e-4 {
+                return Err("a lid's forward must be a nonzero direction and its up not along it".into());
+            }
+        }
         if !self.ridge.is_finite() || self.ridge < 0.0 || !self.flare.is_finite() || self.flare < 0.0 { return Err("ridge and flare must be finite and nonnegative".into()); }
         if !self.wall.is_finite() || self.wall <= 0.0 || !self.rim.is_finite() || self.rim < 0.0 || self.join_size.is_some_and(|v| !v.is_finite() || v < 0.0) {
             return Err("wall must be positive; rim and join_size must be nonnegative".into());
@@ -413,11 +471,15 @@ impl Blob {
 fn yes() -> bool { true }
 fn z_axis() -> Vec3 { Vec3::Z }
 fn y_axis() -> Vec3 { Vec3::Y }
+fn half() -> f32 { 0.5 }
 fn one() -> f32 { 1.0 }
+/// Most points on a blob's path (chain, sweep, band, array along a path).
+pub const MAX_PATH_POINTS: usize = 512;
+
 fn chain_points<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Vec3>, D::Error> {
     let points = Vec::<Vec3>::deserialize(d)?;
-    if !(2..=128).contains(&points.len()) || points.iter().any(|p| !p.is_finite()) {
-        return Err(serde::de::Error::custom("chain needs 2-128 finite path points"));
+    if !(2..=MAX_PATH_POINTS).contains(&points.len()) || points.iter().any(|p| !p.is_finite()) {
+        return Err(serde::de::Error::custom(format!("a path (chain, sweep, band) needs 2-{MAX_PATH_POINTS} finite points, not {}", points.len())));
     }
     Ok(points)
 }
@@ -478,6 +540,28 @@ struct Prim {
     hi: Vec3,
 }
 
+impl Prim {
+    /// Whether the prim can matter inside the box lo..hi: its box is within
+    /// `reach` (the field's limit and largest blend), and so is a tube's
+    /// path. Farther, every op leaves the clamped value as it is (see
+    /// `Field::prefix_full`; tubes are never nearer than their span boxes,
+    /// and the margin keeps rounding from moving a blend). An intersect
+    /// blob matters everywhere: far from it nothing is left.
+    fn matters(&self, lo: Vec3, hi: Vec3, reach: f32) -> bool {
+        if self.op == Op::Intersect {
+            return true;
+        }
+        let gap = (self.lo - hi).max(lo - self.hi).max(Vec3::ZERO).length();
+        if gap > reach {
+            return false;
+        }
+        let Geo::Hard(hard_surface::Geometry::Tube(t)) = &self.geo else { return true };
+        // A mirrored prim reads its form at -x.
+        let (lo, hi) = if self.flip { (Vec3::new(-hi.x, lo.y, lo.z), Vec3::new(-lo.x, hi.y, hi.z)) } else { (lo, hi) };
+        t.near_box(lo, hi, reach * (1.0 + 1e-3) + 1e-6)
+    }
+}
+
 /// A clay's mesh assets by content hash (`Clay::assets`): all its
 /// geometry reads.
 pub(crate) type Assets = std::collections::BTreeMap<String, crate::mesh_asset::MeshAsset>;
@@ -491,6 +575,9 @@ enum Geo {
     Cone { a: Vec3, b: Vec3, r1: f32, r2: f32 },
     Box { c: Vec3, half: Vec3, round: f32, inv: Quat },
     Torus { c: Vec3, big: f32, small: f32, inv: Quat },
+    /// `Form::Lid`: the cap's centre, its axis, the shell's middle radius
+    /// and half thickness.
+    Lid { c: Vec3, n: Vec3, rm: f32, h: f32 },
     /// A mesh's exact distance, kept above `above` and below `below` (y).
     Mesh { sdf: Arc<crate::human::Shape>, above: f32, below: f32 },
     /// A `Form::Mesh`: the asset's field, placed.
@@ -630,6 +717,10 @@ impl Geo {
                 let m = big + small;
                 (Geo::Torus { c: center, big, small, inv: rotation(rotate).inverse() }, center - m, center + m)
             }
+            Form::Lid { .. } => {
+                let (c, n, rm, h) = lid_geometry(form);
+                (Geo::Lid { c, n, rm, h }, c - (rm + h), c + (rm + h))
+            }
         }
     }
 
@@ -649,6 +740,13 @@ impl Geo {
             },
             _=>None,
         }
+    }
+
+    /// Whether the value is never below the distance to the form's box
+    /// (exact distances, and tubes by construction), so a carve can be
+    /// skipped by its box.
+    fn boxed(&self) -> bool {
+        matches!(self, Geo::Sphere { .. } | Geo::Cone { .. } | Geo::Box { .. } | Geo::Torus { .. } | Geo::Lid { .. } | Geo::Hard(hard_surface::Geometry::Tube(_)))
     }
 
     /// `sdf` where it is below `bound`; elsewhere a value from `bound` up
@@ -684,6 +782,20 @@ impl Geo {
                 let ring = glam::Vec2::new(glam::Vec2::new(q.x, q.z).length() - big, q.y);
                 ring.length() - small
             }
+            // The half sphere of radius `rm` on `n`'s side (its edge a
+            // great circle), thickened by `h`: exact. On the cap the
+            // nearest point is straight out from the centre; past its edge
+            // it is on the edge circle, so the margin is a round bead.
+            Geo::Lid { c, n, rm, h } => {
+                let q = p - c;
+                let s = q.dot(n);
+                if s >= 0.0 {
+                    (q.length() - rm).abs() - h
+                } else {
+                    let w = (q - n * s).length();
+                    ((w - rm) * (w - rm) + s * s).sqrt() - h
+                }
+            }
             // A little thicker than the mesh: closes slits thinner than a grid
             // cell (parted lips, eyelid corners, ear rims) that would break up.
             Geo::Mesh { ref sdf, above, below } => {
@@ -701,6 +813,42 @@ impl Geo {
             Geo::Imported { ref field, sign, c, inv, scale } => field.distance(inv * (p - c) / scale, sign) * scale,
         }
     }
+}
+
+/// A lid's frame: its eye's forward, up (square to forward, turned by
+/// `tilt` about it) and the +x side (up x forward).
+pub fn lid_frame(forward: Vec3, up: Vec3, tilt: f32) -> (Vec3, Vec3, Vec3) {
+    let f = forward.normalize_or(Vec3::Z);
+    let u = (up - f * f.dot(up)).normalize_or(f.any_orthonormal_vector());
+    let tilt = if tilt.is_finite() { tilt.clamp(-80.0, 80.0).to_radians() } else { 0.0 };
+    let u = Quat::from_axis_angle(f, tilt) * u;
+    (f, u, u.cross(f))
+}
+
+/// `Form::Lid` as a cap: its centre, axis, middle radius and half
+/// thickness. The margin's middle, at elevation `e` from forward toward
+/// up, is where the margin's bead (radius h round the middle radius rm)
+/// reaches down to `cover` of the eye's height seen along forward:
+/// `rm sin e - h = r (1 - 2 cover)` for an upper lid (and up to it from
+/// below for a lower one). The cap is the half sphere a quarter turn past
+/// it, so its edge is the great circle through the margin and the eye's
+/// corners.
+pub fn lid_geometry(form: &Form) -> (Vec3, Vec3, f32, f32) {
+    let Form::Lid { center, radius, gap, thickness, forward, up, cover, lower, tilt } = *form else { panic!("lid_geometry of a {form:?}") };
+    let pos = |v: f32| if v.is_finite() { v.abs().max(1e-4) } else { 1e-4 };
+    let (r, h) = (pos(radius), pos(thickness) * 0.5);
+    let gap = if gap.is_finite() { gap.max(0.0) } else { 0.0 };
+    let rm = r + gap + h;
+    let cover = if cover.is_finite() { cover.clamp(0.0, 1.0) } else { 0.5 };
+    let (f, u, _) = lid_frame(forward, up, tilt);
+    let n = if lower {
+        let e = ((-r * (1.0 - 2.0 * cover) - h) / rm).clamp(-1.0, 1.0).asin();
+        f * e.sin() - u * e.cos()
+    } else {
+        let e = ((r * (1.0 - 2.0 * cover) + h) / rm).clamp(-1.0, 1.0).asin();
+        u * e.cos() - f * e.sin()
+    };
+    (center, n.normalize_or(u), rm, h)
 }
 
 /// Exact SDF of a rounded cone (Inigo Quilez's sdRoundCone).
@@ -754,6 +902,10 @@ pub(crate) struct Field {
     /// The blob field memoized on a lattice (see `base_cache.rs`), when a
     /// caller attached one: lattice reads then cost a lookup.
     base: Option<Arc<base_cache::BaseCache>>,
+    /// Whether carves are skipped where they cannot change the value (see
+    /// `prefix_full`; tests turn it off to check that nothing changes).
+    #[cfg(test)]
+    pub(crate) cull_carves: bool,
 }
 
 impl Field {
@@ -795,7 +947,7 @@ impl Field {
             None => 2.0 * voxel,
         };
         // Covers read the field up to their offset away from the surface.
-        let mut field = Field { prims, max_k, limit: base + clay.decals.iter().map(|d|crate::damage::depth(d).abs()*3.0 + if d.hinge.is_some() {d.size*0.5*d.angle.to_radians().sin().abs()}else{0.0}).fold(0.0,f32::max) + 2.0 * max_k + max_offset + max_smooth + clay.shell.unwrap_or(0.0) + clay.blobs.iter().filter(|b| matches!(b.op, Op::Plate | Op::Engrave | Op::Emboss)).map(|b| b.wall).fold(0.0, f32::max), detail, keep: None, shell: clay.shell, damage: clay.decals.iter().filter(|d|d.shape.code()>=5 && (crate::damage::depth(d)!=0.0 || d.hinge.is_some())).cloned().collect(), base: None };
+        let mut field = Field { prims, max_k, limit: base + clay.decals.iter().map(|d|crate::damage::depth(d).abs()*3.0 + if d.hinge.is_some() {d.size*0.5*d.angle.to_radians().sin().abs()}else{0.0}).fold(0.0,f32::max) + 2.0 * max_k + max_offset + max_smooth + clay.shell.unwrap_or(0.0) + clay.blobs.iter().filter(|b| matches!(b.op, Op::Plate | Op::Engrave | Op::Emboss)).map(|b| b.wall).fold(0.0, f32::max), detail, keep: None, shell: clay.shell, damage: clay.decals.iter().filter(|d|d.shape.code()>=5 && (crate::damage::depth(d)!=0.0 || d.hinge.is_some())).cloned().collect(), base: None, #[cfg(test)] cull_carves: true };
         // Cache the large fitting filter once; fine meshing must not issue
         // dozens of human-distance queries for every grid point.
         for i in 0..field.prims.len() {
@@ -873,6 +1025,14 @@ impl Field {
         });
     }
 
+    fn culls_carves(&self) -> bool {
+        #[cfg(test)]
+        let cull = self.cull_carves;
+        #[cfg(not(test))]
+        let cull = true;
+        cull
+    }
+
     /// Restricts the surface to the prims marked true.
     pub(crate) fn keep_only(mut self, keep: Vec<bool>) -> Field {
         self.keep = Some(keep);
@@ -929,15 +1089,7 @@ impl Field {
     /// Indices of prims that can matter inside the box.
     pub(crate) fn near(&self, lo: Vec3, hi: Vec3) -> Vec<u32> {
         let reach = self.reach();
-        (0..self.prims.len() as u32)
-            .filter(|&i| {
-                let p = &self.prims[i as usize];
-                // Box-to-box gap. An intersect blob matters everywhere:
-                // far from it nothing is left.
-                let gap = (p.lo - hi).max(lo - p.hi).max(Vec3::ZERO).length();
-                gap <= reach || p.op == Op::Intersect
-            })
-            .collect()
+        (0..self.prims.len() as u32).filter(|&i| self.prims[i as usize].matters(lo, hi, reach)).collect()
     }
 
     /// `near(lo, hi)` into `out`, testing only `from` (a `near` list of a
@@ -946,11 +1098,45 @@ impl Field {
     pub(crate) fn near_from(&self, lo: Vec3, hi: Vec3, from: &[u32], out: &mut Vec<u32>) {
         let reach = self.reach();
         out.clear();
-        out.extend(from.iter().copied().filter(|&i| {
-            let p = &self.prims[i as usize];
-            let gap = (p.lo - hi).max(lo - p.hi).max(Vec3::ZERO).length();
-            gap <= reach || p.op == Op::Intersect
-        }));
+        out.extend(from.iter().copied().filter(|&i| self.prims[i as usize].matters(lo, hi, reach)));
+    }
+
+    /// At most how far the sculpt offsets move the field in a box (damage
+    /// reads them elsewhere: then anywhere).
+    pub(crate) fn detail_bound(&self, lo: Vec3, hi: Vec3) -> f32 {
+        let Some(d) = self.detail.as_ref() else { return 0.0 };
+        if self.damage.is_empty() { d.grid().max_abs_in(lo, hi) } else { d.grid().max_abs() }
+    }
+
+    /// A lower bound (about: blob distances are not exact) on the distance
+    /// from `p` to the solid the prims in `list` make, not clamped like the
+    /// field: the nearest adding prim's own distance, less how far past its
+    /// shape the solid can reach (the clamp's limit covers blends, garment
+    /// and plate offsets, decals and a shell) and the sculpt offsets in the
+    /// box `lo..hi`. Infinite when nothing in `list` adds solid and the
+    /// offsets cannot make any. Proportion guides' extent search skips
+    /// empty boxes with it.
+    ///
+    /// Far from every blob the clamped field is `limit`, so an offset of
+    /// `-limit` or deeper (grab, snakehook and transform write down to
+    /// twice that) makes solid with no blob near: where the box's offsets
+    /// reach that deep there is no bound (minus infinity), and the caller
+    /// reads the field itself.
+    pub(crate) fn solid_bound(&self, p: Vec3, list: &[u32], lo: Vec3, hi: Vec3) -> f32 {
+        let detail = self.detail_bound(lo, hi);
+        if detail >= self.limit {
+            return f32::NEG_INFINITY;
+        }
+        let mut near = f32::INFINITY;
+        for &i in list {
+            let prim = &self.prims[i as usize];
+            if matches!(prim.op, Op::Carve | Op::Intersect) || box_distance(p, prim.lo, prim.hi) >= near {
+                continue;
+            }
+            let q = if prim.flip { Vec3::new(-p.x, p.y, p.z) } else { p };
+            near = near.min(prim.geo.sdf(q));
+        }
+        near - self.limit - detail
     }
 
     fn has_detail(&self, lo: Vec3, hi: Vec3) -> bool {
@@ -989,10 +1175,34 @@ impl Field {
                 continue;
             }
             let q = if prim.flip { Vec3::new(-p.x, p.y, p.z) } else { p };
+            let k = prim.k;
+            // A carve leaves `d` as it is where its distance is at least
+            // `keeps`: sharp keeps max(d, -db) = d from db >= -d, round has
+            // h = 0 from db >= k - d, chamfer's (d - db + k) / sqrt 2 <= d
+            // from db >= k - (sqrt 2 - 1) d. The margin keeps rounding from
+            // moving h. So a form wholly farther by its box is skipped (a
+            // box bounds an exact distance from outside), and a tube is
+            // looked up only that near: its walk stops there, and is exact
+            // below its bound. Other forms keep their bound (a mesh's
+            // lookup deep inside gives the bound, not its depth); skipping
+            // where their value passes `keeps` gives what the op would.
+            let keeps = (prim.op == Op::Carve && self.culls_carves()).then(|| {
+                let t = if k <= 1e-6 { -d } else if prim.join == hard_surface::Join::Chamfer { (-d).max(k - (std::f32::consts::SQRT_2 - 1.0) * d) } else { k - d };
+                t + t.abs() * 1e-3 + 1e-6
+            });
+            if let Some(t) = keeps && prim.geo.boxed() && box_distance(p, prim.lo, prim.hi) > t.max(0.0) {
+                continue;
+            }
             // Every op below leaves `d` (within +-limit) as it is once the
             // blob is limit + k away, so nearer than that is all that counts.
-            let db = prim.geo.sdf_within(q, limit + prim.k);
-            let k = prim.k;
+            let bound = match keeps {
+                Some(t) if matches!(prim.geo, Geo::Hard(hard_surface::Geometry::Tube(_))) => t.clamp(0.0, limit + k),
+                _ => limit + k,
+            };
+            let db = prim.geo.sdf_within(q, bound);
+            if keeps.is_some_and(|t| db >= t) {
+                continue;
+            }
             match prim.op {
                 Op::Add => {
                     if k <= 1e-6 {
@@ -1214,17 +1424,20 @@ impl Field {
         Some(if self.prims[i].name.is_empty() { i.to_string() } else { self.prims[i].name.clone() })
     }
 
+    /// The bone of the blob that makes the surface nearest `p` (a
+    /// mirrored blob's copy rides the other side's bone), as `owner_name`
+    /// sees ownership; None when it has none.
+    pub(crate) fn owner_bone(&self, p: Vec3) -> Option<String> {
+        let i = self.owner_index(p)?;
+        Some(self.prims[i].bone.clone()).filter(|b| !b.is_empty())
+    }
+
     /// The prim that makes the surface nearest `p` (ownership as
     /// `owner_name` sees it).
     pub(crate) fn owner_index(&self, p: Vec3) -> Option<usize> {
         let mut list = self.near(p - self.limit, p + self.limit);
         if list.is_empty() { list.extend(0..self.prims.len() as u32); }
         self.prefix_full(p, &list, true, true, f32::MAX / 1024.0).3
-    }
-
-    /// A prim's blob name (mirrored copies of a blob share it).
-    pub(crate) fn prim_name(&self, i: usize) -> String {
-        self.prims.get(i).map(|p| p.name.clone()).unwrap_or_default()
     }
 
     /// Lower bound of `blob_distance` (distance to the blob's box) and the box volume.
@@ -1254,6 +1467,30 @@ static PAR_HELPERS: AtomicUsize = AtomicUsize::new(0);
 thread_local! {
     /// Most threads a `par_chunks` call made on this thread may use.
     static PAR_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    /// Where mesh builds on this thread report how far they are.
+    static PROGRESS: std::cell::RefCell<Option<Arc<crate::progress::Progress>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` (a mesh build, on a build thread) with `build_window_cells`
+/// reporting to `progress`: block rows, then the surface.
+pub(crate) fn with_progress<R>(progress: Arc<crate::progress::Progress>, f: impl FnOnce() -> R) -> R {
+    let old = PROGRESS.replace(Some(progress));
+    let r = f();
+    PROGRESS.set(old);
+    r
+}
+
+/// From now on the mesh builds on this thread fill `from..to` of their
+/// bar (see `with_progress`): a build that meshes more than once (a split
+/// rig's whole shell, then each part) gives each its share, so the bar
+/// does not wait at one build's end while the next runs.
+pub(crate) fn progress_range(from: f32, to: f32) {
+    PROGRESS.with_borrow(|p| if let Some(p) = p { p.range(from, to) });
+}
+
+/// How far this thread's mesh build is (None outside `with_progress`).
+pub(crate) fn progress_fraction() -> Option<f32> {
+    PROGRESS.with_borrow(|p| p.as_ref().map(|p| p.fraction()))
 }
 
 /// Runs `f` with `par_chunks` calls made on this thread limited to `n`
@@ -1301,7 +1538,52 @@ pub(crate) fn par_chunks<T: Send>(data: &mut [T], chunk: usize, f: impl Fn(usize
     });
 }
 
+/// One blob's own shape, apart from the blobs around it (proportion
+/// guides measure a blob's extent on it, docs/QUALITY_PLAN.md Stage 5b),
+/// in the clay's space, with its box.
+pub(crate) struct BlobShape {
+    geo: Geo,
+    flip: bool,
+    pub lo: Vec3,
+    pub hi: Vec3,
+}
+
+impl BlobShape {
+    /// About the distance outside the shape (negative inside); its sign is
+    /// exact.
+    pub(crate) fn distance(&self, p: Vec3) -> f32 {
+        self.geo.sdf(if self.flip { Vec3::new(-p.x, p.y, p.z) } else { p })
+    }
+}
+
 impl Clay {
+    /// Blob `i`'s shape as `Field::new` builds it: (as written, and for a
+    /// mirrored blob its copy across x = 0). None past `MAX_BLOBS`.
+    pub(crate) fn blob_shapes(&self, i: usize) -> Option<(BlobShape, Option<BlobShape>)> {
+        let blob = self.blobs.get(i).filter(|_| i < MAX_BLOBS)?;
+        let make = || {
+            let (mut geo, mut lo, mut hi) = Geo::new(&blob.form, &self.assets);
+            if let Geo::Hard(ref mut g) = geo {
+                g.band_depth(blob.wall);
+                (lo, hi) = g.bounds();
+            }
+            (geo, lo, hi)
+        };
+        let shape = |flip: bool| {
+            let (geo, lo, hi) = make();
+            let (lo, hi) = if flip { (Vec3::new(-hi.x, lo.y, lo.z), Vec3::new(-lo.x, hi.y, hi.z)) } else { (lo, hi) };
+            BlobShape { geo, flip, lo, hi }
+        };
+        Some((shape(blob.flip), blob.mirror.then(|| shape(!blob.flip))))
+    }
+
+    /// Each field prim's blob (its index in `blobs`), in `Field::new`'s
+    /// order: a mirrored blob makes two prims, so prim and blob indices
+    /// part after the first one.
+    pub(crate) fn prim_blobs(&self) -> Vec<usize> {
+        self.blobs.iter().take(MAX_BLOBS).enumerate().flat_map(|(i, b)| std::iter::repeat_n(i, if b.mirror { 2 } else { 1 })).collect()
+    }
+
     /// The clay mirrored across its own x = 0: blobs flip (and swap `.L` /
     /// `.R` bones), sculpt offsets, paint, mask channels and decals too.
     pub fn mirrored_x(&self) -> Clay {
@@ -1338,6 +1620,7 @@ impl Clay {
                     Form::Capsule { radius, radius_b, .. } => radius.min(radius_b.unwrap_or(radius)),
                     Form::Box { size, .. } => size.abs().min_element() * 0.5,
                     Form::Torus { thickness, .. } => thickness,
+                    Form::Lid { thickness, .. } => thickness * 0.5,
                     Form::Human { .. } => f32::MAX,
                     Form::Membrane { thickness, .. } | Form::Shell { thickness, .. } => thickness * 0.5,
                     Form::Extrude { depth, .. } => depth * 0.5,
@@ -1426,6 +1709,48 @@ impl Clay {
             return Err("the fine mesh came out empty".into());
         }
         Ok(mesh)
+    }
+
+    /// About how many triangles `build_fine` makes, from the regular mesh
+    /// `rest` alone (milliseconds, nothing built): surface nets make about
+    /// 3 triangles per cell-sized square of surface (a quad for each of
+    /// the 1.5 grid edges a random plane crosses per cell), so each rest
+    /// triangle's area counts at the cell the adaptive nets use there (the
+    /// detail cell everywhere without regions). A sample of at most 65,536
+    /// triangles, scaled up, stands for a large mesh.
+    pub(crate) fn fine_estimate(&self, rest: &Mesh) -> f64 {
+        let tris = rest.indices.len() / 3;
+        let (Some(fine), Some(regular)) = (self.detail_cell, self.cell_size()) else { return tris as f64 };
+        let grid = self.detail.as_ref().map(|d| d.grid()).filter(|g| !g.levels().is_empty());
+        // The coarse cell and the cell wanted at a point, as `build_fine`
+        // and the nets' `factor` work them out.
+        let (coarse, cell_at): (f32, Box<dyn Fn(Vec3) -> f32>) = match grid {
+            None => (fine, Box::new(|_| fine)),
+            Some(grid) => {
+                let finest = self.detail.as_ref().expect("checked").finest();
+                let k = (regular / finest).log2().round().clamp(0.0, crate::adaptive::MAX_FACTOR.ilog2() as f32);
+                let coarse = finest * k.exp2();
+                let painted = |p: Vec3| self.paint.as_ref().is_some_and(|g| g.grid().near(p)) || self.masks.values().any(|g| g.grid().near(p));
+                (coarse, Box::new(move |p| {
+                    let wanted = grid.wanted_cell(p);
+                    let wanted = if painted(p) { wanted.min(grid.voxel) } else { wanted };
+                    if !wanted.is_finite() || wanted >= coarse * 0.75 { coarse } else { coarse / (coarse / wanted).log2().round().exp2().min(crate::adaptive::MAX_FACTOR as f32) }
+                }))
+            }
+        };
+        if !coarse.is_finite() || coarse <= 0.0 {
+            return tris as f64;
+        }
+        let step = tris.div_ceil(65_536).max(1);
+        let p = |i: u32| Vec3::from(rest.vertices[i as usize].pos);
+        let (mut sum, mut seen) = (0.0f64, 0usize);
+        for t in rest.indices.chunks_exact(3).step_by(step) {
+            let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
+            let area = (b - a).cross(c - a).length() as f64 * 0.5;
+            sum += 3.0 * area / (cell_at((a + b + c) / 3.0) as f64).powi(2);
+            seen += 1;
+        }
+        sum * tris as f64 / seen.max(1) as f64
     }
 
     /// The most detailed mesh a bake reads: the fine mesh when there is a
@@ -1680,7 +2005,9 @@ impl Clay {
                     let width=self.wear_width();let wear=crate::weather::wear_maps(&mesh,width);let m=crate::weather::with_scale(&mesh.materials[0],self);
                     for (v,w) in mesh.vertices.iter_mut().zip(wear) {let (c,r)=crate::weather::apply(&m,Vec3::from(v.pos),Vec3::from(v.normal),Vec3::from(v.color),v.surface[0],w,width);v.color=c.to_array();v.surface[0]=r;}
                 }
-                hard_surface::split_normals(&mut mesh,|p|normal(p,voxel*0.005));return Ok(mesh);
+                hard_surface::split_normals(&mut mesh,|p|normal(p,voxel*0.005));
+                PROGRESS.with_borrow(|p| if let Some(p) = p { p.at_least(1.0) });
+                return Ok(mesh);
         }
         let field = Field::new(self, voxel);
         let field = match keep {
@@ -1718,7 +2045,17 @@ impl Clay {
         // are not sampled point by point; most of a solid clay is like that.
         let far = 1.5 * BRICK as f32 * voxel;
         let timer = std::time::Instant::now();
-        let lap = |what: &str| if std::env::var("MESH_TIMES").is_ok() { eprintln!("mesh {what}: {:.2}s", timer.elapsed().as_secs_f32()) };
+        // Sampling the blocks is most of a build: 80% of the bar, by rows
+        // done (in any order, so the bar only rises); then each phase its
+        // share, to the whole bar (or this build's section of it, see
+        // `progress_range`) when the mesh is done.
+        let progress = PROGRESS.with_borrow(|p| p.clone());
+        let lap = |what: &str, done: f32| {
+            if std::env::var("MESH_TIMES").is_ok() { eprintln!("mesh {what}: {:.2}s", timer.elapsed().as_secs_f32()) }
+            if let Some(p) = &progress { p.at_least(done); }
+        };
+        let rows_done = AtomicUsize::new(0);
+        let rows = (bny * bnz).max(1);
         let mut bricks: Vec<Block> = vec![Block::Out; bnx * bny * bnz];
         // A row of blocks at a time: z slabs alone would leave cores idle
         // on flat or small grids.
@@ -1748,8 +2085,10 @@ impl Clay {
                 }
                 line[bx] = Block::Data(b.into_boxed_slice());
             }
+            let done = rows_done.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some(p) = &progress { p.at_least(0.8 * done as f32 / rows as f32); }
         });
-        lap("blocks");
+        lap("blocks", 0.8);
         let brick = |x: usize, y: usize, z: usize| x / BRICK + bnx * (y / BRICK + bny * (z / BRICK));
         let at = |x: usize, y: usize, z: usize| match &bricks[brick(x, y, z)] {
             Block::Data(b) => b[x % BRICK + BRICK * (y % BRICK + BRICK * (z % BRICK))],
@@ -1803,23 +2142,34 @@ impl Clay {
                     .iter().map(|&p| { let c = grid.wanted_cell(p); if painted(p) { c.min(grid.voxel) } else { c } }).fold(f32::INFINITY, f32::min);
                 if !wanted.is_finite() || wanted >= voxel * 0.75 { 1 } else { (voxel / wanted).log2().round().exp2() as u32 }
             };
+            let margin = |a: Vec3, b: Vec3| field.detail_bound(a, b);
             let mut cells = Vec::new();
-            for (x, y, z) in cells_in_live_blocks() {
-                let f = CORNERS.map(|(dx, dy, dz)| at(x + dx, y + dy, z + dz));
-                let inside = f.iter().filter(|v| **v < 0.0).count();
+            for &i in &live_blocks {
                 // Surface can pass through a cell with all corners on one
-                // side (a thin ridge); the field is about a distance.
-                if (inside > 0 && inside < 8) || f.iter().any(|v| v.abs() < 1.8 * voxel) {
-                    cells.push([x, y, z]);
+                // side (a thin ridge): the blobs' field is about a distance,
+                // and sculpt offsets (a pore narrower than a cell, deeper
+                // than its corners) move it by at most the block's margin
+                // either way, so twice that is added to the reach (as the
+                // nets' walk does). One margin per block: it is the same
+                // on any thread count, and cheap beside every cell's.
+                let (bx, by, bz) = (i % bnx, (i / bnx) % bny, i / (bnx * bny));
+                let (x0, y0, z0) = (bx * BRICK, by * BRICK, bz * BRICK);
+                let reach = 1.8 * voxel + 2.0 * margin(point(x0, y0, z0), point(x0 + BRICK, y0 + BRICK, z0 + BRICK));
+                for (x, y, z) in cells_of(i) {
+                    let f = CORNERS.map(|(dx, dy, dz)| at(x + dx, y + dy, z + dz));
+                    let inside = f.iter().filter(|v| **v < 0.0).count();
+                    if (inside > 0 && inside < 8) || f.iter().any(|v| v.abs() < reach) {
+                        cells.push([x, y, z]);
+                    }
                 }
             }
             let coarse = |x: usize, y: usize, z: usize| at(x, y, z);
             let fine = |p: Vec3, list: &[u32]| sample(p, list).0;
             let near = |a: Vec3, b: Vec3| field.near(a, b);
-            let nets = crate::adaptive::Nets { lo, cell: voxel, n: [nx, ny, nz], coarse: &coarse, field: &fine, near: &near, factor: &factor };
-            lap("coarse grid");
+            let nets = crate::adaptive::Nets { lo, cell: voxel, n: [nx, ny, nz], coarse: &coarse, field: &fine, near: &near, factor: &factor, margin: &margin };
+            lap("coarse grid", 0.84);
             let (mut positions, mut indices) = nets.mesh(&cells, MAX_FINE_TRIANGLES)?;
-            lap("adaptive nets");
+            lap("adaptive nets", 0.9);
             // A vertex on two pinches can need a second pass.
             for _ in 0..4 {
                 let n = crate::adaptive::make_manifold(&mut positions, &mut indices);
@@ -1828,7 +2178,7 @@ impl Clay {
                     break;
                 }
             }
-            lap("manifold");
+            lap("manifold", 0.92);
             let edges = crate::bake::edges(&indices);
             (positions, indices, edges)
         } else {
@@ -1904,7 +2254,7 @@ impl Clay {
                 cell_vertex.insert(c, positions.len() as u32);
                 positions.push(p);
             }
-            lap("vertices");
+            lap("vertices", 0.85);
 
             // One quad per grid edge the surface crosses, joining the 4 cells around it.
             let mut indices = Vec::new();
@@ -1945,7 +2295,7 @@ impl Clay {
                 }
             }
 
-            lap("quads");
+            lap("quads", 0.9);
             // Split each quad: Ok(diagonal), or Err(a fan center), found on
             // any thread and added in quad order.
             let mut splits: Vec<(([u32;4],Vec3,Vec3,Vec3),Result<bool,Vec3>)> = quads.into_iter().map(|q| (q,Ok(false))).collect();
@@ -1984,7 +2334,7 @@ impl Clay {
             }
 
             if ambiguous {
-                lap("ambiguous quads: marching tetrahedra instead");
+                lap("ambiguous quads: marching tetrahedra instead", 0.9);
                 #[cfg(test)]
                 TETRA_FALLBACKS.with(|n| n.set(n.get() + 1));
                 let mut tetra=hard_surface::TetraMesh::default();
@@ -2013,7 +2363,7 @@ impl Clay {
         let normal_cell=voxel * if sharp {0.05} else {0.5};
         let e = self.detail.as_ref().map_or(normal_cell, |d| normal_cell.max(d.voxel() * 0.75));
         let refined = refine && detail_grid.is_some_and(|g| !g.levels().is_empty());
-        lap("edges");
+        lap("edges", 0.92);
         par_chunks(&mut vertices, 1024, |_, chunk| {
             for v in chunk {
                 let p = Vec3::from(v.pos);
@@ -2061,14 +2411,15 @@ impl Clay {
         // Weathering, smart layers and decals follow the shape; the width
         // comes from the regular mesh cell, so fine and regular meshes
         // weather alike.
-        lap("normals and colors");
+        lap("normals and colors", 0.96);
         crate::smart::finish(self, &field, &mut mesh);
-        lap("smart finish");
+        lap("smart finish", 0.99);
         mesh.face = self.face().map(Arc::new);
         if sharp { hard_surface::split_normals(&mut mesh, |p| {
             let near=field.near(p-voxel,p+voxel);
             normal(p,&near,voxel*0.005)
         }); }
+        if let Some(p) = &progress { p.at_least(1.0); }
         Ok(mesh)
     }
 
@@ -2076,7 +2427,7 @@ impl Clay {
     /// chamfers, a shell); smooth-only clay keeps plain surface nets.
     pub(crate) fn sharp_features(&self) -> bool {
         self.sharp && (self.shell.is_some() || self.blobs.iter().any(|b|
-            !matches!(b.form, Form::Sphere { .. } | Form::Ellipsoid { .. } | Form::Capsule { .. } | Form::Human { .. } | Form::Torus { .. } | Form::Chain { .. } | Form::Membrane { .. })
+            !(matches!(b.form, Form::Sphere { .. } | Form::Ellipsoid { .. } | Form::Capsule { .. } | Form::Human { .. } | Form::Torus { .. } | Form::Lid { .. } | Form::Chain { .. } | Form::Membrane { .. }) || b.form.round_tube())
             || matches!(b.op, Op::Plate | Op::Engrave | Op::Emboss) || b.join == hard_surface::Join::Chamfer))
     }
 
@@ -2105,7 +2456,8 @@ impl Clay {
     }
 
     pub(crate) fn mesh_resolution(&self) -> u32 {
-        let hard = self.shell.is_some() || self.blobs.iter().any(|b| matches!(b.form, Form::Box {..} | Form::Extrude {..} | Form::Lathe {..} | Form::Sweep {..} | Form::Shell {..} | Form::Array {..} | Form::Band {..}) || matches!(b.op, Op::Plate | Op::Engrave | Op::Emboss));
+        // Round tubes are smooth forms, as capsules are (D6).
+        let hard = self.shell.is_some() || self.blobs.iter().any(|b| (matches!(b.form, Form::Box {..} | Form::Extrude {..} | Form::Lathe {..} | Form::Sweep {..} | Form::Shell {..} | Form::Array {..} | Form::Band {..}) && !b.form.round_tube()) || matches!(b.op, Op::Plate | Op::Engrave | Op::Emboss));
         // A uniform refinement preserves shared connectivity at feature cells.
         // Explicit fine meshes still use detail_cell without this floor.
         if !hard || self.resolution != DEFAULT_RESOLUTION { return self.resolution.clamp(MIN_RESOLUTION,MAX_RESOLUTION); }
@@ -3087,6 +3439,42 @@ impl DetailGrid {
         })
     }
 
+    /// The largest absolute offset there can be in a box, every level
+    /// added up: a trilinear value never passes its grid points'.
+    pub(crate) fn max_abs_in(&self, lo: Vec3, hi: Vec3) -> f32 {
+        let levels = self.levels.iter().filter(|l| {
+            let (a, b) = l.extent(0.0);
+            a.cmple(hi).all() && b.cmpge(lo).all()
+        });
+        self.level_max_abs_in(lo, hi) + levels.map(|l| l.grid.level_max_abs_in(lo, hi)).sum::<f32>()
+    }
+
+    /// `max_abs_in` on this level alone: its bricks holding grid points a
+    /// point in the box reads.
+    fn level_max_abs_in(&self, lo: Vec3, hi: Vec3) -> f32 {
+        if self.bricks.is_empty() {
+            return 0.0;
+        }
+        let size = DB as f32 * self.voxel;
+        let (a, b) = (((lo - self.voxel) / size).floor().as_ivec3(), ((hi + self.voxel) / size).floor().as_ivec3());
+        let n = (b - a + 1).max(glam::IVec3::ZERO);
+        let max = |b: &[f32; BRICK_VALUES]| b.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        if (n.x as i64) * (n.y as i64) * (n.z as i64) <= 64 {
+            let mut m = 0.0f32;
+            for z in a.z..=b.z {
+                for y in a.y..=b.y {
+                    for x in a.x..=b.x {
+                        if let Some(b) = self.bricks.get(&[x, y, z]) {
+                            m = m.max(max(b));
+                        }
+                    }
+                }
+            }
+            return m;
+        }
+        self.bricks.iter().filter(|(k, _)| (0..3).all(|i| k[i] >= a[i] && k[i] <= b[i])).fold(0.0f32, |m, (_, b)| m.max(max(b)))
+    }
+
     /// Forgets `solid_bounds` here and on every level (before a change).
     fn forget_bounds(&mut self) {
         self.solid = std::sync::OnceLock::new();
@@ -3638,6 +4026,42 @@ impl<'de> Deserialize<'de> for Detail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pore narrower than a coarse cell and deeper than 1.8 of them
+    /// (between grid points, so no coarse corner sees it): the adaptive
+    /// nets get the cells it passes through below the surface too, so
+    /// the fine mesh is closed and reaches its bottom.
+    #[test]
+    fn a_deep_narrow_pore_meshes_closed_to_its_bottom() {
+        let mut c: Clay = serde_json::from_value(serde_json::json!({ "blobs": [{ "type": "sphere", "center": [0, 0, 0], "radius": 1.0 }], "resolution": 64, "detail_cell": 0.02 })).unwrap();
+        let face = Region { name: "face".into(), center: Vec3::Z, radii: Vec3::splat(0.3), cell: 0.005 };
+        c.set_detail_regions(std::slice::from_ref(&face)).unwrap();
+        // The pore: a round shaft at (0.02, 0.02), radius 0.012, from the
+        // surface down to z = 0.8. Its offsets are nonzero only inside it
+        // (as a sculpted pore's are, unlike a distance), lifting the field
+        // to half the radius on its axis.
+        let (axis, r0, bottom) = (glam::Vec2::new(0.02, 0.02), 0.012f32, 0.8f32);
+        let level = &mut c.detail.as_mut().unwrap().grid_mut().levels[0].grid;
+        let h = level.voxel;
+        assert_eq!(h, 0.005);
+        for i in -2..=10 {
+            for j in -2..=10 {
+                for k in (0.75 / h) as i32..=(1.03 / h) as i32 {
+                    let p = Vec3::new(i as f32, j as f32, k as f32) * h;
+                    let shaft = ((p.truncate() - axis).length() - r0).max(bottom - p.z);
+                    let off = (-shaft).max(0.0) / r0 * (1.0 - p.length() + 0.5 * r0);
+                    if off > 0.0 {
+                        level.set([i, j, k], off);
+                    }
+                }
+            }
+        }
+        let fine = c.build_fine(&[], "").unwrap();
+        let tris: Vec<[u32; 3]> = fine.indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect();
+        assert_eq!(crate::mesh_asset::edge_use_kinds(&tris), Default::default(), "the pore left holes");
+        let deepest = fine.vertices.iter().map(|v| Vec3::from(v.pos)).filter(|p| p.z > 0.0 && (p.truncate() - axis).length() < 2.0 * r0).fold(f32::MAX, |a, p| a.min(p.z));
+        assert!(deepest < bottom + 0.02, "the pore stops at z = {deepest}, its bottom is {bottom}");
+    }
 
     #[test]
     fn loose_cover_hides_a_small_bump_and_keeps_zero_compatible() {

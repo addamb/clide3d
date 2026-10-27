@@ -62,14 +62,18 @@ pub fn count<'de, D: serde::Deserializer<'de>>(d: D) -> Result<usize, D::Error> 
     Ok(n)
 }
 pub fn profile<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Corner>, D::Error> {
-    let p = Vec::<Corner>::deserialize(d)?;
+    check_profile(Vec::<Corner>::deserialize(d)?).map_err(serde::de::Error::custom)
+}
+/// A profile as `profile` accepts it: 3-128 finite points making a simple
+/// polygon with area.
+pub(super) fn check_profile(p: Vec<Corner>) -> Result<Vec<Corner>, String> {
     if !(3..=128).contains(&p.len()) || p.iter().any(|c| {
         !c.point().is_finite()
             || matches!(c, Corner::Rounded { radius, .. } if !radius.is_finite() || *radius < 0.0)
     }) {
-        return Err(serde::de::Error::custom(
-            "profile needs 3-128 finite [u,v] points or {point:[u,v],radius:nonnegative}",
-        ));
+        return Err(
+            "profile needs 3-128 finite [u,v] points or {point:[u,v],radius:nonnegative}".into(),
+        );
     }
     let area: f32 = p
         .iter()
@@ -81,9 +85,7 @@ pub fn profile<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Corner>, D:
             .enumerate()
             .any(|(i, c)| c.point().distance_squared(p[(i + 1) % p.len()].point()) < 1e-12)
     {
-        return Err(serde::de::Error::custom(
-            "profile must have area and distinct adjacent points",
-        ));
+        return Err("profile must have area and distinct adjacent points".into());
     }
     for i in 0..p.len() {
         for j in i + 1..p.len() {
@@ -99,15 +101,13 @@ pub fn profile<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Corner>, D:
             if (b - a).perp_dot(c - a) * (b - a).perp_dot(e - a) < 0.0
                 && (e - c).perp_dot(a - c) * (e - c).perp_dot(b - c) < 0.0
             {
-                return Err(serde::de::Error::custom(
-                    "profile must be simple (no crossing edges)",
-                ));
+                return Err("profile must be simple (no crossing edges)".into());
             }
         }
     }
     Ok(p)
 }
-fn polygon(corners: &[Corner]) -> Vec<Vec2> {
+pub(super) fn polygon(corners: &[Corner]) -> Vec<Vec2> {
     if corners
         .iter()
         .any(|c| matches!(c, Corner::Smooth { smooth: true, .. }))
@@ -215,7 +215,7 @@ fn polygon(corners: &[Corner]) -> Vec<Vec2> {
     }
     p
 }
-fn polygon_sdf(p: Vec2, points: &[Vec2]) -> f32 {
+pub(super) fn polygon_sdf(p: Vec2, points: &[Vec2]) -> f32 {
     polygon_sdf_mode(p, points, false)
 }
 fn polygon_sdf_mode(p: Vec2, points: &[Vec2], lathe: bool) -> f32 {
@@ -804,6 +804,8 @@ fn holds_mesh(form: &Form) -> bool {
 fn exact(form: &Form) -> bool {
     match form {
         Form::Sphere { .. } | Form::Box { .. } | Form::Extrude { .. } | Form::Lathe { .. } | Form::Torus { .. } | Form::Mesh { .. } => true,
+        // Tubes are at least the distance to each span's box.
+        Form::Sweep { field: super::tube::SweepField::Segments, .. } => true,
         Form::Array { source, .. } => exact(source),
         _ => false,
     }
@@ -825,14 +827,14 @@ pub(super) enum Copies {
 
 /// One array lookup: the best distance so far and the least lower bound
 /// of the copies skipped.
-struct Walk {
-    q: Vec3,
-    bound: f32,
-    best: f32,
-    floor: f32,
+pub(super) struct Walk {
+    pub(super) q: Vec3,
+    pub(super) bound: f32,
+    pub(super) best: f32,
+    pub(super) floor: f32,
     /// More than rounding can move a bound, so it never skips a copy
     /// whose distance comes out (a few ulps) lower.
-    slack: f32,
+    pub(super) slack: f32,
 }
 
 impl Walk {
@@ -890,7 +892,7 @@ struct CopyNode {
 }
 
 impl CopyTree {
-    fn new(boxes: &[(Vec3, Vec3)]) -> Self {
+    pub(super) fn new(boxes: &[(Vec3, Vec3)]) -> Self {
         let mut tree = Self { nodes: Vec::new(), order: (0..boxes.len() as u32).collect() };
         tree.build(boxes, 0, boxes.len());
         tree
@@ -914,13 +916,46 @@ impl CopyTree {
         node as u32
     }
 
-    fn walk(&self, walk: &mut Walk, mut visit: impl FnMut(&mut Walk, u32)) {
+    /// Bytes held (for the plan's memory budget).
+    #[cfg(test)]
+    pub(super) fn bytes(&self) -> usize {
+        self.nodes.len() * std::mem::size_of::<CopyNode>() + self.order.len() * 4
+    }
+
+    /// Whether a leaf's boxes (up to four together) come within `reach` of
+    /// the box lo..hi.
+    pub(super) fn near_box(&self, lo: Vec3, hi: Vec3, reach: f32) -> bool {
+        let gap = |n: u32| {
+            let n = &self.nodes[n as usize];
+            (n.lo - hi).max(lo - n.hi).max(Vec3::ZERO).length()
+        };
+        // Depth first: at most one sibling a level waits.
+        let mut stack = [0u32; 32];
+        let mut top = 1;
+        while top > 0 {
+            top -= 1;
+            let n = stack[top];
+            if gap(n) > reach {
+                continue;
+            }
+            let node = &self.nodes[n as usize];
+            if node.count > 0 {
+                return true;
+            }
+            stack[top] = node.second;
+            stack[top + 1] = n + 1;
+            top += 2;
+        }
+        false
+    }
+
+    pub(super) fn walk(&self, walk: &mut Walk, mut visit: impl FnMut(&mut Walk, u32)) {
         let q = walk.q;
         let gap = |n: u32| {
             let n = &self.nodes[n as usize];
             (n.lo - q).max(q - n.hi).max(Vec3::ZERO).length()
         };
-        // Balanced: at most 512 copies make 8 levels.
+        // Balanced: 4096 copies or tube spans make 11 levels.
         let mut stack = [(0u32, 0.0f32); 32];
         stack[0] = (0, gap(0));
         let mut top = 1;
@@ -1002,6 +1037,8 @@ pub(super) enum Geometry {
         half: f32,
         depth: f32,
     },
+    /// A sweep with `field: segments` (see `tube.rs`).
+    Tube(Box<super::tube::Tube>),
 }
 impl Geometry {
     pub(super) fn new(form: &Form, assets: &super::Assets) -> Self {
@@ -1067,8 +1104,13 @@ impl Geometry {
                 taper,
                 twist,
                 smooth,
+                radii,
+                field,
             } => {
-                let p = polygon(profile);
+                if *field == super::tube::SweepField::Segments {
+                    return Self::Tube(Box::new(super::tube::Tube::new(profile, points, *taper, *twist, *smooth, radii.as_deref())));
+                }
+                let p = polygon(&profile.corners());
                 let taper = taper.clamp(0.01, 10.0);
                 let radius = p.iter().map(|p| p.length()).fold(0.0, f32::max) * taper.max(1.0);
                 let points = if *smooth {
@@ -1251,6 +1293,7 @@ impl Geometry {
         match self {
             Self::Extrude { lo, hi, .. } | Self::Lathe { lo, hi, .. } => (*lo, *hi),
             Self::Shell { lo, hi, .. } | Self::Array { lo, hi, .. } => (*lo, *hi),
+            Self::Tube(t) => t.bounds(),
             Self::Sweep { points, radius, .. } => points.iter().fold(
                 (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
                 |(a, b), p| (a.min(*p - *radius), b.max(*p + *radius)),
@@ -1272,10 +1315,12 @@ impl Geometry {
         self.sdf_within(q, f32::MAX)
     }
     /// `sdf` where it is below `bound`; elsewhere some value from `bound`
-    /// up to it (still a lower bound of the distance). Arrays use this to
-    /// skip copies that cannot come within the bound; other forms ignore it.
+    /// up to it (still a lower bound of the distance). Arrays and tubes use
+    /// this to skip copies or spans that cannot come within the bound;
+    /// other forms ignore it.
     pub(super) fn sdf_within(&self, q: Vec3, bound: f32) -> f32 {
         match self {
+            Self::Tube(t) => t.sdf_within(q, bound),
             Self::Extrude {
                 p,
                 center,
@@ -1594,7 +1639,11 @@ pub(super) fn feature_size(form: &Form) -> Option<f32> {
         } else {
             f32::MAX
         })),
-        Form::Sweep { profile, taper, .. } => Some(section(profile) * taper.min(1.0)),
+        Form::Sweep { profile, taper, radii, field, .. } => Some(match (profile.circle(), field) {
+            // A round tube's thinnest diameter.
+            (Some(r), super::tube::SweepField::Segments) => 2.0 * radii.as_ref().map_or(r * taper.min(1.0), |v| v.iter().copied().fold(f32::MAX, f32::min)),
+            _ => section(&profile.corners()) * taper.min(1.0),
+        }),
         Form::Lathe { profile, .. } => Some(
             profile
                 .iter()
@@ -1764,9 +1813,10 @@ pub(super) fn validate(form: &Form) -> Result<(), String> {
             Form::Extrude {depth,center,axis,bevel,..} if !positive(*depth) || !center.is_finite() || !axis_ok(*axis) || !bevel.is_finite() || *bevel<0.0 => Err("extrude needs positive depth, finite center, nonzero axis and nonnegative bevel".into()),
             Form::Lathe {profile,center,axis} if !center.is_finite() || !axis_ok(*axis) || profile.iter().any(|p|p.point().x<0.0) => Err("lathe needs nonnegative profile radius, finite center and nonzero axis".into()),
             Form::Sweep {points,taper,twist,..} if !positive(*taper) || *taper>10.0 || !twist.is_finite() || points.windows(2).any(|w|w[0].distance_squared(w[1])<1e-12) => Err("sweep needs distinct path points, taper in (0,10], finite twist".into()),
+            Form::Sweep {profile,points,radii,field,..} => super::tube::check(profile, points, radii.as_deref(), *field).map(|_| 1),
             Form::Shell {source,thickness} => {if !positive(*thickness) {return Err("shell thickness must be positive".into());}check(source,depth+1)},
             Form::Array {source,count,points,step,radius,center,axis,..} => {
-                if !(1..=512).contains(count) || points.len()>128 || points.iter().any(|p|!p.is_finite()) || points.len()==1 || !step.is_finite() || !radius.is_finite() || *radius<0.0 || !center.is_finite() || !axis_ok(*axis) {return Err("array needs count 1-512, finite transforms, nonzero axis and 0 or 2-128 path points".into());}
+                if !(1..=512).contains(count) || points.len()>super::MAX_PATH_POINTS || points.iter().any(|p|!p.is_finite()) || points.len()==1 || !step.is_finite() || !radius.is_finite() || *radius<0.0 || !center.is_finite() || !axis_ok(*axis) {return Err(format!("array needs count 1-512, finite transforms, nonzero axis and 0 or 2-{} path points", super::MAX_PATH_POINTS));}
                 let n=check(source,depth+1)?.saturating_mul(*count);
                 if n>4096 {Err("nested arrays may contain at most 4096 copies".into())}else{Ok(n)}
             },

@@ -9,7 +9,7 @@
 <p align="center">
   <a href="LICENSE-MIT"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue"></a>
   <img alt="Rust 2024 edition" src="https://img.shields.io/badge/rust-2024%20edition-orange">
-  <img alt="MCP tools: 72" src="https://img.shields.io/badge/MCP%20tools-72-purple">
+  <img alt="MCP tools: 79" src="https://img.shields.io/badge/MCP%20tools-79-purple">
   <a href="https://m8ven.ai/mcp/addamb-clide3d-2hsm3d?s=readme"><img alt="M8ven Score" src="https://m8ven.ai/badge/mcp/addamb-clide3d-2hsm3d?v=55db3abb2693ff403a9475a8d4cfa7e8"></a>
 </p>
 
@@ -25,7 +25,7 @@
 Most 3D tools are built for a person with a mouse. Clide3D is built for both:
 a familiar Maya-style desktop editor **and** a local
 [Model Context Protocol](https://modelcontextprotocol.io) server that exposes
-the whole editor as 72 typed tools. Point Claude Code (or any MCP client) at it
+the whole editor as 79 typed tools. Point Claude Code (or any MCP client) at it
 and the agent can build, inspect, render and export a scene while you watch
 the window update live, then take over with the mouse at any point. Every
 agent edit lands on the same undo stack as yours.
@@ -37,9 +37,9 @@ Everything is one native Rust binary: no Python runtime, no plugins, no cloud.
 | | |
 |---|---|
 | **Maya-style editor** | Menu sets, shelf, Outliner, Channel Box / Attribute Editor, four-view layout, time slider, hotkey editor, and a MEL command line (`polyCube -n box; move 0 2 0`). |
-| **Clay sculpting** | Signed-distance "blob" modelling (spheres, capsules, lathes, sweeps, extrusions, arrays, shells, bands) with smooth or sharp joins, plus brush sculpting, painting and decals on a fine detail layer; VDM stamps (Alpha 3D) captured from any clay and stamped back with their overhangs, and curve strokes whose control points can be moved after the fact (MoveCurve). |
+| **Clay sculpting** | Signed-distance "blob" modelling (spheres, capsules, lathes, sweeps with exact round tubes, extrusions, arrays, shells, bands) with smooth or sharp joins, plus brush sculpting, painting and decals on a fine detail layer; ClayPolish, which takes lumps off and keeps creases, hard edges and lip and lid lines; strokes projected onto the surface so lines drawn along a strand stay on it across blob junctions; VDM stamps (Alpha 3D) captured from any clay and stamped back with their overhangs, and curve strokes whose control points can be moved after the fact (MoveCurve). |
 | **Interactive sculpting** | Sculpt, Paint, Mask and Groups brush tools with a live preview, a brush HUD (size, strength, falloff curve, alpha, symmetry, layers, Adjust Last, history) and pen pressure (touch force, an opt-in macOS tablet monitor, or pointer speed). Every stroke is a record in a stroke ledger that can be listed, disabled, edited, replayed or undone on its own; sculpt and paint layers with amounts, morphs exported as blend shapes, persistent masks and polygroups, detail levels that keep fine detail under coarse edits, and Sculptris Pro local refinement. |
-| **3D printing** | Import OBJ, STL, PLY, GLB and FBX meshes (`import_mesh`), turn any object into clay and combine objects with add / carve / intersect booleans (`to_clay`), then `export_print` to STL, OBJ, PLY or 3MF in millimeters, sized and optionally hollowed, with a watertight / non-manifold report. |
+| **3D printing** | Import OBJ, STL, PLY, GLB and FBX meshes (`import_mesh`), turn any object into clay and combine objects with add / carve / intersect booleans (`to_clay`), then `export_print` to STL, OBJ, PLY or 3MF in millimeters, sized, optionally hollowed or simplified, with fine detail only where detail regions ask for it, a triangle limit checked before building, and a watertight / non-manifold report by kind. |
 | **Hard surface** | Chamfered panels, bolts, vents and cables (`kitbash`, `detail_pass`), forged armor plates, battle damage stamps and vehicle wear presets. |
 | **Characters** | A built-in human base (MakeHuman CC0 mesh, 600+ shape controls) with a full rig, face detail and facial hair, textured eyes, strand hair, and simulated, sewn garments. |
 | **Rigging and animation** | Bones, weight painting, keyframe clips with smooth/linear/step keys, and posing that carries props and armor along. |
@@ -122,19 +122,20 @@ curl -s http://127.0.0.1:7878/mcp \
 ```
 
 <details>
-<summary><b>All 72 tools</b></summary>
+<summary><b>All 79 tools</b></summary>
 
 | Area | Tools |
 |---|---|
 | Scene | `get_scene`, `new_scene`, `open_scene`, `save_scene`, `undo`, `redo`, `history`, `run_mel` |
 | Objects | `create_object`, `update_object`, `delete_object`, `duplicate_object`, `select_object`, `group_objects`, `parent_objects`, `set_pivot`, `mirror_object` |
 | Clay and surfaces | `edit_clay`, `get_clay`, `sculpt`, `paint`, `sculpt_layer`, `detail_level`, `morph`, `mask`, `group`, `brush_preset`, `alpha`, `decal`, `surface_point`, `to_clay` |
+| Polygon objects | `poly` (from clay, Catmull-Clark subdivision levels, semi-sharp creases, UVs, clay detail projected onto the levels as vector displacement), `retopo` (field-aligned quad retopology), `export_poly` (the subdivision cage as OBJ, GLB or USDA with displacement, normal, color and AO maps, checked by reading the files back; `udim: true` writes UDIM texture tiles and per-tile maps); UDIM texture tiles painted with `paint` and baked from clay with `bake udim: true`; `render_film` renders Polys subdivided and displaced about a pixel fine (`subdiv_max_level`, `displacement`, `dice_rate`, `max_diced`) |
 | Stroke ledger | `stroke_log`, `stroke_edit`, `sculpt_diff`, `probe_clay` |
-| Reference images | `set_reference`, `compare_reference`, `project_reference` |
-| Materials and wear | `set_material`, `wear`, `damage` |
+| Reference images and quality | `set_reference` (one image per view, or a turnaround sheet split into views at one scale with image planes), `compare_reference`, `project_reference`, `quality_report`, `guides` (proportion guides: head units, eye and centre lines and proportion targets, measured on the clay's field and against a turnaround sheet; drawn over views, never exported) |
+| Materials and wear | `set_material` (presets, including the stylised `skin_stylized`, `lips_stylized`, `cheek_blush`, `fabric_soft`, with overrides and `apply_to`), `wear`, `damage` |
 | Hard surface | `kitbash`, `detail_pass` |
-| Characters | `create_human`, `set_human`, `human_controls`, `face_detail`, `face_hair`, `cloth` |
-| Rigging and animation | `rig`, `pose_bone`, `animate`, `playback` |
+| Characters | `create_character` (a stylised cartoon base of named, blended blobs from proportions alone: head units, head width, body, limbs, hands, feet, eyes and ears, biped or quadruped, with stylised eyes in carved sockets under eyelids that wrap the eyeball, a rig and proportion guides that measure back; `edit_clay` lid blobs fill eyelids from any Eye object), `create_human`, `set_human`, `human_controls`, `face_detail`, `face_hair`, `groom` (comb, lengthen, shorten, cut, clump, twist, smooth, puff and relax a Hair's guides, kept out of the head; the editor's Groom tool sends it; a Hair's `grow {fur: true}` covers a whole clay body in short fur combed down the body and out along the limbs, coloured from the clay at each root, excluding named parts and the eyes), `cloth` |
+| Rigging and animation | `rig`, `pose_bone` (posing in place; mirrored blobs that a move turns unevenly, such as a head tilt or one arm, are written out as their two sides and each side follows its own bone), `animate`, `playback` |
 | Environments | `kit`, `scatter`, `instance_array`, `edit_terrain`, `fire` |
 | Camera and view | `set_camera`, `frame_view`, `set_display`, `screenshot` |
 | Rendering | `render_film`, `render_views`, `render_animation`, `job_status` |
@@ -173,6 +174,7 @@ Lighting menu offers the same. See `graphics_check/README.md`.
 | Hide / show | Ctrl+H / Shift+H |
 | Brush tools: finer / coarser detail level · X symmetry | D / Shift+D · X (instead of pivot and snap while a brush tool is on) |
 | Brush tools: size · strength · focal shift | Hold S · U · O and move the mouse sideways |
+| Poly objects: finer / coarser shown subdivision level | Page Up / Page Down |
 | Brush tools: smooth · invert · mask · erase mask · lasso | Shift · Alt · Ctrl · Ctrl+Alt · Ctrl+Shift (RMB orbits) |
 | Play animation | Alt+V |
 | Undo / redo | ⌘Z / ⇧⌘Z |
@@ -206,11 +208,14 @@ src/
 ├── scene.rs           the saved scene model
 ├── clay.rs            signed-distance clay → adaptive meshes
 ├── hard_surface.rs    extrude / lathe / sweep / shell / array / band forms
+├── tube.rs            exact tube fields for sweeps (field: segments)
 ├── brush/             strokes: spec, resolver, falloff and pressure curves, symmetry, alphas and VDM stamps
 ├── sculpt/            the sculpt engine and brushes
 ├── paint.rs, surface.rs, detail.rs, adaptive.rs
+├── quality.rs, guides.rs   field quality measures and proportion guides
 ├── rig.rs, pose.rs    skeletons, skinning and posing
-├── human.rs, face.rs, eyeball.rs, hair.rs, face_hair.rs
+├── character.rs       stylised character bases from proportions
+├── human.rs, face.rs, eyeball.rs, hair.rs, face_hair.rs, groom.rs
 ├── cloth.rs, fire.rs, damage.rs, weather.rs
 ├── material.rs, smart.rs   PBR materials and layered smart materials
 ├── render.rs          the real-time viewport renderer

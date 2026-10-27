@@ -107,6 +107,45 @@ fn fill_holes(points: &mut Vec<Vec3>, tris: &mut Vec<[u32; 3]>) -> usize {
 /// own (an even scale; 1 for meshes) and its mesh or clay.
 type Part = (String, Mat4, f32, Result<std::sync::Arc<crate::mesh::Mesh>, Clay>);
 
+/// `export_print`'s triangle limit: by default, and the range it may be set to.
+const DEFAULT_PRINT_TRIANGLES: u64 = 20_000_000;
+const MIN_PRINT_TRIANGLES: u64 = 1_000;
+const MAX_PRINT_TRIANGLES: u64 = 50_000_000;
+/// Pinched sheets move apart by the larger of this many millimeters (above
+/// slicers' weld tolerance, about 1e-4 mm) and this share of the edges there.
+const PINCH_MIN_MM: f32 = 0.005;
+const PINCH_CELL_SHARE: f32 = 0.02;
+
+/// A print mesh simplified by meshopt to within `error_mm` (absolute, the
+/// mesh is in millimeters), unused points dropped; None when it would not
+/// be watertight (every edge in two triangles, opposite ways) or nothing
+/// was removed.
+fn simplified(points: &[Vec3], tris: &[[u32; 3]], error_mm: f32) -> Option<(Vec<Vec3>, Vec<[u32; 3]>)> {
+    let indices: Vec<u32> = tris.iter().flatten().copied().collect();
+    let adapter = meshopt::VertexDataAdapter::new(bytemuck::cast_slice(points), 12, 0).ok()?;
+    let out = meshopt::simplify(&indices, &adapter, 0, error_mm, meshopt::SimplifyOptions::ErrorAbsolute, None);
+    if out.is_empty() || out.len() >= indices.len() {
+        return None;
+    }
+    let mut remap = vec![u32::MAX; points.len()];
+    let mut kept = Vec::new();
+    let tris: Vec<[u32; 3]> = out
+        .chunks_exact(3)
+        .map(|t| {
+            [t[0], t[1], t[2]].map(|i| {
+                let slot = &mut remap[i as usize];
+                if *slot == u32::MAX {
+                    *slot = kept.len() as u32;
+                    kept.push(points[i as usize]);
+                }
+                *slot
+            })
+        })
+        .collect();
+    let (edges, bad, flipped) = mesh_asset::edge_use(&tris);
+    (edges > 0 && bad == 0 && flipped == 0).then_some((kept, tris))
+}
+
 /// Whether a matrix's axes are at right angles (no shear).
 fn orthogonal(m: Mat4) -> bool {
     let [x, y, z] = [m.x_axis.truncate(), m.y_axis.truncate(), m.z_axis.truncate()];
@@ -145,11 +184,17 @@ impl ClideApp {
         if !path.is_absolute() {
             return Err("path must be absolute".into());
         }
+        if args["as"].as_str() == Some("poly") {
+            return self.import_poly(args, path);
+        }
+        if args.get("udim").is_some_and(|v| !v.is_null()) {
+            return Err("udim is for as: poly (a Poly's UV layout)".into());
+        }
         let format = Format::of(&path)?;
         let as_clay = match args["as"].as_str().unwrap_or("clay") {
             "clay" => true,
             "mesh" => false,
-            other => return Err(format!("as must be clay or mesh, not {other}")),
+            other => return Err(format!("as must be clay, mesh or poly, not {other}")),
         };
         let scale = number(args, "scale", 1e-6, 1e6)?.unwrap_or(1.0);
         let z_up = match args["up"].as_str().unwrap_or("y") {
@@ -236,6 +281,108 @@ impl ClideApp {
                     "holes": holes,
                     "holes_closed": holes_closed,
                     "bounds": { "min": round3(lo), "max": round3(hi) },
+                    "warnings": warnings,
+                })))
+            }) as Finish)
+        })))
+    }
+
+    /// `import_mesh as: poly`: an OBJ's polygons as a Poly object, faces
+    /// kept as they are (quads, n-gons), a UV per corner from `vt`, and
+    /// creases from `t crease 2/1/0 i j sharpness` tags (what `export_poly`
+    /// writes, so its cage comes back the same).
+    fn import_poly(&mut self, args: &Value, path: PathBuf) -> Result<Started, String> {
+        // .obj (any polygon file), or the cage export_poly writes into a
+        // .glb (extras.clide3d_cage) or a .usda.
+        let format = match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
+            Some("obj") => crate::poly::export::Geometry::Obj,
+            Some("glb") => crate::poly::export::Geometry::Glb,
+            Some("usda") => crate::poly::export::Geometry::Usda,
+            _ => return Err("as poly reads .obj (polygons, UVs and t crease tags), or the .glb and .usda export_poly writes".into()),
+        };
+        for key in ["resolution", "close_holes"] {
+            if !args[key].is_null() {
+                return Err(format!("{key} is not for as: poly (a Poly keeps the file's faces)"));
+            }
+        }
+        let scale = number(args, "scale", 1e-6, 1e6)?;
+        let z_up = match args["up"].as_str().unwrap_or("y") {
+            "y" => false,
+            "z" => true,
+            other => return Err(format!("up must be y or z, not {other}")),
+        };
+        let center = args["center"].as_bool().unwrap_or(false);
+        let textures = match args.get("textures").filter(|v| !v.is_null()) {
+            None => true,
+            Some(v) => v.as_bool().ok_or("textures must be true or false")?,
+        };
+        let udim = match args.get("udim").filter(|v| !v.is_null()) {
+            None => None,
+            Some(v) => Some(v.as_bool().ok_or("udim must be true or false")?),
+        };
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("import").chars().filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-').take(48).collect::<String>();
+        let name = args["name"].as_str().map(str::to_string).filter(|n| !n.trim().is_empty()).unwrap_or(if stem.is_empty() { "import".into() } else { stem });
+        if name.chars().count() > 64 {
+            return Err("name is at most 64 characters".into());
+        }
+        let label = format!("Import {} as a Poly", path.file_name().and_then(|f| f.to_str()).unwrap_or("mesh"));
+        Ok(Started::Job(label, Box::new(move |progress| {
+            let len = std::fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?.len();
+            if len > mesh_import::MAX_FILE_BYTES {
+                return Err(format!("{}: {} MiB is more than the {} MiB import limit", path.display(), len >> 20, mesh_import::MAX_FILE_BYTES >> 20));
+            }
+            let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            progress.check()?;
+            let read = match format {
+                crate::poly::export::Geometry::Obj => mesh_import::read_cage_as(&bytes, udim),
+                crate::poly::export::Geometry::Glb => crate::poly::export::check_glb(&bytes, progress).and_then(|c| c.cage.map(|c| (c, Vec::new())).ok_or("the .glb holds no subdivision cage (export_poly writes one in its mesh's extras)".into())),
+                crate::poly::export::Geometry::Usda => crate::poly::export::usda::read_as(&bytes, udim).map(|c| (c, Vec::new())),
+            };
+            let (mut cage, warnings) = read.map_err(|e| format!("{}: {e}", path.display()))?;
+            progress.set(0.5);
+            // Points are changed only when asked, so a file comes back bit
+            // for bit by default.
+            if let Some(k) = scale {
+                cage.points.iter_mut().for_each(|p| *p *= k);
+            }
+            if z_up {
+                let turn = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+                cage.points.iter_mut().for_each(|p| *p = turn * *p);
+            }
+            if center {
+                let (lo, hi) = cage.points.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(*p), b.max(*p)));
+                let mid = (lo + hi) * 0.5;
+                cage.points.iter_mut().for_each(|p| *p -= mid);
+            }
+            let mut poly = cage.to_poly().map_err(|e| format!("{}: {e}", path.display()))?;
+            progress.check()?;
+            // UDIM texture tiles an export_poly sidecar lists come back with
+            // the cage (texels exactly as written).
+            let mut texture_tiles = serde_json::Map::new();
+            if textures && poly.uv.is_some()
+                && let Some(t) = crate::poly::export::read_textures(&path, progress)?
+                && !t.is_empty()
+            {
+                for c in t.channels() {
+                    texture_tiles.insert(c.name().into(), json!({ "resolution": t.resolution(c), "tiles": t.tiles(c) }));
+                }
+                poly.paint = Some(std::sync::Arc::new(crate::poly::texture::paint::PolyPaint { textures: t, records: Vec::new(), imported: true }));
+            }
+            let info = poly.info();
+            Ok(Box::new(move |app: &mut ClideApp| {
+                let id = app.scene.add(Shape::Poly);
+                let taken = |n: &str| app.scene.objects.iter().any(|o| o.id != id && o.name == n);
+                let unique = if taken(&name) { (1..).map(|n| format!("{name}{n}")).find(|n| !taken(n)).expect("unbounded") } else { name };
+                let o = app.scene.get_mut(id).expect("just added");
+                o.name = unique;
+                o.poly = Some(poly);
+                app.select_only(id);
+                Ok(text(json!({
+                    "object": object_json_in(&app.scene, id),
+                    "format": format.name(),
+                    "as": "poly",
+                    "poly": info,
+                    "texture_tiles": texture_tiles,
                     "warnings": warnings,
                 })))
             }) as Finish)
@@ -380,7 +527,7 @@ impl ClideApp {
                 if o.shape != Shape::Clay {
                     // In place: the object keeps its id, name, placement and children.
                     o.shape = Shape::Clay;
-                    (o.mesh, o.kit, o.part, o.terrain, o.eye, o.hair) = (None, None, None, None, None, None);
+                    (o.mesh, o.kit, o.part, o.terrain, o.eye, o.hair, o.poly) = (None, None, None, None, None, None, None);
                 }
                 let blobs = clay.blobs.len();
                 o.clay = Some(clay);
@@ -453,6 +600,14 @@ impl ClideApp {
             Some(v) => Some(v["wall_mm"].as_f64().filter(|x| x.is_finite() && *x > 0.0 && *x <= 1e4).ok_or("hollow needs wall_mm, a positive number of millimeters")?),
         };
         let fine = args["fine"].as_bool().unwrap_or(false);
+        let max_triangles = match args.get("max_triangles").filter(|v| !v.is_null()) {
+            None => DEFAULT_PRINT_TRIANGLES,
+            Some(v) => v.as_u64().filter(|n| (MIN_PRINT_TRIANGLES..=MAX_PRINT_TRIANGLES).contains(n)).ok_or(format!("max_triangles must be a whole number from {MIN_PRINT_TRIANGLES} to {MAX_PRINT_TRIANGLES}"))?,
+        };
+        let simplify = match args.get("simplify").filter(|v| !v.is_null()) {
+            None => None,
+            Some(v) => Some(v["error_mm"].as_f64().filter(|x| (0.001..=1.0).contains(x)).ok_or("simplify needs error_mm, from 0.001 to 1 millimeter")? as f32),
+        };
         let eval = self.scene.evaluate();
         let mut ids = Vec::new();
         let roots: Vec<u64> = args["targets"].as_array().into_iter().flatten().map(|t| self.resolve(t)).collect::<Result<_, _>>()?;
@@ -465,7 +620,7 @@ impl ClideApp {
             }
         }
         let mut seen = std::collections::HashSet::new();
-        ids.retain(|id| seen.insert(*id) && self.scene.get(*id).is_some_and(|o| o.shape.is_mesh() && !matches!(o.shape, Shape::Fire | Shape::Hair | Shape::Cloth) && o.kitbash.as_deref() != Some(crate::kitbash::place::LIBRARY_TAG)));
+        ids.retain(|id| seen.insert(*id) && self.scene.get(*id).is_some_and(|o| o.shape.is_mesh() && !o.is_reference() && !matches!(o.shape, Shape::Fire | Shape::Hair | Shape::Cloth) && o.kitbash.as_deref() != Some(crate::kitbash::place::LIBRARY_TAG)));
         if ids.is_empty() {
             return Err("nothing to export: no visible solid objects (or targets)".into());
         }
@@ -475,6 +630,9 @@ impl ClideApp {
         // its own is, and its mesh, or the clay to mesh on the job's
         // thread (hollow or fine).
         let mut parts: Vec<Part> = Vec::new();
+        // Triangles the file will have, from the meshes there are now:
+        // refused before anything is built.
+        let mut estimate = 0.0f64;
         for &id in &ids {
             let o = self.scene.get(id).expect("kept");
             let world = self.scene.world_matrix(id);
@@ -486,13 +644,26 @@ impl ClideApp {
                 if wall.is_some() && (!crate::to_clay::uniform(scale) || !scale.is_finite() || scale.min_element() <= 0.0 || !orthogonal(world)) {
                     return Err(format!("hollow needs evenly scaled clay ({} is scaled unevenly or sheared, so its wall would vary): scale it evenly", o.name));
                 }
-                parts.push((o.name.clone(), world, scale.x, Err(crate::layers::composed_clay(c))));
+                let rest = self.meshes.rest(id).map(|m| m.0.clone()).ok_or_else(|| format!("{} has no mesh", o.name))?;
+                // What is built: every enabled sculpt layer's detail (their
+                // bricks set the cell size too), not the base layer's alone.
+                let c = crate::layers::composed_clay(c);
+                let one = if fine && c.detail_cell.is_some() { c.fine_estimate(&rest) } else { (rest.indices.len() / 3) as f64 };
+                // A shell adds its inside wall.
+                estimate += if wall.is_some() { one * 2.0 } else { one };
+                parts.push((o.name.clone(), world, scale.x, Err(c)));
             } else if wall.is_some() {
                 return Err(format!("hollow works on clay only ({} is a {})", o.name, o.shape.label()));
             } else {
                 let mesh = if o.shape == Shape::Clay { self.meshes.rest(id).map(|m| m.0.clone()) } else { self.meshes.get(o).cloned() };
-                parts.push((o.name.clone(), world, 1.0, Ok(mesh.ok_or_else(|| format!("{} has no mesh", o.name))?)));
+                let mesh = mesh.ok_or_else(|| format!("{} has no mesh", o.name))?;
+                estimate += (mesh.indices.len() / 3) as f64;
+                parts.push((o.name.clone(), world, 1.0, Ok(mesh)));
             }
+        }
+        let estimate = estimate.round() as u64;
+        if estimate > max_triangles {
+            return Err(format!("the print would have about {estimate} triangles, more than max_triangles {max_triangles}; raise max_triangles (at most {MAX_PRINT_TRIANGLES}), use larger detail cells or smaller detail regions, or export without fine"));
         }
         let library = self.scene.materials.clone();
         Ok(Started::Job(format!("Export for print {}", path.file_name().and_then(|f| f.to_str()).unwrap_or("")), Box::new(move |progress| {
@@ -546,8 +717,36 @@ impl ClideApp {
             let (lo, _) = pts.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(*p), b.max(*p)));
             // In millimeters (f64, then f32), lowest point on the plate.
             let plate = glam::DVec3::new(lo.x as f64, lo.y as f64, lo.z as f64);
-            let pts: Vec<Vec3> = pts.iter().map(|p| ((p.as_dvec3() - plate) * mm).as_vec3()).collect();
-            let (edges, bad, flipped) = mesh_asset::edge_use(&tris);
+            let mut pts: Vec<Vec3> = pts.iter().map(|p| ((p.as_dvec3() - plate) * mm).as_vec3()).collect();
+            let mut tris = tris;
+            // Sheets pinched at one point (the weld merged the fine mesh's
+            // copies back) are moved apart, so slicers keep them apart.
+            progress.check()?;
+            let separated = crate::adaptive::separate_pinches(&mut pts, &mut tris, PINCH_MIN_MM, PINCH_CELL_SHARE);
+            let low = pts.iter().fold(f32::MAX, |a, p| a.min(p.z));
+            if low < 0.0 {
+                pts.iter_mut().for_each(|p| p.z -= low);
+            }
+            let mut warnings = Vec::new();
+            let mut simplified_from = None;
+            if let Some(error) = simplify {
+                progress.set(0.8);
+                progress.check()?;
+                match simplified(&pts, &tris, error) {
+                    Some((p, t)) => {
+                        simplified_from = Some(tris.len());
+                        (pts, tris) = (p, t);
+                    }
+                    None => warnings.push(format!("simplify at {error} mm did not stay watertight (or removed nothing), so the unsimplified mesh was written")),
+                }
+            }
+            // The estimate can run low (several fine parts, balancing):
+            // the limit holds for what was built too, and nothing is written.
+            if tris.len() as u64 > max_triangles {
+                return Err(format!("the print has {} triangles (estimated {estimate} before building), more than max_triangles {max_triangles}; nothing was written: raise max_triangles (at most {MAX_PRINT_TRIANGLES}), add simplify, use larger detail cells or smaller detail regions, or export without fine", tris.len()));
+            }
+            let (edges, kinds, flipped) = mesh_asset::edge_report(&tris);
+            let bad = kinds.open + kinds.over_used + kinds.pinched;
             let volume = mesh_asset::volume(&pts, &tris) / 1000.0;
             let (blo, bhi) = pts.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(*p), b.max(*p)));
             let bytes = match ext.as_str() {
@@ -566,7 +765,13 @@ impl ClideApp {
                 "edges": edges,
                 "watertight": bad == 0 && flipped == 0 && edges > 0,
                 "non_manifold_edges": bad,
+                "non_manifold_by_kind": kinds,
                 "inconsistent_edges": flipped,
+                "pinches_separated": separated.copies,
+                "pinch_offset_mm": (separated.copies > 0).then(|| json!({ "min": (separated.min_offset as f64 * 1e5).round() / 1e5, "max": (separated.max_offset as f64 * 1e5).round() / 1e5 })),
+                "estimated_triangles": estimate,
+                "simplified_from": simplified_from,
+                "warnings": warnings,
                 "degenerate_dropped": degenerate,
                 "volume_cm3": (volume * 1e4).round() / 1e4,
                 "bbox_mm": { "min": round3(blo), "max": round3(bhi), "size": round3(bhi - blo) },

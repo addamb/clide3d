@@ -100,6 +100,10 @@ impl ClideApp {
                 if item(ui, "Import…", "", true) {
                     self.import_dialog();
                 }
+                // set_reference {sheet: {path}}: split into views, planes placed.
+                if item(ui, "Load Turnaround Sheet…", "", true) {
+                    self.sheet_dialog();
+                }
                 if item(ui, "Export glTF (.glb)…", "", true) {
                     self.export_dialog("glb");
                 }
@@ -109,6 +113,11 @@ impl ClideApp {
                 // export_print {path, targets: the selection}.
                 if item(ui, "Export for Print…", "", true) {
                     self.export_print_dialog();
+                }
+                // export_poly {target: the lead Poly, path}.
+                let lead_poly = self.lead().and_then(|id| self.scene.get(id)).is_some_and(|o| o.poly.is_some());
+                if item(ui, "Export Subdivision Cage…", "", lead_poly) {
+                    self.export_poly_dialog();
                 }
                 ui.separator();
                 if item(ui, "Exit", "⌘Q", true) {
@@ -160,6 +169,25 @@ impl ClideApp {
                 if item(ui, "Eye", "", true) {
                     self.create(Shape::Eye);
                 }
+                // create_character with the default base (Stage 5c).
+                if item(ui, "Character Base", "", true) {
+                    let req = self.character_request();
+                    self.send_ui_call("create_character", req);
+                }
+                // Lids from the selected clay's eyes, fur over it
+                // (character follow-ups): the requests an agent sends.
+                let lids = self.lids_request();
+                if item(ui, "Eyelids on Selected Clay", "", lids.is_some())
+                    && let Some(req) = lids
+                {
+                    self.send_ui_call("edit_clay", req);
+                }
+                let fur = self.fur_request();
+                if item(ui, "Fur on Selected Clay", "", fur.is_some())
+                    && let Some(req) = fur
+                {
+                    self.send_ui_call("create_object", req);
+                }
                 for sub in ["NURBS Primitives", "Lights", "Cameras"] {
                     ui.menu_button(sub, |ui| disabled(ui, "Not built yet"));
                 }
@@ -190,6 +218,32 @@ impl ClideApp {
                 if item(ui, "Remesh as Clay…", "", sel) {
                     self.open_remesh_dialog();
                 }
+                // poly {action: from_clay, source} and {action: subdivide}.
+                let lead = self.lead().and_then(|id| self.scene.get(id));
+                let clay = lead.filter(|o| o.clay.is_some()).map(|o| o.id);
+                let poly = lead.and_then(|o| o.poly.as_ref().map(|p| (o.id, p.level_count())));
+                if item(ui, "Poly from Clay", "", clay.is_some())
+                    && let Some(id) = clay
+                {
+                    self.send_ui_call("poly", serde_json::json!({ "action": "from_clay", "source": id }));
+                }
+                // retopo {target, faces, adaptive, symmetry, keep_creases, pure_quads}.
+                if item(ui, "Retopologize…", "", clay.is_some()) {
+                    self.open_retopo_dialog();
+                }
+                // poly {target, action: uv}.
+                if item(ui, "Unwrap Poly UVs", "", poly.is_some()) {
+                    self.unwrap_lead_poly();
+                }
+                // poly {target, action: project, source, levels, mode, cone}.
+                if item(ui, "Project Clay Detail…", "", poly.is_some()) {
+                    self.open_project_dialog();
+                }
+                if item(ui, "Subdivide Poly", "", poly.is_some_and(|(_, n)| n < crate::poly::MAX_LEVELS))
+                    && let Some((id, n)) = poly
+                {
+                    self.send_ui_call("poly", serde_json::json!({ "target": id, "action": "subdivide", "levels": n + 1 }));
+                }
                 ui.separator();
                 if item(ui, "Center Pivot", "", sel) {
                     self.center_pivot_selected();
@@ -217,6 +271,15 @@ impl ClideApp {
                 });
                 ui.separator();
                 ui.checkbox(&mut self.show_grid, "Grid");
+                // Proportion guides: the agent's set_display and guides calls.
+                let mut shown = self.show_guides;
+                if ui.checkbox(&mut shown, "Proportion Guides").clicked() {
+                    self.send_ui_call("set_display", serde_json::json!({ "guides": shown }));
+                }
+                let measure = self.measure_request();
+                if item(ui, "Measure Proportions", "", measure.is_some()) && let Some(req) = measure {
+                    self.guides_job = Some(self.send_ui_call("guides", req));
+                }
                 // MatCaps: the same set_display call an agent sends.
                 ui.menu_button("MatCap", |ui| {
                     for name in crate::render::matcap::BUILTIN {
@@ -390,6 +453,7 @@ impl ClideApp {
                 (Some(Tool::Paint), Icon::Paint, "Paint Tool: drag on a clay (brush on the Sculpting shelf)"),
                 (Some(Tool::Mask), Icon::Lasso, "Mask Tool: drag paints the sculpt mask (Alt erases, Shift lassos)"),
                 (Some(Tool::Groups), Icon::FaceMode, "Groups Tool: drag paints a polygroup (pick it in the HUD)"),
+                (Some(Tool::Groom), Icon::Paint, "Groom Tool: select a Hair and drag over it to groom its guides (brush on the Sculpting shelf)"),
             ];
             for (tool, icon, tip) in tools {
                 let r = icons::button(ui, icon, 26.0, tool == Some(self.tool), tool.is_some(), tip);
@@ -401,7 +465,7 @@ impl ClideApp {
                 {
                     // Sculpt and Paint go through brush_preset, as an agent
                     // switches them; their brush lives on the Sculpting shelf.
-                    if matches!(t, Tool::Sculpt | Tool::Paint | Tool::Mask | Tool::Groups) {
+                    if matches!(t, Tool::Sculpt | Tool::Paint | Tool::Mask | Tool::Groups | Tool::Groom) {
                         let name = super::recorder::tool_name(t);
                         if let Err(e) = self.brush_preset(&serde_json::json!({ "action": "set_current", "tool": name })) {
                             self.status = e;

@@ -50,6 +50,9 @@ pub enum Shape {
     /// An imported triangle mesh, from `Object::mesh` (see `mesh_asset.rs`;
     /// `import_mesh`, `to_clay` turns it into clay).
     Mesh,
+    /// A polygon cage with subdivision levels, from `Object::poly` (see
+    /// `poly/`; `poly from_clay` makes one).
+    Poly,
 }
 
 impl Shape {
@@ -82,6 +85,7 @@ impl Shape {
             Shape::Scatter => "Scatter",
             Shape::Part => "Part",
             Shape::Mesh => "Mesh",
+            Shape::Poly => "Poly",
         }
     }
 
@@ -91,7 +95,7 @@ impl Shape {
 
     /// Shapes whose mesh is built for the object itself (not a shared primitive).
     pub fn own_mesh(self) -> bool {
-        matches!(self, Shape::Clay | Shape::Eye | Shape::Hair | Shape::Cloth | Shape::Fire | Shape::Kit | Shape::Terrain | Shape::Part | Shape::Mesh)
+        matches!(self, Shape::Clay | Shape::Eye | Shape::Hair | Shape::Cloth | Shape::Fire | Shape::Kit | Shape::Terrain | Shape::Part | Shape::Mesh | Shape::Poly)
     }
 }
 
@@ -178,9 +182,23 @@ pub struct Object {
     /// The triangles of a `Shape::Mesh` (an import).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<crate::mesh_asset::MeshAsset>,
+    /// The cage and levels of a `Shape::Poly`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poly: Option<crate::poly::Poly>,
+    /// A reference image plane (`Shape::Plane`, Quality Stage 5a): one
+    /// view of a turnaround sheet. Not geometry: see `is_reference`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<crate::refplane::RefPlane>,
 }
 
 impl Object {
+    /// A reference image plane: drawn in the viewport and `render_views`,
+    /// left out of exports, print, film (unless `show_references`),
+    /// silhouettes, close-ups, framing and picking.
+    pub fn is_reference(&self) -> bool {
+        self.reference.is_some()
+    }
+
     pub fn local_matrix(&self) -> Mat4 {
         Mat4::from_translation(self.translation + self.pivot_comp + self.pivot)
             * Mat4::from_quat(self.rotation)
@@ -238,11 +256,15 @@ pub struct Scene {
     /// Display state only: not saved and not compared, so it is never an edit.
     #[serde(skip)]
     pub frame: Option<f32>,
+    /// Proportion guides (`guides`, Quality Stage 5b): head units, lines and
+    /// targets. Not objects: drawn over views, never exported.
+    #[serde(default, skip_serializing_if = "crate::guides::Guides::is_empty", deserialize_with = "crate::guides::lenient")]
+    pub guides: crate::guides::Guides,
 }
 
 impl PartialEq for Scene {
     fn eq(&self, other: &Self) -> bool {
-        self.objects == other.objects && self.next_id == other.next_id && self.materials == other.materials && self.alphas == other.alphas && self.brushes == other.brushes
+        self.objects == other.objects && self.next_id == other.next_id && self.materials == other.materials && self.alphas == other.alphas && self.brushes == other.brushes && self.guides == other.guides
     }
 }
 
@@ -262,6 +284,7 @@ impl Scene {
             Shape::Scatter => self.unique_name("scatter"),
             Shape::Part => self.unique_name("part"),
             Shape::Mesh => self.unique_name("mesh"),
+            Shape::Poly => self.unique_name("poly"),
             _ => self.unique_name(&format!("p{}", shape.label())),
         };
         // Lift solids so they sit on the grid; a plane lies flat on it.
@@ -300,6 +323,8 @@ impl Scene {
             follow: None,
             link: None,
             mesh: None,
+            poly: None,
+            reference: None,
         });
         id
     }
@@ -345,10 +370,15 @@ impl Scene {
     /// Parent space -> object's local space for an object on a bone: the
     /// bone's skinning matrix at `frame`. Identity for everything else.
     pub fn bone_matrix(&self, o: &Object) -> Mat4 {
+        self.bone_matrix_at(o, self.frame)
+    }
+
+    /// `bone_matrix` at `frame` (None: at rest).
+    fn bone_matrix_at(&self, o: &Object, frame: Option<f32>) -> Mat4 {
         let Some(bone) = &o.bone else { return Mat4::IDENTITY };
         let Some(rig) = o.parent.and_then(|p| self.get(p)).and_then(|p| p.rig.as_ref()) else { return Mat4::IDENTITY };
         let Some(i) = rig.bone_index(bone) else { return Mat4::IDENTITY };
-        rig.skin_matrices(self.frame).get(i).copied().unwrap_or(Mat4::IDENTITY)
+        rig.skin_matrices(frame).get(i).copied().unwrap_or(Mat4::IDENTITY)
     }
 
     /// The object's matrix in its parent's space, bone included.
@@ -460,6 +490,19 @@ impl Scene {
         self.parent_world(obj.parent) * self.local_in_parent(obj)
     }
 
+    /// `world_matrix` with every rig at rest, as inside `pose::at_rest`
+    /// (bones placed by their rest pose), without changing the scene.
+    pub fn rest_world_matrix(&self, id: u64) -> Mat4 {
+        let Some(obj) = self.get(id) else { return Mat4::IDENTITY };
+        let mut m = self.bone_matrix_at(obj, None) * obj.local_matrix();
+        for a in self.ancestors(id) {
+            if let Some(o) = self.get(a) {
+                m = self.bone_matrix_at(o, None) * o.local_matrix() * m;
+            }
+        }
+        m
+    }
+
     fn parent_world(&self, parent: Option<u64>) -> Mat4 {
         match parent {
             Some(p) => {
@@ -543,6 +586,34 @@ impl Scene {
         kids
     }
 
+    /// The objects that are geometry: everything but reference image
+    /// planes. Rays (`surface_point`, picking), framing and bounds walk
+    /// these, so nothing a sheet places is ever hit, framed or measured.
+    pub fn geometry(&self) -> impl Iterator<Item = &Object> {
+        self.objects.iter().filter(|o| !o.is_reference())
+    }
+
+    /// Removes a reference plane alone: objects parented under it move to
+    /// its parent, keeping where they stand in the world.
+    pub fn remove_reference_plane(&mut self, id: u64) {
+        let parent = self.get(id).and_then(|o| o.parent);
+        for child in self.children(Some(id)) {
+            if self.reparent(child, parent).is_err() {
+                let _ = self.reparent(child, None);
+            }
+        }
+        self.objects.retain(|o| o.id != id);
+    }
+
+    /// Every reference plane removed (`remove_reference_plane`): the scene
+    /// exports write.
+    pub fn without_references(&mut self) {
+        let planes: Vec<u64> = self.objects.iter().filter(|o| o.is_reference()).map(|o| o.id).collect();
+        for id in planes {
+            self.remove_reference_plane(id);
+        }
+    }
+
     /// Deletes the object and everything under it (like Maya).
     pub fn remove_tree(&mut self, id: u64) {
         let mut doomed = self.descendants(id);
@@ -601,7 +672,8 @@ impl Scene {
         }
     }
 
-    /// Bounds of `id` and its subtree, in the space `to_space` maps `id`'s object space into.
+    /// Bounds of `id` and its subtree (reference planes under it left
+    /// out), in the space `to_space` maps `id`'s object space into.
     pub fn subtree_bounds(&self, id: u64, to_space: Mat4, mesh_bounds: &dyn Fn(&Object) -> Option<(Vec3, Vec3)>) -> Option<(Vec3, Vec3)> {
         self.get(id)?;
         let index = self.index();
@@ -616,7 +688,9 @@ impl Scene {
                 continue;
             }
             let Some(obj) = index.get(&cur).map(|&i| &self.objects[i]) else { continue };
-            if let Some((lo, hi)) = mesh_bounds(obj) {
+            // Reference planes under the object are not part of it (framing,
+            // pivots, placement): only one asked for itself counts.
+            if let Some((lo, hi)) = mesh_bounds(obj).filter(|_| cur == id || !obj.is_reference()) {
                 for i in 0..8 {
                     let corner = Vec3::new(
                         if i & 1 == 0 { lo.x } else { hi.x },
@@ -644,6 +718,13 @@ impl Scene {
     pub fn sanitize(&mut self) {
         self.renumber_if_needed();
         for o in &mut self.objects { if o.cloth.as_ref().is_some_and(|c| !c.valid()) { o.cloth = None; } }
+        // A damaged reference plane (or one on another shape) is dropped,
+        // leaving a plain plane.
+        for o in &mut self.objects {
+            if o.reference.as_ref().is_some_and(|r| o.shape != Shape::Plane || !r.is_sane()) {
+                o.reference = None;
+            }
+        }
         for clay in self.objects.iter_mut().filter_map(|o| o.clay.as_mut()) {
             clay.sanitize();
         }
@@ -672,6 +753,10 @@ impl Scene {
             l.sanitize();
         }
         self.materials.truncate(crate::material::MAX_MATERIALS);
+        // Damaged guides in a file are dropped (none, rather than wrong).
+        if self.guides.check().is_err() {
+            self.guides = Default::default();
+        }
         for m in &mut self.materials {
             m.sanitize();
         }
@@ -757,6 +842,17 @@ impl Scene {
             }
             if let Some(l) = &mut o.link {
                 l.source = first_new.get(&l.source).copied().unwrap_or(0);
+            }
+            // A bake's simple mesh from a Poly (`bake lowpoly: {poly}`).
+            if let Some(l) = o.bake.as_mut().and_then(|b| b.lowpoly.as_mut()) {
+                l.poly = first_new.get(&l.poly).copied().unwrap_or(0);
+            }
+            // The clay a Poly was made from (`poly rebuild`, `quality_report`)
+            // and the one its detail was projected from (`poly project`).
+            if let Some(p) = o.poly.as_mut() {
+                for m in [p.made_by.as_mut(), p.projected.as_mut()].into_iter().flatten().filter(|m| m["source"].is_u64()).map(std::sync::Arc::make_mut) {
+                    m["source"] = first_new.get(&m["source"].as_u64().expect("checked")).copied().unwrap_or(0).into();
+                }
             }
         }
         self.next_id = self.objects.len() as u64;
@@ -968,6 +1064,30 @@ mod tests {
         // Adding works without overflowing.
         let d = s.add(Shape::Torus);
         assert!(!ids.contains(&d));
+    }
+
+    /// A renumbered file keeps each Poly pointing at the clay it was made
+    /// from (`made_by`), and one whose clay is gone at none.
+    #[test]
+    fn renumbering_keeps_poly_sources() {
+        let mut s = Scene::default();
+        let cube = s.add(Shape::Cube);
+        let clay = s.add(Shape::Clay);
+        let poly = s.add(Shape::Poly);
+        let lost = s.add(Shape::Poly);
+        // The clay and the first Poly share an id: the file is renumbered.
+        s.get_mut(clay).unwrap().id = 9;
+        s.get_mut(poly).unwrap().id = 9;
+        let made = |source: u64| crate::poly::Poly { made_by: Some(std::sync::Arc::new(serde_json::json!({ "action": "from_clay", "source": source }))), ..crate::poly::tests::cube() };
+        s.objects[2].poly = Some(crate::poly::Poly { projected: Some(std::sync::Arc::new(serde_json::json!({ "source": 9, "levels": 2 }))), ..made(9) });
+        s.objects[3].poly = Some(made(77));
+        let _ = (cube, lost);
+        s.sanitize();
+        let source = |i: usize| s.objects[i].poly.as_ref().unwrap().made_by.as_ref().unwrap()["source"].clone();
+        assert_eq!(source(2), serde_json::json!(s.objects[1].id), "the clay, by its new id");
+        assert_eq!(source(3), serde_json::json!(0), "a clay that is gone: none");
+        let projected = s.objects[2].poly.as_ref().unwrap().projected.as_ref().unwrap()["source"].clone();
+        assert_eq!(projected, serde_json::json!(s.objects[1].id), "the projection's clay too");
     }
 
     #[test]

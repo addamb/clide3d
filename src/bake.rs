@@ -41,11 +41,23 @@ pub struct Settings {
     /// Read every texel from the exact clay field (slow) instead of the
     /// fine mesh; for comparisons.
     pub exact: bool,
+    /// The simple mesh is this Poly's level (Stage 3c), not a meshopt
+    /// simplification of the clay.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lowpoly: Option<LowPoly>,
+}
+
+/// `bake lowpoly: {poly, level}`: a Poly object (a retopology of the
+/// clay, say) and the level of it, undisplaced, that is the simple mesh.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LowPoly {
+    pub poly: u64,
+    pub level: u8,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { triangles: 30_000, texture: 2048, region_density: 0.5, exact: false }
+        Settings { triangles: 30_000, texture: 2048, region_density: 0.5, exact: false, lowpoly: None }
     }
 }
 
@@ -60,10 +72,14 @@ impl Settings {
             self.texture = Settings::default().texture;
         }
         self.region_density = if self.region_density.is_finite() { self.region_density.clamp(0.0, 1.0) } else { 0.5 };
+        if let Some(l) = &mut self.lowpoly {
+            l.level = l.level.min(crate::poly::MAX_LEVELS);
+        }
     }
 }
 
 /// What a bake reads.
+#[derive(Clone, Copy)]
 pub struct Source<'a> {
     pub clay: &'a Clay,
     /// The clay's rest mesh (split into parts for a split rig).
@@ -75,6 +91,32 @@ pub struct Source<'a> {
     pub fallback: &'a str,
     /// The clay's fine mesh, if one is already built (else the bake makes it).
     pub fine: Option<&'a Mesh>,
+    /// A Poly's level as the simple mesh (`lowpoly: {poly, level}`), with
+    /// its UVs; texels then find the clay through the Poly's projection.
+    pub low: Option<&'a crate::poly::low::Low>,
+}
+
+/// Each texel's point on the clay through a Poly's simple mesh (see
+/// `poly::low`): the projected surface there snapped onto the clay along
+/// its normal, or without projected detail a search from the texel (the
+/// projection's vector search, its default cone and reach). None: nothing
+/// found within reach.
+fn low_target<'a>(low: &'a crate::poly::low::Low, probe: &'a crate::quality::Probe, cell: f32) -> impl Fn(u32, [f32; 3], Vec3, Vec3) -> Option<Vec3> + Sync + 'a {
+    use crate::poly::project::{DEFAULT_CONE, Found, Mode, REACH_EDGES, Search, Target, find};
+    let t = Target { surface: probe, to_clay: glam::Mat4::IDENTITY, cell };
+    let snap = Search::new(&t, Mode::Scalar, 0.0, 2.0 * low.fine_edge().max(cell));
+    let search = Search::new(&t, Mode::Vector, DEFAULT_CONE, REACH_EDGES * low.edge);
+    move |tri, w, pos, nrm| match low.surface_point(tri, w) {
+        Some((q, n)) if n != Vec3::ZERO => {
+            let f = probe.near(q, snap.reach);
+            Some(find(&f, q, n, &snap).0)
+        }
+        _ => {
+            let f = probe.near(pos, search.reach);
+            let (p, how) = find(&f, pos, nrm, &search);
+            (how != Found::Missed).then_some(p)
+        }
+    }
 }
 
 /// Texels kept clear around each island when packing.
@@ -93,60 +135,81 @@ pub fn bake(src: &Source, settings: Settings, progress: &crate::progress::Progre
     let mut times: Vec<(&str, f32)> = Vec::new();
     let lap = |name: &'static str, times: &mut Vec<(&str, f32)>| times.push((name, timer.elapsed().as_secs_f32()));
 
-    // 1. Simplify. The error limit is loose so the triangle budget decides.
-    // Detail regions look bigger to the simplifier (space spread out from
-    // each region's middle, smoothly), so they keep more triangles.
-    let warped = warp_regions(rest, src.clay, settings.region_density);
-    let bytes: &[u8] = match &warped {
-        Some(w) => bytemuck::cast_slice(w),
-        None => bytemuck::cast_slice(&rest.vertices),
-    };
-    let stride = if warped.is_some() { 12 } else { std::mem::size_of::<Vertex>() };
-    let adapter = meshopt::VertexDataAdapter::new(bytes, stride, 0).map_err(|e| e.to_string())?;
-    let target = (settings.triangles as usize * 3).min(rest.indices.len());
-    let mut indices = meshopt::simplify(&rest.indices, &adapter, target, 1.0, meshopt::SimplifyOptions::None, None);
-    if indices.is_empty() {
-        return Err("simplifying removed every triangle".into());
-    }
-    // Keep only the vertices used, remembering where each came from.
-    let mut remap = vec![u32::MAX; rest.vertices.len()];
-    let mut origin: Vec<u32> = Vec::new();
-    for &i in &indices {
-        if remap[i as usize] == u32::MAX {
-            remap[i as usize] = origin.len() as u32;
-            origin.push(i);
-        }
-    }
-    for i in &mut indices {
-        *i = remap[*i as usize];
-    }
-    lap("simplify", &mut times);
-
-    // 2. UV unwrap.
-    progress.check()?;
-    progress.stage("laying the mesh flat (UV unwrap)", 0.05);
     let size = settings.texture;
-    let positions: Vec<[f32; 3]> = origin.iter().map(|&o| rest.vertices[o as usize].pos).collect();
-    let normals: Vec<[f32; 3]> = origin.iter().map(|&o| rest.vertices[o as usize].normal).collect();
-    let (uvs, out_indices, xref) = unwrap(&positions, &normals, &indices, size, src.clay, settings.region_density)?;
-    let mut mesh = Mesh { materials: rest.materials.clone(), ..Mesh::default() };
-    let mut source = Vec::with_capacity(uvs.len());
-    for (uv, x) in uvs.iter().zip(&xref) {
-        let o = origin[*x as usize] as usize;
-        let mut vert = rest.vertices[o];
-        vert.uv = *uv;
-        vert.color = [1.0; 3];
-        mesh.vertices.push(vert);
-        source.push(o);
-    }
-    mesh.indices = out_indices;
-    tangents(&mut mesh);
-    mesh.edges = edges(&mesh.indices);
-    let skin = src.skin.filter(|s| s.joints.len() == rest.vertices.len()).map(|s| Skin {
-        joints: source.iter().map(|&o| s.joints[o]).collect(),
-        weights: source.iter().map(|&o| s.weights[o]).collect(),
-    });
-    lap("unwrap", &mut times);
+    let (mut mesh, skin, source) = match src.low {
+        Some(low) => {
+            // The Poly's level is the simple mesh, its UVs and tangents
+            // made already. Each vertex stands for its nearest rest vertex:
+            // a split rig's part (which field its texels read) and the skin
+            // weights, so a rigged clay's game mesh follows its rig.
+            progress.stage("the Poly's level as the simple mesh", 0.05);
+            let mut mesh = low.mesh.clone();
+            mesh.materials = rest.materials.clone();
+            lap("simple mesh", &mut times);
+            let source = low.rest_vertex.clone();
+            let skin = src.skin.filter(|s| s.joints.len() == rest.vertices.len() && source.iter().all(|&o| o < rest.vertices.len())).map(|s| Skin {
+                joints: source.iter().map(|&o| s.joints[o]).collect(),
+                weights: source.iter().map(|&o| s.weights[o]).collect(),
+            });
+            (mesh, skin, source)
+        }
+        None => {
+            // 1. Simplify. The error limit is loose so the triangle budget decides.
+            // Detail regions look bigger to the simplifier (space spread out from
+            // each region's middle, smoothly), so they keep more triangles.
+            let warped = warp_regions(rest, src.clay, settings.region_density);
+            let bytes: &[u8] = match &warped {
+                Some(w) => bytemuck::cast_slice(w),
+                None => bytemuck::cast_slice(&rest.vertices),
+            };
+            let stride = if warped.is_some() { 12 } else { std::mem::size_of::<Vertex>() };
+            let adapter = meshopt::VertexDataAdapter::new(bytes, stride, 0).map_err(|e| e.to_string())?;
+            let target = (settings.triangles as usize * 3).min(rest.indices.len());
+            let mut indices = meshopt::simplify(&rest.indices, &adapter, target, 1.0, meshopt::SimplifyOptions::None, None);
+            if indices.is_empty() {
+                return Err("simplifying removed every triangle".into());
+            }
+            // Keep only the vertices used, remembering where each came from.
+            let mut remap = vec![u32::MAX; rest.vertices.len()];
+            let mut origin: Vec<u32> = Vec::new();
+            for &i in &indices {
+                if remap[i as usize] == u32::MAX {
+                    remap[i as usize] = origin.len() as u32;
+                    origin.push(i);
+                }
+            }
+            for i in &mut indices {
+                *i = remap[*i as usize];
+            }
+            lap("simplify", &mut times);
+
+            // 2. UV unwrap.
+            progress.check()?;
+            progress.stage("laying the mesh flat (UV unwrap)", 0.05);
+            let positions: Vec<[f32; 3]> = origin.iter().map(|&o| rest.vertices[o as usize].pos).collect();
+            let normals: Vec<[f32; 3]> = origin.iter().map(|&o| rest.vertices[o as usize].normal).collect();
+            let (uvs, out_indices, xref) = unwrap(&positions, &normals, &indices, size, src.clay, settings.region_density)?;
+            let mut mesh = Mesh { materials: rest.materials.clone(), ..Mesh::default() };
+            let mut source = Vec::with_capacity(uvs.len());
+            for (uv, x) in uvs.iter().zip(&xref) {
+                let o = origin[*x as usize] as usize;
+                let mut vert = rest.vertices[o];
+                vert.uv = *uv;
+                vert.color = [1.0; 3];
+                mesh.vertices.push(vert);
+                source.push(o);
+            }
+            mesh.indices = out_indices;
+            tangents(&mut mesh);
+            mesh.edges = edges(&mesh.indices);
+            let skin = src.skin.filter(|s| s.joints.len() == rest.vertices.len()).map(|s| Skin {
+                joints: source.iter().map(|&o| s.joints[o]).collect(),
+                weights: source.iter().map(|&o| s.weights[o]).collect(),
+            });
+            lap("unwrap", &mut times);
+            (mesh, skin, source)
+        }
+    };
 
     // 3. The detailed surface to read: the fine mesh (built here unless
     // given) with its ambient occlusion per vertex; texels it misses read
@@ -154,7 +217,8 @@ pub fn bake(src: &Source, settings: Settings, progress: &crate::progress::Progre
     let whole = Field::new(src.clay, cell);
     let (lo, hi) = whole.bounds().unwrap_or((Vec3::ZERO, Vec3::ONE));
     let ao_step = (hi - lo).length() * 0.004;
-    let high = if settings.exact || src.parts.len() > 1 {
+    // A Poly's level finds its texels through the Poly (`low_target`).
+    let high = if settings.exact || src.parts.len() > 1 || src.low.is_some() {
         None
     } else {
         progress.stage("building the detailed surface", 0.1);
@@ -191,6 +255,8 @@ pub fn bake(src: &Source, settings: Settings, progress: &crate::progress::Progre
     let weather = Weather { at: &wear_at, scaled: palette.iter().map(|m| crate::weather::with_scale(m, src.clay)).collect(), width: src.clay.wear_width(), face: src.clay.face(), texel: texel_size(&mesh, size) };
     let covered = raster_ids(&mesh, size);
     lap("raster", &mut times);
+    let probe = src.low.and_then(|_| crate::quality::Probe::new(src.clay));
+    let target = src.low.zip(probe.as_ref()).map(|(low, probe)| low_target(low, probe, cell));
     let n = (size * size) as usize;
     let detail = src.clay.detail.as_ref().map(|d| d.finest());
     // Gradient step: finer than the mesh, but not below the sculpt grid.
@@ -231,9 +297,12 @@ pub fn bake(src: &Source, settings: Settings, progress: &crate::progress::Progre
             let part = vertex_part[mesh.indices[tri as usize * 3] as usize];
             let field = fields.get(part).unwrap_or(&whole);
             let found = high.as_ref().and_then(|h| h.find(pos, nrm));
-            let mut s = match found {
-                Some((p, hn, ao)) => shade(src.clay, field, &palette, p, hn, ao, cell, &weather),
-                None => {
+            let on_poly = target.as_ref().and_then(|f| f(tri, w, pos, nrm));
+            let mut s = match (on_poly, found) {
+                // On the clay already: sampled there.
+                (Some(p), _) => sample(src.clay, field, &whole, &palette, p, nrm, cell, e, ao_step, &weather),
+                (None, Some((p, hn, ao))) => shade(src.clay, field, &palette, p, hn, ao, cell, &weather),
+                (None, None) => {
                     if high.is_some() {
                         missed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -313,6 +382,9 @@ pub struct Maps {
     pub vector: bool,
     /// Pixels across (over the bake's UVs).
     pub size: u32,
+    /// The vector map holds the whole offset in the clay's object space
+    /// (`export_poly space: object`), not in the texel's tangent frame.
+    pub object: bool,
 }
 
 /// Largest displacement map: a vector map at 4096 is 192 MB of floats.
@@ -334,6 +406,8 @@ pub struct Displacement {
     /// and those where neither met a surface (left at 0).
     pub from_field: usize,
     pub missed: usize,
+    /// The vector map is in object space (`Maps::object`).
+    pub object: bool,
 }
 
 impl Displacement {
@@ -403,15 +477,20 @@ pub fn displacement(src: &Source, mesh: &Mesh, maps: Maps, progress: &crate::pro
     let (lo, hi) = whole.bounds().unwrap_or((Vec3::ZERO, Vec3::ONE));
     let reach = (cell * 8.0).max((hi - lo).length() * 0.05);
     progress.stage("building the detailed surface", 0.0);
-    let built = src.fine.is_none().then(|| src.clay.refine_rest(src.rest, crate::clay::MAX_FINE_TRIANGLES));
-    let high = High::bare(src.fine.unwrap_or_else(|| built.as_ref().expect("built")), reach);
+    // A Poly's level finds its texels through the Poly (`low_target`);
+    // the clay's simple mesh looks along its normal at the fine mesh.
+    let probe = src.low.and_then(|_| crate::quality::Probe::new(src.clay));
+    let target = src.low.zip(probe.as_ref()).map(|(low, probe)| low_target(low, probe, cell));
+    let built = (src.fine.is_none() && target.is_none()).then(|| src.clay.refine_rest(src.rest, crate::clay::MAX_FINE_TRIANGLES));
+    let high = target.is_none().then(|| High::bare(src.fine.unwrap_or_else(|| built.as_ref().expect("built")), reach));
     progress.check()?;
     progress.stage("baking displacement", 0.1);
     let size = maps.size;
     let covered = grown_ids(&raster_ids(mesh, size), size as usize, EXTRAPOLATE);
     let n = (size * size) as usize;
-    // Per texel: Some(offset in the tangent frame) once baked.
-    let mut texels: Vec<Option<Vec3>> = vec![None; n];
+    // Per texel once baked: the offset (in the tangent frame, or in object
+    // space for `Maps::object`) and its height along the normal.
+    let mut texels: Vec<Option<(Vec3, f32)>> = vec![None; n];
     let all: Vec<u32> = (0..whole.prim_count() as u32).collect();
     let from_field = std::sync::atomic::AtomicUsize::new(0);
     let missed = std::sync::atomic::AtomicUsize::new(0);
@@ -440,9 +519,19 @@ pub fn displacement(src: &Source, mesh: &Mesh, maps: Maps, progress: &crate::pro
             let tan = lerp3(|v| Vec3::from_slice(&v.tangent));
             let tan = (tan - nrm * nrm.dot(tan)).normalize_or(nrm.any_orthonormal_vector());
             let bit = nrm.cross(tan) * a.tangent[3].signum();
-            let p = match high.find(pos, nrm) {
-                Some((p, _, _)) => p,
-                None => {
+            let p = match (&target, high.as_ref().and_then(|h| h.find(pos, nrm))) {
+                (Some(f), _) => match f(tri, w, pos, nrm) {
+                    Some(p) => {
+                        from_field.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        p
+                    }
+                    None => {
+                        missed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        pos
+                    }
+                },
+                (None, Some((p, _, _))) => p,
+                (None, None) => {
                     let near = whole.near(pos - Vec3::splat(reach), pos + Vec3::splat(reach));
                     let list = if near.is_empty() { &all } else { &near };
                     let f = |q: Vec3| whole.sample(q, list).0;
@@ -456,19 +545,30 @@ pub fn displacement(src: &Source, mesh: &Mesh, maps: Maps, progress: &crate::pro
                 }
             };
             let d = p - pos;
-            *texel = Some(Vec3::new(d.dot(tan), d.dot(bit), d.dot(nrm)));
+            *texel = Some((if maps.object { d } else { Vec3::new(d.dot(tan), d.dot(bit), d.dot(nrm)) }, d.dot(nrm)));
         }
     });
     progress.check()?;
     // Fill the gaps between islands from the nearest island (as the
     // textures are), so filtering never pulls in zero across a seam.
     progress.stage("filling map gaps", 0.96);
-    let mut filled: Vec<bool> = texels.iter().map(Option::is_some).collect();
-    let mut values: Vec<Vec3> = texels.into_iter().map(|t| t.unwrap_or(Vec3::ZERO)).collect();
+    let baked: Vec<bool> = texels.iter().map(Option::is_some).collect();
+    let mut filled = baked.clone();
+    let mut values: Vec<Vec3> = texels.iter().map(|t| t.map_or(Vec3::ZERO, |t| t.0)).collect();
     fill_values(&mut values, &mut filled, size as usize);
+    // In object space the height is not a component: filled on its own.
+    let heights = (maps.object && maps.displacement).then(|| {
+        let mut filled = baked;
+        let mut h: Vec<Vec3> = texels.iter().map(|t| Vec3::new(t.map_or(0.0, |t| t.1), 0.0, 0.0)).collect();
+        fill_values(&mut h, &mut filled, size as usize);
+        h.into_iter().map(|v| v.x).collect::<Vec<f32>>()
+    });
     Ok(Displacement {
         size,
-        height: maps.displacement.then(|| values.iter().map(|v| v.z).collect()),
+        object: maps.object,
+        // Height is along the normal in either space (its own pass when
+        // the vector is in object space).
+        height: maps.displacement.then(|| heights.unwrap_or_else(|| values.iter().map(|v| v.z).collect())),
         vector: maps.vector.then(|| values.iter().map(|v| v.to_array()).collect()),
         from_field: from_field.into_inner(),
         missed: missed.into_inner(),
@@ -1112,7 +1212,7 @@ mod tests {
                 clay.decals.push(serde_json::from_value(serde_json::json!({ "shape": "splat", "center": [-0.2, 0.2, 0.06], "normal": [0, 0, 1], "size": 0.25 })).unwrap());
             }
             let rest = clay.build_mesh_with(&[], material);
-            let src = Source { clay: &clay, rest: &rest, skin: None, parts: &[], library: &[], fallback: material, fine: None };
+            let src = Source { clay: &clay, rest: &rest, skin: None, parts: &[], library: &[], fallback: material, fine: None, low: None };
             let (mesh, _) = bake(&src, Settings { triangles: 4000, texture: 512, ..Default::default() }, &Default::default()).unwrap();
             mesh.textures.clone().unwrap()
         };
@@ -1141,7 +1241,7 @@ mod tests {
         let rest = clay.build_mesh();
         let bake_with = |detail: &str| {
             let library = vec![Material { name: "knitwear".into(), detail: Some(detail.into()), detail_scale: 0.08, detail_color: 1.0, ..Material::preset("cloth").unwrap() }];
-            let src = Source { clay: &clay, rest: &rest, skin: None, parts: &[], library: &library, fallback: "", fine: None };
+            let src = Source { clay: &clay, rest: &rest, skin: None, parts: &[], library: &library, fallback: "", fine: None, low: None };
             let (mesh, _) = bake(&src, Settings { triangles: 2000, texture: 512, ..Default::default() }, &Default::default()).unwrap();
             let tex = mesh.textures.clone().unwrap();
             // Texel-to-texel change inside islands: high-frequency content.
@@ -1177,7 +1277,7 @@ mod tests {
         clay.set_detail_regions(&[region]).unwrap();
         let rest = clay.build_mesh();
         let share = |density: f32| {
-            let src = Source { clay: &clay, rest: &rest, skin: None, parts: &[], library: &[], fallback: "", fine: None };
+            let src = Source { clay: &clay, rest: &rest, skin: None, parts: &[], library: &[], fallback: "", fine: None, low: None };
             let (mesh, _) = bake(&src, Settings { triangles: 3000, texture: 1024, region_density: density, ..Default::default() }, &Default::default()).unwrap();
             let (mut tris, mut uv, mut all_uv) = (0, 0.0, 0.0);
             for t in mesh.indices.chunks_exact(3) {
@@ -1209,7 +1309,7 @@ mod tests {
         }))
         .unwrap();
         let rest = clay.build_mesh();
-        let src = Source { clay: &clay, rest: &rest, skin: None, parts: &[], library: &[], fallback: "", fine: None };
+        let src = Source { clay: &clay, rest: &rest, skin: None, parts: &[], library: &[], fallback: "", fine: None, low: None };
         let (mesh, _) = bake(&src, Settings { triangles: 800, texture: 512, ..Default::default() }, &Default::default()).unwrap();
         assert!(mesh.indices.len() / 3 <= 900, "{}", mesh.indices.len() / 3);
         let tex = mesh.textures.as_ref().unwrap();
@@ -1248,10 +1348,10 @@ mod tests {
         let clay: Clay = serde_json::from_value(serde_json::json!({ "blobs": blobs, "resolution": 64 })).unwrap();
         let cell = clay.cell_size().unwrap();
         let rest = clay.build_mesh();
-        let src = Source { clay: &clay, rest: &rest, skin: None, parts: &[], library: &[], fallback: "", fine: None };
+        let src = Source { clay: &clay, rest: &rest, skin: None, parts: &[], library: &[], fallback: "", fine: None, low: None };
         let (mesh, _) = bake(&src, Settings { triangles: 800, texture: 512, ..Default::default() }, &Default::default()).unwrap();
         let t = std::time::Instant::now();
-        let disp = displacement(&src, &mesh, Maps { displacement: true, vector: true, size: 512 }, &Default::default()).unwrap();
+        let disp = displacement(&src, &mesh, Maps { displacement: true, vector: true, size: 512, object: false }, &Default::default()).unwrap();
         eprintln!("displacement maps 512: {:.2} s, {} texels from the field, {} missed", t.elapsed().as_secs_f32(), disp.from_field, disp.missed);
         assert_eq!(disp.missed, 0);
         // Through the file formats an agent gets.
@@ -1259,14 +1359,14 @@ mod tests {
         let codes = Displacement::encode16(disp.height.clone().unwrap().into_iter(), scale);
         let (w, h, channels, back) = crate::outputs::read_png16(&crate::outputs::png16(512, 512, 1, &codes).unwrap()).unwrap();
         assert_eq!((w, h, channels), (512, 512, 1));
-        let height = Displacement { size: 512, height: Some(back.iter().map(|c| Displacement::decode16(*c, scale)).collect()), vector: None, from_field: 0, missed: 0 };
+        let height = Displacement { size: 512, height: Some(back.iter().map(|c| Displacement::decode16(*c, scale)).collect()), vector: None, from_field: 0, missed: 0, object: false };
         let path = std::env::temp_dir().join(format!("clide-vdm-{}.exr", std::process::id()));
         let v = disp.vector.clone().unwrap();
         crate::outputs::write_exr(&path, 512, 512, vec![("R", v.iter().map(|c| c[0]).collect()), ("G", v.iter().map(|c| c[1]).collect()), ("B", v.iter().map(|c| c[2]).collect())]).unwrap();
         let (_, _, read) = crate::outputs::read_exr(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
         let get = |n: &str| &read.iter().find(|(k, _)| k == n).unwrap().1;
-        let vector = Displacement { size: 512, height: None, vector: Some((0..512 * 512).map(|i| [get("R")[i], get("G")[i], get("B")[i]]).collect()), from_field: 0, missed: 0 };
+        let vector = Displacement { size: 512, height: None, vector: Some((0..512 * 512).map(|i| [get("R")[i], get("G")[i], get("B")[i]]).collect()), from_field: 0, missed: 0, object: false };
         let field = Field::new(&clay, cell);
         let all: Vec<u32> = (0..field.prim_count() as u32).collect();
         // Both ways: the mesh's points to the clay (|field|), and the clay's
@@ -1277,7 +1377,7 @@ mod tests {
             let to_mesh = rest.vertices.iter().map(|v| { let p = Vec3::from(v.pos); Vec3::from(near.vertex(p).unwrap().pos).distance(p) }).fold(0.0f32, f32::max);
             (to_clay / cell, to_mesh / cell)
         };
-        let plain = crate::film::dice::apply_baked(&mesh, &Displacement { size: 1, height: Some(vec![0.0]), vector: None, from_field: 0, missed: 0 }, cell * 0.5, 4_000_000).unwrap();
+        let plain = crate::film::dice::apply_baked(&mesh, &Displacement { size: 1, height: Some(vec![0.0]), vector: None, from_field: 0, missed: 0, object: false }, cell * 0.5, 4_000_000).unwrap();
         let (a, b) = hausdorff(&plain);
         eprintln!("cell {cell:.4}; simple mesh ({} triangles) alone: {a:.2} / {b:.2} cells (to clay / from clay)", mesh.indices.len() / 3);
         assert!(a.max(b) > 1.4, "the bumps should need the map: {a} {b}");

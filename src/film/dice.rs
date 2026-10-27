@@ -24,44 +24,133 @@ pub const MAX_DICED: usize = 6_000_000;
 /// Smallest displacement worth dicing for, in pixels at the surface.
 const MIN_PIXELS: f32 = 0.35;
 
-/// What one camera sees: (eye, forward, world size of a pixel per unit
-/// of distance (perspective) or in all (orthographic), cos of the half
-/// field of view for culling).
-struct Eye {
+/// Frustum slack: a point counts as on screen within this factor of the
+/// frustum's half-angle tangents (subdivision and displacement bulge past
+/// the cage's and the mesh's points).
+const MARGIN: f32 = 1.15;
+
+/// What one camera sees: its place and axes, the world size of a pixel
+/// per unit of distance (perspective) or in all (orthographic), and the
+/// frustum's half extents (tangents with `MARGIN`, or ortho half sizes),
+/// from the frame's width and height both.
+pub(super) struct Eye {
     eye: Vec3,
     forward: Vec3,
+    right: Vec3,
+    up: Vec3,
     pixel: f32,
     ortho: bool,
-    cos_half: f32,
+    /// Half extents: tangents (perspective) or half sizes (ortho).
+    half_x: f32,
+    half_y: f32,
 }
 
 impl Eye {
-    fn new(c: &Camera, height: usize) -> Eye {
+    pub(super) fn new(c: &Camera, width: usize, height: usize) -> Eye {
         let forward = (c.target - c.eye).normalize_or(Vec3::NEG_Z);
+        let right = forward.cross(c.up).normalize_or(forward.any_orthonormal_vector());
+        let up = right.cross(forward);
+        let aspect = width.max(1) as f32 / height.max(1) as f32;
         let half = (c.fov_deg.to_radians() * 0.5).clamp(0.01, 1.5);
         match c.ortho {
-            Some(h) => Eye { eye: c.eye, forward, pixel: 2.0 * h / height.max(1) as f32, ortho: true, cos_half: -1.0 },
-            None => Eye { eye: c.eye, forward, pixel: 2.0 * half.tan() / height.max(1) as f32, ortho: false, cos_half: (half * 1.6).min(1.5).cos() },
+            Some(h) => Eye { eye: c.eye, forward, right, up, pixel: 2.0 * h / height.max(1) as f32, ortho: true, half_x: h * aspect * MARGIN, half_y: h * MARGIN },
+            None => Eye { eye: c.eye, forward, right, up, pixel: 2.0 * half.tan() / height.max(1) as f32, ortho: false, half_x: half.tan() * aspect * MARGIN, half_y: half.tan() * MARGIN },
         }
+    }
+
+    /// The cosine between `n` (unit) and the direction from `p` toward
+    /// this camera: below 0 the camera sees the back of a surface there.
+    pub(super) fn facing(&self, p: Vec3, n: Vec3) -> f32 {
+        let toward = if self.ortho { -self.forward } else { (self.eye - p).normalize_or(-self.forward) };
+        n.dot(toward)
+    }
+
+    /// `p` in the camera's axes (right, up, forward), from the eye.
+    fn local(&self, p: Vec3) -> Vec3 {
+        let d = p - self.eye;
+        Vec3::new(d.dot(self.right), d.dot(self.up), d.dot(self.forward))
+    }
+
+    /// Which of the frustum's side (and, in perspective, near) planes `q`
+    /// (camera axes) is outside of, as bits.
+    fn outside(&self, q: Vec3) -> u8 {
+        let (sx, sy) = if self.ortho { (self.half_x, self.half_y) } else { (self.half_x * q.z, self.half_y * q.z) };
+        (q.x > sx) as u8 | ((q.x < -sx) as u8) << 1 | ((q.y > sy) as u8) << 2 | ((q.y < -sy) as u8) << 3 | ((!self.ortho && q.z <= 0.0) as u8) << 4
     }
 
     /// World size of a pixel at `p`; off screen it is taken 8 times larger
     /// (only shadows and reflections see it there).
-    fn footprint(&self, p: Vec3) -> f32 {
+    pub(super) fn footprint(&self, p: Vec3) -> f32 {
         if self.ortho {
             return self.pixel;
         }
-        let to = p - self.eye;
-        let dist = to.length().max(1e-4);
-        let seen = to.dot(self.forward) / dist >= self.cos_half;
+        let dist = (p - self.eye).length().max(1e-4);
+        let seen = self.outside(self.local(p)) == 0;
         self.pixel * dist * if seen { 1.0 } else { 8.0 }
     }
+
+    /// World size of a pixel on the convex polygon `face` where it comes
+    /// nearest this camera, and whether any of it may be on screen (a
+    /// conservative frustum test: off screen only when every corner is
+    /// outside one plane). Off screen it is taken 8 times larger.
+    pub(super) fn face_footprint(&self, face: &[Vec3]) -> (f32, bool) {
+        let all = face.iter().fold(0x1f_u8, |m, p| m & self.outside(self.local(*p)));
+        let seen = all == 0;
+        if self.ortho {
+            return (self.pixel, seen);
+        }
+        let mut dist = f32::MAX;
+        for k in 1..face.len().saturating_sub(1) {
+            dist = dist.min(closest_on_triangle(self.eye, face[0], face[k], face[k + 1]).distance(self.eye));
+        }
+        if face.len() < 3 {
+            dist = face.iter().map(|p| p.distance(self.eye)).fold(dist, f32::min);
+        }
+        (self.pixel * dist.max(1e-4) * if seen { 1.0 } else { 8.0 }, seen)
+    }
+}
+
+/// The point of triangle `abc` nearest `p` (Ericson, Real-Time Collision
+/// Detection 5.1.5).
+pub(crate) fn closest_on_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
+    let (ab, ac, ap) = (b - a, c - a, p - a);
+    let (d1, d2) = (ab.dot(ap), ac.dot(ap));
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return a;
+    }
+    let bp = p - b;
+    let (d3, d4) = (ab.dot(bp), ac.dot(bp));
+    if d3 >= 0.0 && d4 <= d3 {
+        return b;
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        return a + ab * (d1 / (d1 - d3));
+    }
+    let cp = p - c;
+    let (d5, d6) = (ab.dot(cp), ac.dot(cp));
+    if d6 >= 0.0 && d5 <= d6 {
+        return c;
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        return a + ac * (d2 / (d2 - d6));
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+    }
+    let denom = va + vb + vc;
+    if !(denom.abs() > 0.0) {
+        return a;
+    }
+    a + ab * (vb / denom) + ac * (vc / denom)
 }
 
 /// Dices and displaces every item whose materials ask for it. Returns the
 /// number of triangles added.
-pub fn displace(items: &mut [Item], cams: &[Camera], height: usize) -> usize {
-    let eyes: Vec<Eye> = cams.iter().map(|c| Eye::new(c, height)).collect();
+pub fn displace(items: &mut [Item], cams: &[Camera], width: usize, height: usize) -> usize {
+    let eyes: Vec<Eye> = cams.iter().map(|c| Eye::new(c, width, height)).collect();
     if eyes.is_empty() {
         return 0;
     }
@@ -206,8 +295,10 @@ fn interpolate(mesh: &Mesh, parents: &[(u32, u32)]) -> (Vec<Vertex>, Vec<Vec3>) 
 /// `edge` long, then every vertex moved by the map at its UV, along its
 /// smooth normal (height) or in its tangent frame (vector, when there is
 /// one). Shading normals stay the undisplaced ones, for the baked normal
-/// map. Vertices split at UV seams read their own side's texels, so a
-/// seam can open by about the map's rounding.
+/// map. Vertices split at UV seams (or by normals) each read their own
+/// chart's texels, and every vertex at one place then moves by the mean
+/// of their offsets, summed in vertex order, so a seam never opens
+/// (Stage 3c's plan; done in Stage 4a).
 pub fn apply_baked(mesh: &Mesh, map: &crate::bake::Displacement, edge: f32, max_triangles: usize) -> Result<Mesh, String> {
     if !(edge.is_finite() && edge > 0.0) {
         return Err("edge must be a positive length".into());
@@ -216,10 +307,12 @@ pub fn apply_baked(mesh: &Mesh, map: &crate::bake::Displacement, edge: f32, max_
     let mut indices = mesh.indices.clone();
     let refined = crate::adaptive::refine(&mut positions, &mut indices, &|_| edge, &|p, _, _| p, max_triangles)?;
     let (mut vertices, normals) = interpolate(mesh, &refined.parents);
-    for (v, n) in vertices.iter_mut().zip(&normals) {
-        let p = Vec3::from(v.pos);
+    let mut offsets = Vec::with_capacity(vertices.len());
+    for (v, n) in vertices.iter().zip(&normals) {
         let uv = glam::Vec2::from(v.uv);
-        let offset = if map.vector.is_some() {
+        let offset = if map.vector.is_some() && map.object {
+            map.vector_at(uv)
+        } else if map.vector.is_some() {
             let t = Vec3::from_slice(&v.tangent);
             let t = (t - *n * n.dot(t)).normalize_or(n.any_orthonormal_vector());
             let b = n.cross(t) * v.tangent[3].signum();
@@ -228,7 +321,19 @@ pub fn apply_baked(mesh: &Mesh, map: &crate::bake::Displacement, edge: f32, max_
         } else {
             *n * map.height_at(uv)
         };
-        v.pos = (p + offset).to_array();
+        offsets.push(offset);
+    }
+    // Seams: one offset per place, the mean of its vertices'.
+    let key = |p: [f32; 3]| p.map(|x| if x == 0.0 { 0 } else { x.to_bits() });
+    let mut at: HashMap<[u32; 3], (Vec3, u32)> = HashMap::with_capacity(vertices.len());
+    for (v, o) in vertices.iter().zip(&offsets) {
+        let e = at.entry(key(v.pos)).or_default();
+        e.0 += *o;
+        e.1 += 1;
+    }
+    for v in &mut vertices {
+        let (sum, n) = at[&key(v.pos)];
+        v.pos = (Vec3::from(v.pos) + sum / n as f32).to_array();
     }
     let edges = crate::bake::edges(&indices);
     Ok(Mesh { vertices, indices, edges, materials: mesh.materials.clone(), textures: None, imported: None, decals: mesh.decals.clone(), face: mesh.face.clone(), unshaded: None })
@@ -248,7 +353,7 @@ mod tests {
         let item = || Item { mesh: plane.clone(), world: glam::Mat4::IDENTITY, tint: [1.0; 3], surface: m.surface(), material: m.clone() };
         let cam = |d: f32| Camera { eye: Vec3::new(0.0, d, d), target: Vec3::ZERO, up: Vec3::Y, fov_deg: 40.0, ortho: None };
         let mut near = vec![item()];
-        let added = displace(&mut near, &[cam(1.0)], 400);
+        let added = displace(&mut near, &[cam(1.0)], 400, 400);
         assert!(added > 5000, "{added}");
         let ys: Vec<f32> = near[0].mesh.vertices.iter().map(|v| v.pos[1]).collect();
         let spread = ys.iter().fold(f32::MIN, |a, b| a.max(*b)) - ys.iter().fold(f32::MAX, |a, b| a.min(*b));
@@ -263,6 +368,32 @@ mod tests {
         let rim = |i: u32| { let p = mesh.vertices[i as usize].pos; (p[0].abs() - half).abs() < 1e-4 || (p[2].abs() - half).abs() < 1e-4 };
         assert!(seen.iter().all(|&(a, b)| seen.contains(&(b, a)) || (rim(a) && rim(b))), "a crack inside the plane");
         let mut far = vec![item()];
-        assert_eq!(displace(&mut far, &[cam(400.0)], 400), 0);
+        assert_eq!(displace(&mut far, &[cam(400.0)], 400, 400), 0);
+    }
+
+    /// Stage 3c's seam mitigation (done in 4a): a quad whose two
+    /// triangles sit in different charts (the diagonal's vertices split,
+    /// each side reading other texels) stays closed when a vector map is
+    /// added: every place moves once, by the mean of its vertices'.
+    #[test]
+    fn baked_maps_keep_seams_closed() {
+        // Chart A: the left triangle at u < 0.5; chart B: the right one at u > 0.5.
+        let mut mesh = Mesh::default();
+        for (p, uv) in [([0.0, 0.0, 0.0], [0.05, 0.05]), ([1.0, 0.0, 1.0], [0.45, 0.45]), ([0.0, 0.0, 1.0], [0.05, 0.45]), ([0.0, 0.0, 0.0], [0.55, 0.05]), ([1.0, 0.0, 0.0], [0.95, 0.05]), ([1.0, 0.0, 1.0], [0.95, 0.45])] {
+            let i = mesh.vert(Vec3::from(p), Vec3::Y) as usize;
+            mesh.vertices[i].uv = uv;
+            mesh.vertices[i].tangent = [1.0, 0.0, 0.0, 1.0];
+        }
+        mesh.indices = vec![0, 2, 1, 3, 5, 4];
+        let size = 8u32;
+        let vector: Vec<[f32; 3]> = (0..size * size).map(|i| { let x = (i % size) as f32; [0.01 * x, 0.02 * (i / size) as f32, 0.05 + 0.03 * x] }).collect();
+        let map = crate::bake::Displacement { size, height: None, vector: Some(vector), from_field: 0, missed: 0, object: false };
+        let plain = apply_baked(&mesh, &crate::bake::Displacement { size: 1, height: None, vector: Some(vec![[0.0; 3]]), from_field: 0, missed: 0, object: false }, 0.1, 100_000).unwrap();
+        let moved = apply_baked(&mesh, &map, 0.1, 100_000).unwrap();
+        let places = |m: &Mesh| m.vertices.iter().map(|v| v.pos.map(f32::to_bits)).collect::<std::collections::HashSet<_>>().len();
+        // Before the fix the diagonal's points split in two (a crack).
+        assert_eq!(places(&moved), places(&plain), "every place moved once");
+        let lifted = moved.vertices.iter().map(|v| v.pos[1]).fold(f32::MAX, f32::min);
+        assert!(lifted > 0.04, "the map moved the points ({lifted})");
     }
 }

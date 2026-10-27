@@ -29,8 +29,11 @@ mod command;
 mod eyes;
 #[cfg(test)]
 pub(crate) use eyes::{BACKGROUND, contact_sheet, scene_callback_of};
+mod character;
 mod game;
 mod garments;
+mod groom;
+mod guides;
 mod fires;
 pub(crate) mod history;
 mod hotkeys;
@@ -41,14 +44,21 @@ mod jobs;
 mod layering;
 mod leveling;
 mod look;
+mod lids;
+mod fur;
 mod masking;
 mod panels;
 mod pen_macos;
 mod people;
+mod poly;
 mod posing;
 mod probe;
 mod quicksave;
+mod features;
+mod outline;
 mod recorder;
+mod report;
+mod sheet;
 pub(crate) mod theme;
 mod timeline;
 pub(crate) mod tools;
@@ -59,6 +69,26 @@ mod live_tests;
 mod speed_checks;
 #[cfg(test)]
 mod stage7_tests;
+#[cfg(test)]
+mod quality_tests;
+#[cfg(test)]
+mod groom_tests;
+#[cfg(test)]
+mod style_tests;
+#[cfg(test)]
+mod sheet_tests;
+#[cfg(test)]
+mod guides_tests;
+#[cfg(test)]
+mod character_tests;
+#[cfg(test)]
+mod pose_split_tests;
+#[cfg(test)]
+mod lid_tests;
+#[cfg(test)]
+mod fur_tests;
+#[cfg(test)]
+mod longhair_tests;
 mod strokes;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -75,6 +105,9 @@ enum Tool {
     Mask,
     /// Drag on a clay to paint a polygroup.
     Groups,
+    /// Drag over a Hair object (or its head) to groom its guides (sends
+    /// `groom`).
+    Groom,
 }
 
 impl Tool {
@@ -88,6 +121,7 @@ impl Tool {
             Tool::Paint => "Paint Tool: drag on a clay to paint with the brush color (Alt erases). Right-drag orbits.",
             Tool::Mask => "Mask Tool: drag on a clay to paint the sculpt mask; Alt erases, Shift draws a lasso. Right-drag orbits.",
             Tool::Groups => "Groups Tool: drag on a clay to paint the HUD's polygroup. Right-drag orbits.",
+            Tool::Groom => "Groom Tool: select a Hair, then drag over it (or its head) to groom its guides with the HUD's groom brush; the drag runs across the view at the depth you pressed. Right-drag orbits.",
         }
     }
 }
@@ -176,6 +210,13 @@ pub struct ClideApp {
     last_film_args: Option<serde_json::Value>,
     /// Draw rig skeletons in the viewport.
     show_bones: bool,
+    /// Draw the proportion guides over the viewport (`set_display guides`).
+    show_guides: bool,
+    /// The Proportions window's measure call (Display > Measure Proportions).
+    guides_job: Option<u64>,
+    /// The framing the guides are drawn through, once per frame for every
+    /// pane: (the frame's pass, centre, radius).
+    guides_sphere: std::cell::Cell<Option<(u64, Vec3, f32)>>,
     /// One manipulator per view pane; each keeps its own drag state.
     gizmos: Vec<Gizmo>,
     meshes: MeshLib,
@@ -216,6 +257,8 @@ pub struct ClideApp {
     hotkey_editor: HotkeyEditor,
     /// The Remesh as Clay… dialog, while open.
     remesh_dialog: Option<importing::RemeshDialog>,
+    retopo_dialog: Option<poly::retopo::RetopoDialog>,
+    project_dialog: Option<poly::project::ProjectDialog>,
 
     /// Undo and redo, one labelled step per agent call or UI edit.
     history: history::History,
@@ -253,7 +296,11 @@ pub struct ClideApp {
     /// Last drawn view area (all panes), in points; agent screenshots crop to it.
     viewport_rect: Rect,
     /// Image the agent is sculpting from (see `eyes.rs`).
-    reference: Option<eyes::Reference>,
+    /// Reference images, one per view slot (D13).
+    references: eyes::References,
+    /// The reference planes the sheet slots were last made from
+    /// (`sync_reference_slots`).
+    plane_basis: Vec<(u64, crate::refplane::RefPlane)>,
     /// Ledger replay checkpoints (never saved, never undone).
     replay_cache: std::sync::Arc<crate::ledger::ReplayCache>,
     /// The newest stroke per clay object, for Adjust Last.
@@ -280,6 +327,12 @@ pub struct ClideApp {
     lives: Vec<brush::Live>,
     /// Numbers previews across strokes.
     preview_seq: u64,
+    /// How many times off-screen renders measured a quality shade.
+    #[cfg(test)]
+    shade_measures: std::cell::Cell<usize>,
+    /// The last fur grow of each hair (`app/fur.rs`): its measures, which
+    /// the hair's summary shows.
+    fur_reports: std::collections::HashMap<u64, serde_json::Value>,
     /// Milliseconds from a sample to its preview's chunks being ready to
     /// draw (the newest few thousand).
     preview_latency: Vec<f64>,
@@ -316,8 +369,9 @@ impl ClideApp {
         let hotkeys = match cc.storage.and_then(|s| eframe::get_value::<Hotkeys>(s, HOTKEYS_KEY)) {
             Some(saved) => {
                 // Saved before the list was kept: every action but the
-                // brush tools' level steps and X symmetry was known.
-                let known = cc.storage.and_then(|s| eframe::get_value::<Vec<Action>>(s, HOTKEYS_KNOWN_KEY)).unwrap_or_else(|| Action::ALL.into_iter().filter(|a| !matches!(a, Action::LevelFiner | Action::LevelCoarser | Action::SymmetryX)).collect());
+                // brush tools' level steps, X symmetry and the Poly level
+                // steps was known.
+                let known = cc.storage.and_then(|s| eframe::get_value::<Vec<Action>>(s, HOTKEYS_KNOWN_KEY)).unwrap_or_else(|| Action::ALL.into_iter().filter(|a| !matches!(a, Action::LevelFiner | Action::LevelCoarser | Action::SymmetryX | Action::PolyLevelUp | Action::PolyLevelDown)).collect());
                 saved.with_new_defaults(&known)
             }
             None => Hotkeys::default(),
@@ -354,6 +408,9 @@ impl ClideApp {
             matcap_choice: render::matcap::Matcap::builtin("clay").expect("built in"),
             last_film_args: None,
             show_bones: true,
+            show_guides: true,
+            guides_job: None,
+            guides_sphere: std::cell::Cell::new(None),
             gizmos: (0..render::SLOTS).map(|_| Gizmo::default()).collect(),
             meshes,
             render_state,
@@ -382,6 +439,8 @@ impl ClideApp {
             hotkeys,
             hotkey_editor: HotkeyEditor::default(),
             remesh_dialog: None,
+            retopo_dialog: None,
+            project_dialog: None,
             history: history::History::default(),
             step_base: Scene::default(),
             ui_label: None,
@@ -399,7 +458,8 @@ impl ClideApp {
             jobs: jobs::Jobs::default(),
             next_shot_id: 0,
             viewport_rect: Rect::NOTHING,
-            reference: None,
+            references: Default::default(),
+            plane_basis: Vec::new(),
             replay_cache: Default::default(),
             last_deltas: Default::default(),
             masked_drag: None,
@@ -412,6 +472,9 @@ impl ClideApp {
             layer_selection: Default::default(),
             lives: Vec::new(),
             preview_seq: 0,
+            #[cfg(test)]
+            shade_measures: Default::default(),
+            fur_reports: Default::default(),
             preview_latency: Vec::new(),
             preview_work_ms: Vec::new(),
             preview_checks: (0, 0),
@@ -567,8 +630,10 @@ impl ClideApp {
         }
     }
 
+    /// Bounds of an object's drawn mesh; none for a reference plane, at any
+    /// depth of a subtree walk (framing never takes them in).
     fn mesh_bounds(&self) -> impl Fn(&crate::scene::Object) -> Option<(Vec3, Vec3)> + '_ {
-        |o| self.meshes.bounds(o)
+        |o| if o.is_reference() { None } else { self.meshes.bounds(o) }
     }
 
     fn center_pivot_selected(&mut self) {
@@ -591,13 +656,15 @@ impl ClideApp {
 
     /// World bounds of the given objects and their children.
     fn world_bounds(&self, ids: &[u64]) -> Option<(Vec3, Vec3)> {
+        // Reference image planes are not framed (at any depth: `mesh_bounds`
+        // has none for them), but objects parented under one are.
         let bounds = self.mesh_bounds();
         ids.iter()
             .filter(|&&id| self.scene.is_visible(id))
             .filter_map(|&id| {
                 self.scene.subtree_bounds(id, self.scene.world_matrix(id), &bounds).or_else(|| {
                     let p = self.scene.pivot_world(id);
-                    Some((p, p))
+                    self.scene.get(id).is_some_and(|o| !o.is_reference()).then_some((p, p))
                 })
             })
             .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))
@@ -677,6 +744,8 @@ impl ClideApp {
             self.quicksave.pending = true;
         }
         self.step_base = self.scene.clone();
+        // A call that deleted or edited a plane: its slot follows.
+        self.sync_reference_slots();
     }
 
     fn undo(&mut self) {
@@ -718,6 +787,8 @@ impl ClideApp {
         self.dirty = true;
         self.quicksave.pending = true;
         self.step_base = self.scene.clone();
+        // The slots follow the planes the jump brought back or took away.
+        self.sync_reference_slots();
     }
 
     /// Swaps in a whole new scene (new, open). Ids in it may name other
@@ -725,6 +796,8 @@ impl ClideApp {
     fn replace_scene(&mut self, scene: Scene) {
         self.scene = scene;
         self.scene_generation += 1;
+        // A saved sheet's views come back from its planes.
+        self.references_from_planes();
         // Its ids name other objects: no layer stays selected.
         self.layer_selection.clear();
     }
@@ -886,6 +959,7 @@ impl ClideApp {
                     self.toggle_symmetry_x();
                 }
             }
+            Action::PolyLevelUp | Action::PolyLevelDown => self.step_poly_level(if action == Action::PolyLevelUp { 1 } else { -1 }),
             Action::GridSnapHold | Action::PivotHold => {}
         }
     }
@@ -966,6 +1040,10 @@ impl ClideApp {
         if self.meshes.chunks_pending() {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
+        // So does the viewport's quality shade, once measured.
+        if self.meshes.shading() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
         self.answer_deferred(ctx);
         self.poll_jobs(ctx);
         self.report_ui_activity();
@@ -1017,6 +1095,9 @@ impl ClideApp {
 
         self.hotkey_editor.show(ctx, &mut self.hotkeys);
         self.remesh_dialog_window(ctx);
+        self.retopo_dialog_window(ctx);
+        self.project_dialog_window(ctx);
+        self.proportions_window(ctx);
         self.prune_selection();
 
         // Record one undo step per continuous edit (agent calls recorded
@@ -1029,6 +1110,8 @@ impl ClideApp {
             crate::pose::sync(&mut self.scene);
             let before = std::mem::take(&mut self.step_base);
             self.record_edit(before);
+            // A plane deleted in the outliner: its slot goes too.
+            self.sync_reference_slots();
         }
         // A New or Open that changed nothing labels no later edit.
         (self.ui_label, self.ui_clean) = (None, false);

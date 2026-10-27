@@ -55,7 +55,7 @@ pub(in crate::app) fn settle(app: &mut ClideApp, ctx: &egui::Context) {
     let start = Instant::now();
     loop {
         frame(app, ctx, Vec::new());
-        let idle = app.jobs.running.is_empty() && app.jobs.queue.is_empty() && app.jobs.deferred.is_empty() && app.capture.is_none() && app.strokes.is_empty() && app.lives.is_empty() && app.hud.amount_sent.is_none() && !app.meshes.busy() && !app.meshes.chunks_pending();
+        let idle = app.jobs.running.is_empty() && app.jobs.queue.is_empty() && app.jobs.deferred.is_empty() && app.capture.is_none() && app.strokes.is_empty() && app.lives.is_empty() && app.hud.amount_sent.is_none() && !app.meshes.busy() && !app.meshes.chunks_pending() && !app.meshes.shading();
         if idle {
             return;
         }

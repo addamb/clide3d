@@ -13,7 +13,7 @@ use super::alpha::{AlphaParams, AlphaRef, Mode};
 use super::curve::{Curve, Falloff, Preset};
 use super::path::{self, Sample};
 use super::rng::Pcg32;
-use super::spec::{Brush, Frame, PaintArgs, Side, SmoothMode, StrokeKind, StrokeMask, StrokeSpec};
+use super::spec::{Along, Brush, Frame, PaintArgs, Project, Side, SmoothMode, StrokeKind, StrokeMask, StrokeSpec};
 
 /// Most points an authored stroke may give.
 pub const MAX_POINTS: usize = 512;
@@ -60,13 +60,16 @@ pub struct ResolveCtx<'a> {
     /// The clay's detail levels' cells, coarse first (`levels::cells`):
     /// what a stroke's `level` resolves to.
     pub levels: Option<&'a [f32]>,
+    /// The clay's middle in object space: which way a projected frame's
+    /// one-way plane rays go (toward it).
+    pub center: Option<Vec3>,
 }
 
 impl ResolveCtx<'_> {
     /// Points already in object space, nothing to snap to.
     #[cfg(test)]
     pub fn local() -> ResolveCtx<'static> {
-        ResolveCtx { to_local: Mat4::IDENTITY, radius_scale: 1.0, world_to_local: Mat4::IDENTITY, snap: None, cast: None, view_far: 100.0, snap_call: None, snap_single: false, alpha: None, unpose: None, levels: None }
+        ResolveCtx { to_local: Mat4::IDENTITY, radius_scale: 1.0, world_to_local: Mat4::IDENTITY, snap: None, cast: None, view_far: 100.0, snap_call: None, snap_single: false, alpha: None, unpose: None, levels: None, center: None }
     }
 }
 
@@ -94,13 +97,20 @@ pub struct Params {
     /// reaches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<f32>,
+    /// clay_polish: the crease angle in degrees and whether the volume is
+    /// kept, resolved (None for every other brush, so their records hash
+    /// as before).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angle: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_volume: Option<bool>,
 }
 
 impl Params {
     /// A path brush's settings with the original curve.
     #[cfg(test)]
     pub fn new(brush: Brush, strength: f32) -> Params {
-        Params { brush, curve: Curve::Legacy, strength, invert: false, scale: None, pattern: None, side: Side::Both, smooth_mode: SmoothMode::Normal, alpha: None, transform: None, level: None }
+        Params { brush, curve: Curve::Legacy, strength, invert: false, scale: None, pattern: None, side: Side::Both, smooth_mode: SmoothMode::Normal, alpha: None, transform: None, level: None, angle: None, keep_volume: None }
     }
 }
 
@@ -275,6 +285,14 @@ fn resolve_with(spec: &StrokeSpec, ctx: &ResolveCtx, fit: bool) -> Result<Resolv
         check(!(brush == Brush::Noise && m.auto()), "noise strokes take no auto-masking (backface, cavity, connected, normal_angle)")?;
     }
     check(spec.transform.is_none() || brush == Brush::Transform, "transform is for brush transform")?;
+    check((spec.angle.is_none() && spec.keep_volume.is_none()) || brush == Brush::ClayPolish, "angle and keep_volume are for brush clay_polish")?;
+    check(spec.angle.is_none_or(|a| (5.0..=90.0).contains(&a)), "angle must be 5 to 90 degrees")?;
+    check(!(brush == Brush::ClayPolish && spec.alpha.is_some()), "clay_polish takes no alpha")?;
+    if matches!(spec.frame, Some(Frame::Project(_))) {
+        check(brush != Brush::Transform && !spec.symmetry.as_ref().is_some_and(|s| s.posable), "a projected frame is for strokes on the rest clay (not transform or posable symmetry)")?;
+        check(spec.snap != Some(true), "a projected frame puts points on the clay itself; leave snap out")?;
+        check(!matches!(spec.kind, StrokeKind::DragRect { .. }), "a projected frame takes points (not drag_rect)")?;
+    }
     check(!(brush.marks() && spec.paint.is_some()), "mask and group strokes take no paint")?;
     if brush == Brush::Transform {
         return resolve_transform(spec, ctx);
@@ -310,6 +328,7 @@ fn resolve_with(spec: &StrokeSpec, ctx: &ResolveCtx, fit: bool) -> Result<Resolv
     // Frame: points (and directions) into object space.
     let (to_local, scale) = match &spec.frame {
         Some(Frame::Object) => (Mat4::IDENTITY, 1.0),
+        // A projected frame's points and directions are in the call's space.
         Some(Frame::Screen(_)) => (ctx.world_to_local, mat_scale(ctx.world_to_local)),
         _ => (ctx.to_local, ctx.radius_scale),
     };
@@ -342,7 +361,14 @@ fn resolve_with(spec: &StrokeSpec, ctx: &ResolveCtx, fit: bool) -> Result<Resolv
         }
         _ => spec.points.iter().map(|p| Sample { p: to_local.transform_point3(p.p), pressure: p.pressure, normal: p.normal.map(|n| to_local.inverse().transpose().transform_vector3(n).normalize_or_zero()) }).collect(),
     };
-    let snapped = matches!(spec.frame, Some(Frame::Surface { .. })) || spec.snap.or(ctx.snap_call).unwrap_or(ctx.snap_single && samples.len() == 1);
+    let project = match &spec.frame {
+        Some(Frame::Project(p)) => Some(Projector::new(p, to_local, scale, spec.radius * scale, ctx)?),
+        _ => None,
+    };
+    if let Some(p) = &project {
+        p.place(&mut samples, ctx)?;
+    }
+    let snapped = project.is_none() && (matches!(spec.frame, Some(Frame::Surface { .. })) || spec.snap.or(ctx.snap_call).unwrap_or(ctx.snap_single && samples.len() == 1));
     if snapped && !matches!(spec.frame, Some(Frame::Screen(_))) {
         let snap = ctx.snap.ok_or("snap needs a clay surface")?;
         let offset = match spec.frame {
@@ -380,7 +406,11 @@ fn resolve_with(spec: &StrokeSpec, ctx: &ResolveCtx, fit: bool) -> Result<Resolv
             check(samples.len() >= if closed { 3 } else { 2 }, "a curve needs 2 or more control points (3 when closed)")?;
             samples = path::curve(&samples, closed, radius * 0.25);
             let resnap = snapped || matches!(spec.frame, Some(Frame::Screen(_)));
-            if resnap && brush != Brush::Snakehook && let Some(snap) = ctx.snap {
+            // Between its control points the curve leaves the surface: a
+            // projected one is cast again, across the curve.
+            if let Some(p) = &project {
+                p.place(&mut samples, ctx)?;
+            } else if resnap && brush != Brush::Snakehook && let Some(snap) = ctx.snap {
                 let offset = match spec.frame {
                     Some(Frame::Surface { offset }) => offset * scale,
                     _ => 0.0,
@@ -498,13 +528,20 @@ fn resolve_with(spec: &StrokeSpec, ctx: &ResolveCtx, fit: bool) -> Result<Resolv
             fits(&samples, spacing, count as usize, MAX_DABS, "dabs")?;
             let mut rng = Pcg32::new(seed, 0x5eed);
             let centers = path::resample(&samples, spacing);
+            // A projected spray casts each jittered dab again, along its
+            // center's ray; dabs that land on nothing are left out (the
+            // same ones on every replay: the seed fixes them).
+            let rays = project.as_ref().map(|p| p.directions(&centers, ctx)).transpose()?;
             for (i, s) in centers.iter().copied().enumerate() {
                 let n = s.normal.or(normal).map(|n| n.normalize_or(Vec3::Y)).unwrap_or(Vec3::Y);
                 let (u, v) = n.any_orthonormal_pair();
                 for _ in 0..count {
                     let (x, y) = rng.in_disk();
                     let mut at = Sample { p: s.p + (u * x + v * y) * jitter * radius, ..s };
-                    if snapped && let Some((q, _)) = ctx.snap.and_then(|f| f(at.p)) {
+                    if let (Some(p), Some(rays)) = (&project, &rays) {
+                        let Some((q, n)) = p.cast_one(at.p, rays[i], ctx) else { continue };
+                        (at.p, at.normal) = (q, Some(n));
+                    } else if snapped && let Some((q, _)) = ctx.snap.and_then(|f| f(at.p)) {
                         at.p = q;
                     }
                     base.push(single(&at, 1.0, dir(&centers, i)));
@@ -573,6 +610,8 @@ fn resolve_with(spec: &StrokeSpec, ctx: &ResolveCtx, fit: bool) -> Result<Resolv
             alpha,
             transform: None,
             level: level_cell(spec, ctx)?,
+            angle: (brush == Brush::ClayPolish).then(|| spec.angle.unwrap_or(30.0)),
+            keep_volume: (brush == Brush::ClayPolish).then(|| spec.keep_volume.unwrap_or(true)),
         },
         mask: spec.mask.clone(),
         dabs,
@@ -603,7 +642,7 @@ fn resolve_transform(spec: &StrokeSpec, ctx: &ResolveCtx) -> Result<Resolved, St
     let strength = spec.strength.unwrap_or(1.0);
     check((0.0..=1.0).contains(&strength), "transform strength is 0 to 1 (how much of the move applies)")?;
     Ok(Resolved {
-        params: Params { brush: Brush::Transform, curve: Curve::Legacy, strength, invert: false, scale: None, pattern: None, side: Side::Both, smooth_mode: SmoothMode::Normal, alpha: None, transform: Some(m), level: level_cell(spec, ctx)? },
+        params: Params { brush: Brush::Transform, curve: Curve::Legacy, strength, invert: false, scale: None, pattern: None, side: Side::Both, smooth_mode: SmoothMode::Normal, alpha: None, transform: Some(m), level: level_cell(spec, ctx)?, angle: None, keep_volume: None },
         mask: spec.mask.clone(),
         dabs: vec![Dab { points: vec![at], radius: spec.radius * ctx.radius_scale, radii: None, gain: 1.0, gains: None, delta: None, normal: None, tangent: None, upright: None, flip: false }],
         instances: 1,
@@ -671,6 +710,152 @@ fn paint_params(spec: &StrokeSpec, curve: Option<Curve>) -> Result<Option<PaintP
 pub fn mat_scale(m: Mat4) -> f32 {
     let s = m.to_scale_rotation_translation().0;
     (s.x.abs() + s.y.abs() + s.z.abs()) / 3.0
+}
+
+/// A projected frame (`Frame::Project`) resolved in object space.
+struct Projector {
+    /// The ray direction, or for rays across the path in a plane, that
+    /// plane's normal.
+    dir: Vec3,
+    across: bool,
+    both_ways: bool,
+    reach: f32,
+    offset: f32,
+    /// Rays across the path take its direction over this much of it (a
+    /// radius) each way, so at a bend they fan across rather than jump.
+    window: f32,
+}
+
+/// Most misses a refusal lists.
+const LISTED_MISSES: usize = 16;
+
+impl Projector {
+    fn new(p: &Project, to_local: Mat4, scale: f32, radius: f32, ctx: &ResolveCtx) -> Result<Projector, String> {
+        let normal = |v: Vec3| to_local.inverse().transpose().transform_vector3(v).try_normalize();
+        let (dir, across) = match &p.along {
+            Along::Dir(d) => (to_local.transform_vector3(*d).try_normalize().filter(|_| d.is_finite()).ok_or("project along must be a nonzero, finite direction")?, false),
+            Along::Word(w) if w == "plane" => {
+                let n = p.plane.ok_or("project along plane needs plane: {normal: [x, y, z]}")?.normal;
+                (normal(n).filter(|_| n.is_finite()).ok_or("project plane normal must be nonzero and finite")?, true)
+            }
+            Along::Word(w) => {
+                let d = match w.strip_prefix("view:") {
+                    Some("front") => Vec3::NEG_Z,
+                    Some("back") => Vec3::Z,
+                    Some("right") => Vec3::NEG_X,
+                    Some("left") => Vec3::X,
+                    Some("top") => Vec3::NEG_Y,
+                    Some("bottom") => Vec3::Y,
+                    _ => return Err(format!("project along {w}: use [x, y, z], view:front|back|left|right|top|bottom or plane")),
+                };
+                (ctx.world_to_local.transform_vector3(d).normalize(), false)
+            }
+        };
+        check(p.plane.is_none() || across, "project plane goes with along: \"plane\"")?;
+        let reach = p.reach.map_or(4.0 * radius, |r| r * scale);
+        check(reach.is_finite() && reach > 0.0, "project reach must be positive")?;
+        let offset = p.offset * scale;
+        check(offset.is_finite(), "project offset must be finite")?;
+        Ok(Projector { dir, across, both_ways: p.both_ways, reach, offset, window: radius })
+    }
+
+    /// How far behind each point its rays start: a quarter radius (at most
+    /// half the reach), so a point already on the surface (a curve's
+    /// landed control points, the curve between them, a jittered spray dab)
+    /// hits the sheet it is on instead of passing through it to the far
+    /// side. Distances still count from the point itself.
+    fn back(&self) -> f32 {
+        (0.25 * self.window).min(0.5 * self.reach)
+    }
+
+    /// Each sample's ray direction: `dir`, or for rays across the path in
+    /// a plane, across it there (its direction over a window each way),
+    /// one way toward the clay's middle unless `both_ways`.
+    fn directions(&self, samples: &[Sample], ctx: &ResolveCtx) -> Result<Vec<Vec3>, String> {
+        let n = samples.len();
+        if !self.across {
+            return Ok(vec![self.dir; n]);
+        }
+        check(n >= 2, "a projected frame along plane needs a path of 2 or more points")?;
+        // Arc length to each sample, and the point that far along.
+        let along: Vec<f32> = std::iter::once(0.0)
+            .chain(samples.windows(2).scan(0.0f32, |a, w| {
+                *a += w[0].p.distance(w[1].p);
+                Some(*a)
+            }))
+            .collect();
+        let at = |u: f32| -> Vec3 {
+            let u = u.clamp(0.0, along[n - 1]);
+            let j = along.partition_point(|a| *a <= u).clamp(1, n - 1);
+            let (a, b) = (along[j - 1], along[j]);
+            let f = if b > a { (u - a) / (b - a) } else { 0.0 };
+            samples[j - 1].p.lerp(samples[j].p, f)
+        };
+        samples
+            .iter()
+            .enumerate()
+            .map(|(k, s)| {
+                let t = at(along[k] + self.window) - at(along[k] - self.window);
+                let d = self.dir.cross(t).try_normalize().ok_or(format!("projected point {k}: the path there runs along the plane's normal"))?;
+                Ok(match ctx.center {
+                    Some(c) if !self.both_ways && d.dot(c - s.p) < 0.0 => -d,
+                    _ => d,
+                })
+            })
+            .collect()
+    }
+
+    /// Where the ray from `p` along `d` (and back, with `both_ways`; the
+    /// nearer wins) first meets the clay within reach, lifted `offset`
+    /// along the outward normal there.
+    fn cast_one(&self, p: Vec3, d: Vec3, ctx: &ResolveCtx) -> Option<(Vec3, Vec3)> {
+        let cast = ctx.cast?;
+        let back = self.back();
+        let hit = |d: Vec3| cast(p - d * back, d).filter(|(q, _)| q.distance(p) <= self.reach);
+        let mut best = hit(d);
+        if self.both_ways
+            && let Some(b) = hit(-d)
+            && best.is_none_or(|a| b.0.distance(p) < a.0.distance(p))
+        {
+            best = Some(b);
+        }
+        let (q, mut normal) = best?;
+        // The hit's normal faces the ray: from inside the clay that is
+        // inward. The surface there says which way out.
+        if let Some((_, m)) = ctx.snap.and_then(|f| f(q))
+            && m.dot(normal) < 0.0
+        {
+            normal = -normal;
+        }
+        Some((q + normal * self.offset, normal))
+    }
+
+    /// Moves every sample to where its ray first meets the clay (the nearer
+    /// way with `both_ways`), lifted `offset` along the outward normal
+    /// there; refuses the samples that hit nothing within `reach`.
+    fn place(&self, samples: &mut [Sample], ctx: &ResolveCtx) -> Result<(), String> {
+        check(ctx.cast.is_some(), "a projected frame needs a clay surface to hit")?;
+        let n = samples.len();
+        let dirs = self.directions(samples, ctx)?;
+        let mut misses: Vec<usize> = Vec::new();
+        let mut placed = Vec::with_capacity(n);
+        for (k, (s, d)) in samples.iter().zip(&dirs).enumerate() {
+            match self.cast_one(s.p, *d, ctx) {
+                Some(hit) => placed.push(hit),
+                None => misses.push(k),
+            }
+        }
+        if !misses.is_empty() {
+            let shown: Vec<String> = misses.iter().take(LISTED_MISSES).map(|k| k.to_string()).collect();
+            let more = if misses.len() > LISTED_MISSES { format!(" and {} more", misses.len() - LISTED_MISSES) } else { String::new() };
+            return Err(format!("projected points {}{more} (of {n}) hit no clay within reach {:.4}; move them nearer the surface, raise reach or change along", shown.join(", "), self.reach));
+        }
+        for (s, (q, normal)) in samples.iter_mut().zip(placed) {
+            s.p = q;
+            s.normal = Some(normal);
+        }
+        Ok(())
+    }
 }
 
 /// Points where rays through a screen frame hit the clay.
@@ -784,7 +969,7 @@ mod tests {
                 (p, p)
             })
         };
-        let ctx = ResolveCtx { to_local: world_to_local, radius_scale: 0.5, world_to_local, snap: Some(&snap), cast: Some(&cast), view_far: 50.0, snap_call: None, snap_single: false, alpha: None, unpose: None, levels: None };
+        let ctx = ResolveCtx { to_local: world_to_local, radius_scale: 0.5, world_to_local, snap: Some(&snap), cast: Some(&cast), view_far: 50.0, snap_call: None, snap_single: false, alpha: None, unpose: None, levels: None, center: None };
         let mut s = spec(Brush::Inflate, &[[2.0, 3.0, 0.0]], 0.2);
         let r = resolve(&s, &ctx).unwrap();
         assert!((r.dabs[0].points[0] - Vec3::new(0.0, 1.5, 0.0)).length() < 1e-6 && (r.dabs[0].radius - 0.1).abs() < 1e-6, "world");

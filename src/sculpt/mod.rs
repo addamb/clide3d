@@ -59,6 +59,7 @@
 
 mod brushes;
 pub mod engine;
+pub mod flow;
 mod noise;
 mod transform;
 pub mod preview;
@@ -221,6 +222,8 @@ pub fn prepare(raws: &[serde_json::Value], default_brush: Option<Brush>, ctx: &R
 
 #[cfg(test)]
 mod acceptance;
+#[cfg(test)]
+mod stage1c;
 #[cfg(test)]
 mod stage2;
 #[cfg(test)]

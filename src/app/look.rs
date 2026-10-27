@@ -3,7 +3,7 @@
 //! `create_object` / `update_object`), aiming an object (`aim`), and
 //! mirrored copies (`mirror` on `create_object`).
 
-use glam::{Mat3, Mat4, Quat, Vec3};
+use glam::{Mat3, Quat, Vec3};
 use serde_json::{Value, json};
 
 use super::ClideApp;
@@ -12,6 +12,10 @@ use crate::hair::{Guide, Hair};
 use crate::material::{MAX_MATERIALS, Material, PRESETS};
 use crate::mcp::ToolResult;
 use crate::scene::{Scene, Shape};
+pub(super) use crate::groom::head::{Head as Collider, InHair};
+
+/// Objects one `set_material apply_to` takes.
+const MAX_APPLY_TO: usize = 64;
 
 fn material_edit_summary(name: &str, args: &Value, layers: usize, users: usize, materials: usize) -> Value {
     let fields: Vec<_> = args.as_object().into_iter().flat_map(|o|o.keys())
@@ -23,11 +27,35 @@ impl ClideApp {
     /// `set_material`: define, change or remove a scene material. Edits
     /// return a compact summary; read-only calls list the library and presets.
     pub(super) fn set_material(&mut self, args: &Value) -> ToolResult {
+        // apply_to only goes with setting a named material: refused (not
+        // ignored) with a listing, a rename, a replace or delete_unused.
+        if args.get("apply_to").is_some_and(|v| !v.is_null()) {
+            let manages = args["delete_unused"].as_bool() == Some(true) || ["rename", "replace", "replace_with"].iter().any(|k| args.get(*k).is_some_and(|v| !v.is_null()));
+            if manages || args["list"].as_bool() == Some(true) || args["name"].is_null() {
+                return Err("apply_to needs a material name to set (not a listing, rename, replace or delete_unused)".into());
+            }
+        }
         if let Some(result) = crate::material_management::manage(&mut self.scene, args)? { return Ok(super::tools::text(result)); }
         if args["list"].as_bool()==Some(true) || args["name"].is_null() {
             return Ok(super::tools::text(crate::material_management::listing(&self.scene,args)));
         }
         let mut changed = None;
+        // apply_to: objects that take the material in the same call (the
+        // editor's Stylised buttons send it), checked before anything
+        // changes.
+        let apply_to: Vec<u64> = match args.get("apply_to") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(list)) => {
+                if list.len() > MAX_APPLY_TO {
+                    return Err(format!("apply_to takes at most {MAX_APPLY_TO} objects ({} sent)", list.len()));
+                }
+                list.iter().map(|v| self.resolve(v)).collect::<Result<_, _>>()?
+            }
+            Some(v) => vec![self.resolve(v)?],
+        };
+        if !apply_to.is_empty() && (args["remove"].as_bool().unwrap_or(false) || args["name"].as_str().is_none()) {
+            return Err("apply_to needs a material name to set (not remove)".into());
+        }
         if let Some(name) = args["name"].as_str() {
             let name = name.trim();
             if name.is_empty() {
@@ -40,12 +68,22 @@ impl ClideApp {
                     return Err(format!("the scene has no material {name} (presets cannot be removed)"));
                 }
             } else {
-                let start = match args["based_on"].as_str() {
-                    Some(b) => Material::find(&self.scene.materials, b).ok_or_else(|| format!("unknown material {b} in based_on"))?,
-                    None => Material::find(&self.scene.materials, name).unwrap_or_default(),
+                // preset: start again from a built-in preset's values
+                // (Stage 4d's stylised looks, or any other), even when the
+                // scene already has a material of this name.
+                let preset = match args.get("preset") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(p)) => Some(p.trim()),
+                    Some(_) => return Err("preset must be a preset name".into()),
+                };
+                let start = match (preset, args["based_on"].as_str()) {
+                    (Some(_), Some(_)) => return Err("send preset or based_on, not both".into()),
+                    (Some(p), None) => Material::preset(p).ok_or_else(|| format!("unknown preset {p}; use one of {}, or a smart preset ({})", PRESETS.iter().map(|p| p.0).collect::<Vec<_>>().join(", "), smart_names()))?,
+                    (None, Some(b)) => Material::find(&self.scene.materials, b).ok_or_else(|| format!("unknown material {b} in based_on"))?,
+                    (None, None) => Material::find(&self.scene.materials, name).unwrap_or_default(),
                 };
                 let mut m = Material { name: name.to_string(), ..start };
-                for (key, field) in [("roughness", &mut m.roughness), ("metallic", &mut m.metallic), ("clearcoat", &mut m.clearcoat), ("sheen", &mut m.sheen), ("subsurface", &mut m.subsurface), ("pores", &mut m.pores), ("mottling", &mut m.mottling), ("skin_specular", &mut m.skin_specular), ("emission", &mut m.emission), ("transmission", &mut m.transmission), ("ior", &mut m.ior), ("cavity", &mut m.cavity), ("edge_wear", &mut m.edge_wear), ("dirt", &mut m.dirt), ("variation", &mut m.variation), ("gloss_variation", &mut m.gloss_variation), ("variation_scale", &mut m.variation_scale)] {
+                for (key, field) in [("subsurface_radius", &mut m.subsurface_radius), ("roughness", &mut m.roughness), ("metallic", &mut m.metallic), ("clearcoat", &mut m.clearcoat), ("sheen", &mut m.sheen), ("subsurface", &mut m.subsurface), ("pores", &mut m.pores), ("mottling", &mut m.mottling), ("skin_specular", &mut m.skin_specular), ("emission", &mut m.emission), ("transmission", &mut m.transmission), ("ior", &mut m.ior), ("cavity", &mut m.cavity), ("edge_wear", &mut m.edge_wear), ("dirt", &mut m.dirt), ("variation", &mut m.variation), ("gloss_variation", &mut m.gloss_variation), ("variation_scale", &mut m.variation_scale)] {
                     if let Some(v) = args[key].as_f64() {
                         *field = v as f32;
                     }
@@ -115,6 +153,9 @@ impl ClideApp {
                     None if full => return Err(format!("at most {MAX_MATERIALS} scene materials")),
                     None => self.scene.materials.push(m.clone()),
                 }
+                for &id in &apply_to {
+                    self.scene.get_mut(id).ok_or("object vanished")?.material = Some(m.name.clone());
+                }
                 changed = Some(m);
             }
         }
@@ -129,8 +170,16 @@ impl ClideApp {
         };
         // Edits answer with fields and counts; a call without name lists everything.
         if let Some(name) = args["name"].as_str() {
-            return Ok(super::tools::text(material_edit_summary(name, args,
-                changed.as_ref().map_or(0, |m|m.layers.len()), users(name).len(), self.scene.materials.len())));
+            let mut summary = material_edit_summary(name, args, changed.as_ref().map_or(0, |m|m.layers.len()), users(name).len(), self.scene.materials.len());
+            if !apply_to.is_empty() {
+                summary["applied_to"] = json!(apply_to.iter().filter_map(|id| self.scene.get(*id).map(|o| o.name.clone())).collect::<Vec<_>>());
+            }
+            // A preset's look, as stored (overrides applied).
+            if let (Some(m), Some(p)) = (&changed, args["preset"].as_str()) {
+                summary["preset"] = json!(p.trim());
+                summary["values"] = json!({ "roughness": m.roughness, "sheen": m.sheen, "clearcoat": m.clearcoat, "subsurface": m.subsurface, "subsurface_radius": m.subsurface_radius, "scatter": m.scatter, "pores": m.pores, "mottling": m.mottling, "skin_specular": m.skin_specular, "detail": m.detail_name() });
+            }
+            return Ok(super::tools::text(summary));
         }
         Ok(super::tools::text(crate::material_management::listing(&self.scene,args)))
     }
@@ -154,14 +203,39 @@ impl ClideApp {
                 return Err(format!("{} is not an Eye; eye settings need shape Eye", o.name));
             }
             let Value::Object(patch) = patch else { return Err("eye must be an object".into()) };
-            let mut merged = serde_json::to_value(o.eye.clone().unwrap_or_default()).map_err(|e| e.to_string())?;
+            const EYE_KEYS: [&str; 12] = ["iris_color", "iris_size", "pupil_size", "pupil", "sclera_color", "pupil_color", "cornea", "veins", "limbal_ring", "style", "iris_scale", "catchlight"];
+            if let Some(k) = patch.keys().find(|k| !EYE_KEYS.contains(&k.as_str())) {
+                return Err(format!("unknown eye setting {k}; use {}", EYE_KEYS.join(", ")));
+            }
+            if patch.contains_key("pupil") && patch.contains_key("pupil_size") {
+                return Err("send pupil or pupil_size, not both (pupil is pupil_size)".into());
+            }
+            let style = match patch.get("style") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(serde_json::from_value::<crate::eyeball::EyeStyle>(v.clone()).map_err(|_| "eye style must be realistic or stylized")?),
+            };
+            if let Some(v) = patch.get("iris_scale").filter(|v| !v.is_null()) {
+                let (lo, hi) = crate::eyeball::IRIS_SCALE;
+                v.as_f64().filter(|x| (lo as f64..=hi as f64).contains(x)).ok_or(format!("iris_scale must be {lo} to {hi}"))?;
+            }
+            if let Some(v) = patch.get("pupil").filter(|v| !v.is_null()) {
+                v.as_f64().filter(|x| (0.05..=0.95).contains(x)).ok_or("pupil must be 0.05 to 0.95 (a part of the iris width, as pupil_size)")?;
+            }
+            let before = o.eye.clone().unwrap_or_default();
+            // Every field, defaults too, so a patch can name any of them.
+            let mut merged = serde_json::to_value(&before).map_err(|e| e.to_string())?;
+            merged["style"] = json!(before.style);
+            merged["iris_scale"] = json!(before.iris_scale);
+            merged["catchlight"] = json!(before.catchlight);
             for (k, v) in patch {
-                if merged.get(k).is_none() {
-                    return Err(format!("unknown eye setting {k}; use iris_color, iris_size, pupil_size, sclera_color, pupil_color, cornea"));
-                }
-                merged[k] = v.clone();
+                merged[if k == "pupil" { "pupil_size" } else { k.as_str() }] = v.clone();
             }
             let mut eye: Eye = serde_json::from_value(merged).map_err(|e| format!("bad eye settings: {e}"))?;
+            // Turning stylised fills in its look (stored), except what the
+            // call sets itself.
+            if style == Some(crate::eyeball::EyeStyle::Stylized) && before.style != crate::eyeball::EyeStyle::Stylized {
+                eye.stylize(&|k| patch.contains_key(k));
+            }
             eye.sanitize();
             o.eye = Some(eye);
         }
@@ -180,14 +254,27 @@ impl ClideApp {
     /// world space, guide points and center are converted to object space.
     fn apply_hair(&mut self, id: u64, patch: &Value, world: bool) -> Result<(), String> {
         validate_hair_keys(patch)?;
+        // `grow: {fur: true}` spreads short guides over a whole clay body
+        // (`app/fur.rs`); they replace the list.
+        let fur_grown = match patch.get("grow").filter(|g| g.get("fur").and_then(Value::as_bool) == Some(true)) {
+            Some(g) => {
+                if g.get("style").is_some() {
+                    return Err("grow takes fur or style, not both".into());
+                }
+                Some(self.grow_fur(id, g)?)
+            }
+            None => None,
+        };
         // `grow` makes guides over a scalp; they join (or replace) the list.
         let style = patch["grow"]["style"].as_str().unwrap_or("drape");
         let facial = matches!(style, "brow" | "lash");
-        let grown = match patch.get("grow").filter(|v| !v.is_null()) {
+        let grown = match patch.get("grow").filter(|v| !v.is_null() && fur_grown.is_none()) {
             Some(g) => Some(self.grow_guides(id, g)?),
             None => None,
         };
         let to_local = self.scene.world_matrix(id).inverse();
+        let hair_scale = self.scene.world_matrix(id).to_scale_rotation_translation().0.abs().max_element().max(1e-9);
+        let grown_lift = grown.is_some().then(|| patch["grow"]["lift"].as_f64().map_or(if facial { 0.0001 } else { crate::hair::GROW_LIFT }, |v| v as f32).clamp(0.0, 0.1));
         let grown_center = if grown.is_some() {
             let on = self.resolve(&patch["grow"]["on"])?;
             self.meshes.whole(on).map(|m| {
@@ -233,14 +320,29 @@ impl ClideApp {
             }
             hair.guides.extend(guides);
         }
+        // The guides stay out of the JSON round trip: a settings patch keeps
+        // them shared with the undo history (no copy), and only `guides`,
+        // `add_guides` and `grow` change them.
+        let mut guides = std::mem::take(&mut hair.guides);
         let mut merged = serde_json::to_value(&hair).map_err(|e| e.to_string())?;
         for (k, v) in patch {
             match k.as_str() {
                 "grow" => {}
-                "guides" => hair.guides = v.as_array().ok_or("guides must be a list")?.iter().map(guide).collect::<Result<_, _>>()?,
+                "fur" if v.is_null() => merged["fur"] = Value::Null,
+                "fur" => {
+                    // Merged into the fur's settings (a hair without fur
+                    // gets them from the defaults).
+                    let mut f = merged.get("fur").filter(|f| !f.is_null()).cloned().unwrap_or_else(|| serde_json::to_value(crate::hair::Fur::default()).expect("fur"));
+                    for (fk, fv) in v.as_object().ok_or("fur must be an object of fur settings")? {
+                        f[fk] = fv.clone();
+                    }
+                    let _: crate::hair::Fur = serde_json::from_value(f.clone()).map_err(|e| format!("bad fur settings: {e}"))?;
+                    merged["fur"] = f;
+                }
+                "guides" => guides = v.as_array().ok_or("guides must be a list")?.iter().map(guide).collect::<Result<_, _>>()?,
                 "add_guides" => {
                     let more: Vec<Guide> = v.as_array().ok_or("add_guides must be a list")?.iter().map(guide).collect::<Result<_, _>>()?;
-                    hair.guides.extend(more);
+                    guides.extend(more);
                 }
                 "center" if world && !v.is_null() => {
                     let c: [f32; 3] = serde_json::from_value(v.clone()).map_err(|_| "center must be [x, y, z]")?;
@@ -250,8 +352,36 @@ impl ClideApp {
                 _ => return Err(format!("unknown hair setting {k}; use {}", HAIR_KEYS.join(", "))),
             }
         }
-        merged["guides"] = serde_json::to_value(&hair.guides).map_err(|e| e.to_string())?;
         let mut hair: Hair = serde_json::from_value(merged).map_err(|e| format!("bad hair settings: {e}"))?;
+        hair.guides = guides;
+        if let Some(f) = fur_grown {
+            // The fur's own settings, except what the patch sets itself.
+            hair.guides = f.guides.into();
+            hair.fur = Some(f.fur);
+            hair.mirror = false;
+            hair.center = None;
+            if !patch.contains_key("strands") {
+                hair.strands = f.strands;
+            }
+            if !patch.contains_key("strand_width") {
+                hair.strand_width = f.strand_width;
+            }
+            if !patch.contains_key("lift") {
+                hair.lift = f.lift;
+            }
+            if !patch.contains_key("frizz") {
+                hair.frizz = f.frizz;
+            }
+            if !patch.contains_key("length_variation") {
+                hair.length_variation = 0.25;
+            }
+            self.fur_reports.insert(id, f.report);
+        }
+        // Grown guides keep their lift for groom (the hair's units), unless
+        // the patch sets one.
+        if grown_lift.is_some() && !patch.contains_key("lift") {
+            hair.lift = grown_lift.unwrap_or(crate::hair::GROW_LIFT) / hair_scale;
+        }
         if hair.guides.len() > crate::hair::MAX_GUIDES {
             return Err(format!("at most {} guides", crate::hair::MAX_GUIDES));
         }
@@ -329,7 +459,7 @@ impl ClideApp {
         if let Some(v) = g.get("roots") {
             let points: Vec<Vec3> = serde_json::from_value(v.clone()).map_err(|_| "grow.roots must be a list of world points")?;
             if points.len() > crate::hair::MAX_GUIDES || points.iter().any(|p| !p.is_finite()) {
-                return Err("grow.roots needs at most 512 finite points".into());
+                return Err(format!("grow.roots needs at most {} finite points", crate::hair::MAX_GUIDES));
             }
             candidates = points.into_iter().filter_map(surface).collect();
         }
@@ -373,29 +503,87 @@ impl ClideApp {
         Ok((guides, g["replace"].as_bool().unwrap_or(true)))
     }
 
+    /// A clay as groom keeps hair out of it: its composed field (sculpt
+    /// layers too), as its mesh is drawn.
+    pub(super) fn head_collider(&self, id: u64) -> Result<Collider, String> {
+        let o = self.scene.get(id).ok_or("object vanished")?;
+        let clay = crate::layers::composed_clay(o.clay.as_ref().ok_or("not a clay object")?);
+        clay.cell_size().ok_or("clay is empty")?;
+        let bounds = self.meshes.whole(id).map(|m| m.bounds()).ok_or("the clay has no mesh")?;
+        Collider::new(&clay, bounds, self.scene.rest_world_matrix(id))
+    }
+
     /// A clay object as something hair rests on.
     fn collider(&self, id: u64) -> Result<Collider, String> {
         let clay = self.scene.get(id).and_then(|o| o.clay.as_ref()).ok_or("not a clay object")?;
-        let cell = clay.cell_size().ok_or("clay is empty")?;
-        let field = crate::clay::Field::new(clay, cell);
-        let (lo, hi) = self.meshes.whole(id).map(|m| m.bounds()).ok_or("the clay has no mesh")?;
-        let list = field.near(lo - 0.1, hi + 0.1);
-        let world = self.scene.world_matrix(id);
-        let scale = world.to_scale_rotation_translation().0.abs().max_element().max(1e-6);
-        Ok(Collider { to_local: world.inverse(), to_world: world, scale, field, list, cell, center: (lo + hi) * 0.5 })
+        clay.cell_size().ok_or("clay is empty")?;
+        let bounds = self.meshes.whole(id).map(|m| m.bounds()).ok_or("the clay has no mesh")?;
+        Collider::new(clay, bounds, self.scene.rest_world_matrix(id))
+    }
+
+    /// The clay a hair object sits on: its nearest clay ancestor, which
+    /// `groom` keeps the guides out of and film keeps the strands out of.
+    pub(super) fn hair_head(&self, id: u64) -> Option<u64> {
+        self.scene.ancestors(id).into_iter().find(|&a| self.scene.get(a).is_some_and(|o| o.shape == Shape::Clay))
+    }
+
+    /// The film strands of hair `id` (in its own space), kept out of the
+    /// clay it sits on as that clay is drawn, to the hair's lift
+    /// (`Hair::strands_kept_out`); `budget` caps the strand count (the
+    /// summary's sample). A hair under no clay gets exactly
+    /// `Hair::strands`; under one whose collider cannot be built (no mesh
+    /// yet) it gets them too, with the reason in `error` for the caller to
+    /// report. Film renders and `hair_summary` both take their strands
+    /// from here, so what the summary counts is what film draws.
+    pub(super) fn hair_strands(&self, id: u64, budget: Option<u32>) -> KeptStrands {
+        let Some(hair) = self.scene.get(id).and_then(|o| o.hair.as_ref()) else { return KeptStrands::default() };
+        let mut h = hair.clone();
+        if let Some(b) = budget {
+            h.strands = h.strands.min(b);
+        }
+        h.sanitize();
+        let head = self.hair_head(id);
+        let collider = head.map(|c| self.head_collider(c));
+        let head_collider = match &collider {
+            None => return KeptStrands { strands: h.strands(), ..Default::default() },
+            Some(Err(e)) => return KeptStrands { strands: h.strands(), head, error: Some(e.clone()), moved: 0 },
+            Some(Ok(c)) => c,
+        };
+        // At rest, in the hair's own space: the head's field is its rest
+        // shape, so the hair is placed at rest too (`pose::at_rest`'s
+        // matrices); film then places the strands where the pose puts the
+        // hair, and they follow it.
+        let to_world = self.scene.rest_world_matrix(id);
+        let scale = to_world.to_scale_rotation_translation().0.abs().max_element().max(1e-9);
+        let (strands, moved) = h.strands_kept_out(Some(&InHair::new(head_collider, to_world, h.lift * scale)));
+        KeptStrands { strands, moved, head, error: None }
     }
 
     /// Sample real fibers against nearby head clay, without hiding bad guides.
     pub(super) fn hair_summary(&self, id: u64) -> Value {
         let Some(hair) = self.scene.get(id).and_then(|o| o.hair.as_ref()) else { return Value::Null };
         let mut report = hair.coverage();
-        let world = self.scene.world_matrix(id);
-        let mut sample = hair.clone();
-        sample.strands = sample.strands.min(256);
-        let fibers = sample.strands();
+        if hair.fur.is_some()
+            && let Some(grown) = self.fur_reports.get(&id)
+        {
+            report["grown"] = grown.clone();
+        }
+        // At rest, as the strands are kept out (the colliders are rest fields).
+        let world = self.scene.rest_world_matrix(id);
+        let kept = self.hair_strands(id, Some(256));
+        let (fibers, lifted) = (kept.strands, kept.moved);
+        if let Some(e) = &kept.error {
+            report["warnings"].as_array_mut().unwrap().push(json!(format!("strands not kept out of the head: {e}")));
+        }
         let roots: Vec<_> = fibers.iter().map(|s| world.transform_point3(s.points[0])).collect();
         let middle = hair.center.map(|p| world.transform_point3(p)).unwrap_or_else(|| roots.iter().copied().sum::<Vec3>() / roots.len().max(1) as f32);
+        // The clay the hair sits on (whatever its size: a whole body under
+        // fur), and other head-sized clays near the roots.
+        let own = self.hair_head(id);
         let colliders: Vec<_> = self.scene.objects.iter().filter(|o| o.shape == Shape::Clay).filter_map(|o| {
+            if Some(o.id) == own {
+                return self.collider(o.id).ok();
+            }
             let (lo, hi) = self.meshes.whole(o.id)?.bounds();
             if (hi - lo).max_element() > 0.7 { return None; }
             let inverse = self.scene.world_matrix(o.id).inverse();
@@ -418,6 +606,10 @@ impl ClideApp {
         report["collision_check"] = json!(if colliders.is_empty() { "no nearby head clay" } else { "sampled against nearby head clay" });
         report["sampled_strands"] = json!(fibers.len());
         report["strands_inside_head"] = json!(inside);
+        report["strands_kept_out_of_head"] = json!(lifted);
+        if let Some(moved) = self.meshes.hair_cards_moved(id) {
+            report["cards_kept_out_of_head"] = json!(moved);
+        }
         if inside > 0 {
             report["warnings"].as_array_mut().unwrap().push(json!(format!("{inside}/{} sampled strands enter the head; move guides outside the scalp or increase grow.lift", fibers.len())));
         }
@@ -481,7 +673,7 @@ pub(super) fn unknown_blob_materials(scene: &Scene, id: u64) -> Vec<String> {
     clay.material_names().into_iter().filter(|n| !n.is_empty() && Material::find(&scene.materials, n).is_none()).collect()
 }
 
-const HAIR_KEYS: &[&str] = &["guides", "add_guides", "grow", "width", "taper", "cards", "spread", "root_color", "tip_color", "center", "mirror", "seed", "strands", "strand_width", "clump", "clump_size", "clump_levels", "frizz", "volume", "flyaways", "length_variation", "melanin_variation", "interpolate", "rise"];
+const HAIR_KEYS: &[&str] = &["guides", "add_guides", "grow", "fur", "lift", "width", "taper", "cards", "spread", "root_color", "tip_color", "center", "mirror", "seed", "strands", "strand_width", "clump", "clump_size", "clump_levels", "frizz", "volume", "flyaways", "length_variation", "melanin_variation", "interpolate", "rise"];
 const GROW_KEYS: &[&str] = &["on", "style", "center", "radii", "count", "length", "lift", "comb", "part", "mirror", "roots", "replace"];
 
 /// Validate before growing or mutating anything, including nested settings.
@@ -492,7 +684,7 @@ pub(super) fn validate_hair_keys(patch: &Value) -> Result<(), String> {
             return Err(format!("unknown hair setting {key}; use {}", HAIR_KEYS.join(", ")));
         }
     }
-    if let Some(grow) = patch.get("grow").filter(|v| !v.is_null()) {
+    if let Some(grow) = patch.get("grow").filter(|v| !v.is_null() && v.get("fur").and_then(Value::as_bool) != Some(true)) {
         let object = grow.as_object().ok_or("hair.grow must be an object")?;
         for key in object.keys() {
             if !GROW_KEYS.contains(&key.as_str()) {
@@ -503,40 +695,16 @@ pub(super) fn validate_hair_keys(patch: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// A clay that hair rests on (see `drape_strand`).
-struct Collider {
-    to_local: Mat4,
-    to_world: Mat4,
-    scale: f32,
-    field: crate::clay::Field,
-    list: Vec<u32>,
-    cell: f32,
-    /// Middle of its mesh (clay space): the way out from deep inside.
-    center: Vec3,
-}
-
-impl Collider {
-    /// `p` (world) moved out to at least `lift` outside the clay, and the
-    /// surface normal (world) if it touches the clay.
-    fn push_out(&self, p: Vec3, lift: f32) -> (Vec3, Option<Vec3>) {
-        let q = self.to_local.transform_point3(p);
-        let lift = lift / self.scale;
-        let touch = lift * 2.0 + self.cell * 0.5;
-        if self.field.far_side(q, &self.list, touch + self.cell) == Some(false) {
-            return (p, None);
-        }
-        let d = |x: Vec3| self.field.sample(x, &self.list).0;
-        let dq = d(q);
-        if dq >= touch {
-            return (p, None);
-        }
-        let e = self.cell * 0.5;
-        let grad = Vec3::new(d(q + Vec3::X * e) - d(q - Vec3::X * e), d(q + Vec3::Y * e) - d(q - Vec3::Y * e), d(q + Vec3::Z * e) - d(q - Vec3::Z * e));
-        // Deep inside the field is flat (it is clamped): head outward.
-        let out = grad.try_normalize().unwrap_or_else(|| (q - self.center).normalize_or(Vec3::Y));
-        let n = self.to_world.transform_vector3(out).normalize_or(Vec3::Y);
-        (self.to_world.transform_point3(q + out * (lift - dq).max(0.0)), Some(n))
-    }
+/// A hair's film strands and what kept them out of its head.
+#[derive(Default)]
+pub(super) struct KeptStrands {
+    pub(super) strands: Vec<crate::hair::Strand>,
+    /// Strands the head moved.
+    pub(super) moved: usize,
+    /// The clay the hair sits on, if any.
+    pub(super) head: Option<u64>,
+    /// Why the strands could not be kept out of it.
+    pub(super) error: Option<String>,
 }
 
 /// One guide hung like a chain from `root`: it leaves the scalp along its

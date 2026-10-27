@@ -51,6 +51,10 @@ pub struct Link {
     /// big sculpted clay is mirrored again only when its source changes.
     #[serde(skip)]
     pub from: Option<Box<Clay>>,
+    /// The source Poly the copy's was mirrored from (not saved), when the
+    /// copy reflects its geometry (`axis`), likewise.
+    #[serde(skip)]
+    pub from_poly: Option<Box<crate::poly::Poly>>,
 }
 
 impl Link {
@@ -212,6 +216,9 @@ fn mirror_content(scene: &Scene, s: &Object, x: &mut Object, axis: Option<u8>) {
     x.hair = s.hair.clone();
     x.kit = s.kit.clone();
     x.terrain = s.terrain.clone();
+    // An imported mesh: shared (`choose_axis` gives it no axis, so the
+    // copy reflects it by its matrix, as a Poly's).
+    x.mesh = s.mesh.clone();
     x.bake = s.bake;
     x.pivot = flip_axis(s.pivot, axis);
     x.damage = s.damage.clone();
@@ -247,6 +254,21 @@ fn mirror_content(scene: &Scene, s: &Object, x: &mut Object, axis: Option<u8>) {
         x.clay = s.clay.as_ref().map(|c| if axis == Some(0) { c.mirrored_x() } else { c.clone() });
         if let Some(l) = &mut x.link {
             l.from = s.clay.clone().map(Box::new);
+        }
+    }
+    // Poly: shared when the copy's matrix reflects it (`choose_axis`
+    // gives a Poly no axis), else mirrored again only when its source
+    // changed. A source made clay in place leaves the copy none.
+    match axis {
+        None => x.poly = s.poly.clone(),
+        Some(a) => {
+            let fresh = x.link.as_ref().and_then(|l| l.from_poly.as_deref()) == s.poly.as_ref() && x.poly.is_some() == s.poly.is_some();
+            if !fresh {
+                x.poly = s.poly.as_ref().map(|p| p.mirrored(a as usize));
+                if let Some(l) = &mut x.link {
+                    l.from_poly = s.poly.clone().map(Box::new);
+                }
+            }
         }
     }
     // The bone on the other side, when the rig has one.
@@ -381,7 +403,7 @@ fn copy_tree(scene: &mut Scene, s: u64, parent: Option<u64>, plane: (Vec3, f32),
     x.name = unique(scene, &name.unwrap_or_else(|| side_name(&src.name)));
     x.parent = parent.or(src.parent);
     x.follow = None;
-    x.link = Some(Link { source: s, normal: plane.0, d: plane.1, axis, from: None });
+    x.link = Some(Link { source: s, normal: plane.0, d: plane.1, axis, from: None, from_poly: None });
     let id = add_object(scene, x);
     made.insert(s, id);
     out.objects.push(id);
@@ -650,7 +672,7 @@ pub fn named_point(o: &Object, name: &str) -> Option<Vec3> {
     let clay = o.clay.as_ref()?;
     let b = clay.blobs.iter().find(|b| b.name == name)?;
     let p = match &b.form {
-        Form::Sphere { center, .. } | Form::Ellipsoid { center, .. } | Form::Box { center, .. } | Form::Torus { center, .. } | Form::Extrude { center, .. } | Form::Lathe { center, .. } => *center,
+        Form::Sphere { center, .. } | Form::Ellipsoid { center, .. } | Form::Box { center, .. } | Form::Torus { center, .. } | Form::Lid { center, .. } | Form::Extrude { center, .. } | Form::Lathe { center, .. } => *center,
         Form::Capsule { a, b, .. } => (*a + *b) * 0.5,
         Form::Sweep { points, .. } | Form::Chain { points, .. } | Form::Membrane { points, .. } | Form::Band { points, .. } => points.iter().copied().sum::<Vec3>() / points.len().max(1) as f32,
         _ => return None,
@@ -755,8 +777,129 @@ pub struct Posed {
     pub objects: Vec<u64>,
     pub blobs: Vec<String>,
     pub strokes: usize,
-    /// Blob forms whose roll a turn can only follow approximately.
-    pub approximate: Vec<String>,
+    /// Blob forms whose roll a turn can only follow approximately, each
+    /// with why.
+    pub approximate: Vec<(String, &'static str)>,
+}
+
+/// One rigid move of a pose call: `bone` and the bones under it by
+/// `delta` (rig rest space), plus the blobs named in `extra`.
+#[derive(Clone, Debug)]
+pub struct Move {
+    pub bone: String,
+    pub delta: Mat4,
+    pub extra: Vec<String>,
+}
+
+/// A mirrored blob written out as its two sides (`split_mirrored`).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Split {
+    pub from: String,
+    /// The stored side (its name kept) and the copy across x = 0, which
+    /// comes just before it (where `Field::new` drew the reflection).
+    pub into: [String; 2],
+    pub why: String,
+}
+
+/// `bone` and every bone under it, in the rig's order of discovery.
+pub fn bone_set(rig: &Rig, bone: &str) -> Vec<String> {
+    let mut set: Vec<String> = vec![bone.to_string()];
+    loop {
+        let more: Vec<String> = rig.bones.iter().filter(|b| b.parent.as_ref().is_some_and(|p| set.contains(p)) && !set.contains(&b.name)).map(|b| b.name.clone()).collect();
+        if more.is_empty() {
+            return set;
+        }
+        set.extend(more);
+    }
+}
+
+/// The bone the reflected side of a mirrored blob on `bone` rides: the
+/// other side's bone when the rig has it (as `Field::new` names it),
+/// else the same bone.
+pub fn reflected_bone(rig: Option<&Rig>, bone: &str) -> String {
+    match (mirror_name(bone), rig) {
+        (Some(other), Some(r)) if r.bone_index(&other).is_some() => other,
+        _ => bone.to_string(),
+    }
+}
+
+/// The name of a split blob's copy across x = 0: `.L` and `.R` (and the
+/// other side tokens) swapped, else `.R` added; an unnamed blob's copy is
+/// unnamed too.
+pub fn split_name(name: &str) -> String {
+    if name.is_empty() {
+        return String::new();
+    }
+    swap_side_token(name).unwrap_or_else(|| format!("{name}.R"))
+}
+
+/// Whether the motions of a mirrored blob's two sides are each other's
+/// reflection across x = 0, so the blob can stay one mirrored blob.
+pub fn mirror_symmetric(stored: Mat4, reflected: Mat4) -> bool {
+    let f = Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0));
+    (f * stored * f).abs_diff_eq(reflected, 1e-5)
+}
+
+/// Writes the mirrored blob at `index` out as two blobs with `mirror`
+/// off: itself (the stored side, name and bone kept) and just before it
+/// its copy across x = 0 (`flip` turned, so it is exactly the reflected
+/// prim `Field::new` made, in the same place in the prim order: the
+/// field, smooth blends included, is unchanged; the other side's name,
+/// and bone when `rig` has it). The stored side moves up one index.
+/// Refused, with nothing changed, when the blob is not mirrored, the
+/// copy's name is taken or the clay is full.
+pub fn split_mirrored(clay: &mut Clay, index: usize, rig: Option<&Rig>) -> Result<(String, String), String> {
+    let b = clay.blobs.get(index).ok_or_else(|| format!("no blob {index}"))?;
+    if !b.mirror {
+        return Err(format!("blob {} is not mirrored", if b.name.is_empty() { index.to_string() } else { b.name.clone() }));
+    }
+    if clay.blobs.len() >= crate::clay::MAX_BLOBS {
+        return Err(format!("splitting {} would pass {} blobs", b.name, crate::clay::MAX_BLOBS));
+    }
+    let name = split_name(&b.name);
+    if !name.is_empty() && clay.blobs.iter().any(|x| x.name == name) {
+        return Err(format!("cannot split {} into its two sides: a blob named {name} already exists (rename it first)", b.name));
+    }
+    let mut copy = b.clone();
+    copy.mirror = false;
+    copy.flip = !b.flip;
+    copy.name = name.clone();
+    copy.bone = if b.bone.is_empty() { String::new() } else { reflected_bone(rig, &b.bone) };
+    let stored = b.name.clone();
+    clay.blobs[index].mirror = false;
+    clay.blobs.insert(index, copy);
+    Ok((stored, name))
+}
+
+/// The motion of each side of every mirrored blob of `clay` under
+/// `moves` (bones by `bone_set` of `rig`, blobs by name): the mirrored
+/// blobs whose two sides would not move as each other's reflection, with
+/// why. A blob none of the moves reaches is not listed.
+pub fn asymmetric_blobs(clay: &Clay, rig: &Rig, moves: &[Move]) -> Vec<(usize, String)> {
+    let sets: Vec<Vec<String>> = moves.iter().map(|m| bone_set(rig, &m.bone)).collect();
+    let motion = |bone: &str, name: &str| -> Option<(usize, Mat4)> {
+        moves.iter().zip(&sets).enumerate().find(|(_, (m, set))| set.iter().any(|b| b == bone) || (!name.is_empty() && m.extra.iter().any(|n| n == name))).map(|(i, (m, _))| (i, m.delta))
+    };
+    let mut out = Vec::new();
+    for (i, b) in clay.blobs.iter().enumerate().filter(|(_, b)| b.mirror) {
+        let other_bone = reflected_bone(Some(rig), &b.bone);
+        let (here, there) = (motion(&b.bone, &b.name), motion(&other_bone, &split_name(&b.name)));
+        if here.is_none() && there.is_none() {
+            continue;
+        }
+        let (a, c) = (here.map_or(Mat4::IDENTITY, |m| m.1), there.map_or(Mat4::IDENTITY, |m| m.1));
+        if mirror_symmetric(a, c) {
+            continue;
+        }
+        let label = |m: Option<(usize, Mat4)>| m.map_or("nothing".to_string(), |(k, _)| moves[k].bone.clone());
+        let why = match (here, there) {
+            (Some(x), Some(y)) if x.0 == y.0 => format!("{}'s move is not mirror-symmetric across x = 0, so each side moves by it on its own", moves[x.0].bone),
+            (Some(_), None) | (None, Some(_)) => format!("only one side moves ({} moves the stored side, {} the other)", label(here), label(there)),
+            _ => format!("its sides move by different moves ({} and {}) that are not each other's mirror", label(here), label(there)),
+        };
+        out.push((i, why));
+    }
+    out
 }
 
 /// Moves bone `bone` of `rig_id` (and the bones under it) by the rigid
@@ -770,14 +913,7 @@ pub fn pose_rest(scene: &mut Scene, rig_id: u64, bone: &str, delta: Mat4, carry:
         return Err(format!("{} has no bone {bone}; bones: {:?}", o.name, rig.bones.iter().map(|b| &b.name).collect::<Vec<_>>()));
     }
     // The bone and everything under it.
-    let mut set: Vec<String> = vec![bone.to_string()];
-    loop {
-        let more: Vec<String> = rig.bones.iter().filter(|b| b.parent.as_ref().is_some_and(|p| set.contains(p)) && !set.contains(&b.name)).map(|b| b.name.clone()).collect();
-        if more.is_empty() {
-            break;
-        }
-        set.extend(more);
-    }
+    let set = bone_set(rig, bone);
     let mut out = Posed { bones: set.clone(), ..Default::default() };
     at_rest(scene, |scene| {
         let o = scene.get_mut(rig_id).expect("checked");
@@ -795,8 +931,8 @@ pub fn pose_rest(scene: &mut Scene, rig_id: u64, bone: &str, delta: Mat4, carry:
         }
         if let Some(clay) = o.clay.as_mut() {
             for b in clay.blobs.iter_mut().filter(|b| set.contains(&b.bone) || (!b.name.is_empty() && extra.contains(&b.name))) {
-                if !transform_form(&mut b.form, delta, b.flip) {
-                    out.approximate.push(b.name.clone());
+                if let Err(why) = transform_form_exact(&mut b.form, delta, b.flip) {
+                    out.approximate.push((b.name.clone(), why));
                 }
                 out.blobs.push(if b.name.is_empty() { b.bone.clone() } else { b.name.clone() });
             }
@@ -836,10 +972,16 @@ pub fn pose_rest(scene: &mut Scene, rig_id: u64, bone: &str, delta: Mat4, carry:
     Ok(out)
 }
 
+/// Why a polygon profile's turn is approximate.
+const ROLL: &str = "its polygon profile's roll about the path (or axis) is set by the path, not stored, so a turn moves the path exactly but may roll the profile; round tubes (profile {circle}, field segments) are exact";
+
 /// Moves a blob's form rigidly by `m` (object space). `flip`: the blob is
-/// stored mirrored (its form is read at -x). Returns false when only an
-/// approximation was possible (the roll of extrude and sweep profiles).
-pub fn transform_form(form: &mut Form, m: Mat4, flip: bool) -> bool {
+/// stored mirrored (its form is read at -x). Says why when the result is
+/// only approximate:
+/// extrudes and polygon-profile sweeps (their profile's roll is not
+/// stored) and human blobs (not moved). Round tubes are exact: their
+/// profile has no roll.
+pub fn transform_form_exact(form: &mut Form, m: Mat4, flip: bool) -> Result<(), &'static str> {
     let f = Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0));
     // A flipped blob is stored on the other side: move it by the mirrored motion.
     let m = if flip { f * m * f } else { m };
@@ -851,6 +993,7 @@ pub fn transform_form(form: &mut Form, m: Mat4, flip: bool) -> bool {
         *r = Vec3::new(x, y, z) * (180.0 / std::f32::consts::PI);
     };
     let turned = q.angle_between(Quat::IDENTITY) > 1e-5;
+    let round = form.round_tube();
     match form {
         Form::Sphere { center, .. } => p(center),
         Form::Ellipsoid { center, rotate, .. } | Form::Box { center, rotate, .. } | Form::Torus { center, rotate, .. } | Form::Mesh { center, rotate, .. } => {
@@ -864,7 +1007,9 @@ pub fn transform_form(form: &mut Form, m: Mat4, flip: bool) -> bool {
         Form::Extrude { center, axis, .. } => {
             p(center);
             d(axis);
-            return !turned;
+            if turned {
+                return Err(ROLL);
+            }
         }
         Form::Lathe { center, axis, .. } => {
             p(center);
@@ -872,23 +1017,30 @@ pub fn transform_form(form: &mut Form, m: Mat4, flip: bool) -> bool {
         }
         Form::Sweep { points, .. } => {
             points.iter_mut().for_each(p);
-            return !turned;
+            if turned && !round {
+                return Err(ROLL);
+            }
         }
         Form::Chain { points, .. } | Form::Membrane { points, .. } => points.iter_mut().for_each(p),
         Form::Band { points, normal, .. } => {
             points.iter_mut().for_each(p);
             d(normal);
         }
-        Form::Shell { source, .. } => return transform_form(source, m, false),
+        Form::Lid { center, forward, up, .. } => {
+            p(center);
+            d(forward);
+            d(up);
+        }
+        Form::Shell { source, .. } => return transform_form_exact(source, m, false),
         Form::Array { source, step, center, axis, points, .. } => {
-            let ok = transform_form(source, m, false);
+            let ok = transform_form_exact(source, m, false);
             d(step);
             p(center);
             d(axis);
             points.iter_mut().for_each(p);
             return ok;
         }
-        Form::Human { .. } => return false,
+        Form::Human { .. } => return Err("a human blob is built from its own body mesh and is not moved"),
     }
-    true
+    Ok(())
 }

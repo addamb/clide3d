@@ -10,6 +10,7 @@
 mod adaptive;
 mod app;
 mod bake;
+mod character;
 mod band;
 mod brush;
 mod camera;
@@ -43,7 +44,9 @@ mod instancing_checks;
 mod gltf;
 mod export_atlas;
 mod glb_read;
+mod groom;
 mod groups;
+mod guides;
 mod hair;
 #[cfg(test)]
 mod harness;
@@ -52,6 +55,7 @@ mod kitbash;
 mod layers;
 mod ledger;
 mod levels;
+mod lids;
 mod mask;
 mod material;
 mod mcp;
@@ -64,7 +68,10 @@ mod overlay;
 mod material_management;
 mod replies;
 mod paint;
+mod poly;
+mod refplane;
 mod pose;
+mod quality;
 #[cfg(test)]
 mod pose_tests;
 mod progress;

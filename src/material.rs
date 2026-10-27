@@ -43,6 +43,12 @@ pub struct Material {
     /// scene units (meters). Red goes furthest in skin.
     #[serde(default = "default_scatter")]
     pub scatter: [f32; 3],
+    /// Scales every `scatter` distance (Stage 4d): above 1 the
+    /// Christensen-Burley profile spreads wider and the falloff at shadow
+    /// edges is softer (the stylised skin presets use 1.6). Missing in
+    /// files saved before it: 1, as they rendered.
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub subsurface_radius: f32,
     /// Procedural skin bump and roughness variation (film and bake).
     #[serde(default)]
     pub pores: f32,
@@ -156,6 +162,17 @@ fn is_zero(v: &f32) -> bool {
     *v == 0.0
 }
 
+fn one() -> f32 {
+    1.0
+}
+
+fn is_one(v: &f32) -> bool {
+    *v == 1.0
+}
+
+/// Bounds of `subsurface_radius`.
+pub const SUBSURFACE_RADIUS: (f32, f32) = (0.1, 4.0);
+
 /// Human skin's mean free path (Jensen et al. 2001), in meters: right for
 /// a character about 1.7 units tall.
 fn default_scatter() -> [f32; 3] {
@@ -163,7 +180,7 @@ fn default_scatter() -> [f32; 3] {
 }
 
 /// (name, roughness, metallic, clearcoat, sheen, use).
-pub const PRESETS: [(&str, f32, f32, f32, f32, &str); 18] = [
+pub const PRESETS: [(&str, f32, f32, f32, f32, &str); 22] = [
     ("clay", 0.55, 0.0, 0.0, 0.0, "default; soft satin"),
     ("skin", 0.48, 0.0, 0.0, 0.04, "skin"),
     ("lips", 0.36, 0.0, 0.08, 0.0, "soft moist lips; paint rose [0.70, 0.43, 0.42]"),
@@ -182,7 +199,22 @@ pub const PRESETS: [(&str, f32, f32, f32, f32, &str); 18] = [
     ("glass", 0.02, 0.0, 0.0, 0.0, "clear see-through glass (color tints it): windows, bottles, lenses"),
     ("water", 0.02, 0.0, 0.0, 0.0, "see-through water, ice, tears"),
     ("crystal", 0.05, 0.0, 0.0, 0.0, "see-through gems and crystal that sparkle (strong bending)"),
+    // Stage 4d: the soft, saturated, forgiving look of stylised feature
+    // animation (see `Material::preset` for their other values).
+    ("skin_stylized", 0.45, 0.0, 0.0, 0.15, "stylised character skin: soft wide subsurface, saturated, no pores, soft rim"),
+    ("lips_stylized", 0.34, 0.0, 0.12, 0.05, "stylised lips: soft and a little moist; paint rose [0.80, 0.45, 0.45]"),
+    ("cheek_blush", 0.5, 0.0, 0.0, 0.18, "stylised skin for cheeks, nose tip and ears: redder glow; paint a soft pink [0.92, 0.62, 0.58]"),
+    ("fabric_soft", 0.85, 0.0, 0.0, 0.5, "stylised cloth: soft sheen, no weave texture"),
 ];
+
+/// The stylised skin presets' scatter distances (before
+/// `subsurface_radius`): every color reaching further than in realistic
+/// skin, red furthest ahead, so the light that comes back out is more
+/// saturated (red/green 2.8 and red/blue 8, against 2.6 and 5.3 for
+/// `skin`). With the plan's subsurface 0.6 (less than skin's 0.8, so more
+/// of the light keeps a sharp edge) and radius 1.6, this is what widens
+/// the shadow edge to 1.5x realistic skin's (`stylized_skin_softer`).
+pub const STYLIZED_SCATTER: [f32; 3] = [0.0056, 0.0020, 0.0007];
 
 impl Default for Material {
     fn default() -> Self {
@@ -201,11 +233,33 @@ impl Material {
             metallic,
             clearcoat,
             sheen,
-            subsurface: if name == "skin" { 0.8 } else if name == "lips" { 0.5 } else { 0.0 },
+            subsurface: match name {
+                "skin" => 0.8,
+                "lips" | "lips_stylized" => 0.5,
+                "skin_stylized" => 0.6,
+                "cheek_blush" => 0.7,
+                _ => 0.0,
+            },
             pores: if name == "skin" { 0.65 } else { 0.0 },
-            mottling: if name == "skin" { 0.4 } else { 0.0 },
-            skin_specular: if matches!(name, "skin" | "lips") { 0.8 } else { 0.0 },
-            scatter: if name == "lips" { [0.0012, 0.0006, 0.0003] } else { default_scatter() },
+            mottling: match name {
+                "skin" => 0.4,
+                "skin_stylized" | "cheek_blush" => 0.1,
+                _ => 0.0,
+            },
+            skin_specular: match name {
+                "skin" | "lips" => 0.8,
+                "skin_stylized" | "cheek_blush" => 0.4,
+                "lips_stylized" => 0.5,
+                _ => 0.0,
+            },
+            scatter: match name {
+                "lips" | "lips_stylized" => [0.0012, 0.0006, 0.0003],
+                "skin_stylized" => STYLIZED_SCATTER,
+                // Redder still: blush is blood close under the skin.
+                "cheek_blush" => [0.0064, 0.0020, 0.0007],
+                _ => default_scatter(),
+            },
+            subsurface_radius: if matches!(name, "skin_stylized" | "lips_stylized" | "cheek_blush") { 1.6 } else { 1.0 },
             emission: if name == "glow" { 2.5 } else { 0.0 },
             transmission: if matches!(name, "glass" | "water" | "crystal") { 1.0 } else { 0.0 },
             ior: match name {
@@ -276,6 +330,12 @@ impl Material {
         Material::find(library, name).unwrap_or_default()
     }
 
+    /// The per-color scatter distances the renderer uses: `scatter`
+    /// times `subsurface_radius` (CPU and GPU both read this).
+    pub fn scatter_radius(&self) -> Vec3 {
+        Vec3::from(self.scatter) * self.subsurface_radius
+    }
+
     /// Values packed for the shader: roughness, metallic, clearcoat, sheen.
     pub fn surface(&self) -> [f32; 4] {
         [self.roughness, self.metallic, self.clearcoat, self.sheen]
@@ -337,6 +397,7 @@ impl Material {
         self.variation_scale = if self.variation_scale.is_finite() { self.variation_scale.clamp(0.0, 100.0) } else { 0.0 };
         self.dirt_color = self.dirt_color.map(|c| fix(c, 0.2));
         self.scatter = self.scatter.map(|v| if v.is_finite() { v.clamp(1e-5, 1.0) } else { 0.002 });
+        self.subsurface_radius = if self.subsurface_radius.is_finite() { self.subsurface_radius.clamp(SUBSURFACE_RADIUS.0, SUBSURFACE_RADIUS.1) } else { 1.0 };
         self.name = self.name.trim().chars().take(64).collect();
         self.detail = self.detail.take().map(|d| d.trim().chars().take(64).collect());
         self.detail_scale = if self.detail_scale.is_finite() { self.detail_scale.clamp(0.0, 100.0) } else { 0.0 };
@@ -453,5 +514,43 @@ mod tests {
         assert_eq!((m.detail_name(), m.detail_scale, m.detail_strength, m.detail_color, m.detail_rotate), (Some("knit"), 0.0, 4.0, 0.35, 90.0));
         let back: Material = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
         assert_eq!(back, m);
+    }
+
+    /// Stage 4d: the stylised presets carry the plan's values, survive a
+    /// save and load (subsurface_radius stored), and a material saved
+    /// before the field loads at 1.
+    #[test]
+    fn stylized_presets_have_the_plan_values() {
+        let s = Material::preset("skin_stylized").unwrap();
+        assert_eq!((s.subsurface, s.subsurface_radius, s.pores, s.mottling, s.roughness, s.skin_specular, s.sheen), (0.6, 1.6, 0.0, 0.1, 0.45, 0.4, 0.15));
+        assert!(s.detail_name().is_none(), "no pore texture");
+        assert_eq!(s.scatter, STYLIZED_SCATTER);
+        let real = Material::preset("skin").unwrap();
+        let ratio = |m: &Material| (m.scatter[0] / m.scatter[1], m.scatter[0] / m.scatter[2]);
+        assert!(ratio(&s).0 > ratio(&real).0 && ratio(&s).1 > ratio(&real).1, "more saturated: {:?} against {:?}", ratio(&s), ratio(&real));
+        assert!(s.scatter_radius().cmpge(real.scatter_radius() * 1.6 - Vec3::splat(1e-7)).all(), "wider: {} against {}", s.scatter_radius(), real.scatter_radius());
+        for name in ["skin_stylized", "lips_stylized", "cheek_blush", "fabric_soft"] {
+            let m = Material::preset(name).unwrap();
+            let mut checked = m.clone();
+            checked.sanitize();
+            assert_eq!(checked, m, "{name} is within its bounds");
+            let back: Material = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+            assert_eq!(back, m, "{name} round-trips");
+        }
+        assert!(serde_json::to_string(&s).unwrap().contains("\"subsurface_radius\":1.6"));
+        assert!(!serde_json::to_string(&real).unwrap().contains("subsurface_radius"));
+        let old: Material = serde_json::from_str(r#"{"name":"face","subsurface":0.8}"#).unwrap();
+        assert_eq!(old.subsurface_radius, 1.0);
+        assert_eq!(old.scatter_radius(), Vec3::from(old.scatter));
+        let mut wild = Material { subsurface_radius: f32::NAN, ..Material::default() };
+        wild.sanitize();
+        assert_eq!(wild.subsurface_radius, 1.0);
+        wild.subsurface_radius = 99.0;
+        wild.sanitize();
+        assert_eq!(wild.subsurface_radius, SUBSURFACE_RADIUS.1);
+        let lips = Material::preset("lips_stylized").unwrap();
+        assert!(lips.subsurface > 0.0 && lips.pores == 0.0 && lips.subsurface_radius == 1.6);
+        let fabric = Material::preset("fabric_soft").unwrap();
+        assert!(fabric.subsurface == 0.0 && fabric.sheen >= 0.5 && fabric.detail_name().is_none());
     }
 }

@@ -49,7 +49,52 @@ pub struct Eye {
     /// Where the lids touch the eye (see `Lids`); set by `create_human`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lids: Option<Lids>,
+    /// Realistic (fibers, crypts, veins) or stylised (Stage 4d: a clean
+    /// radial iris with a crisp limbal ring and a few soft fibers).
+    #[serde(skip_serializing_if = "EyeStyle::is_realistic")]
+    pub style: EyeStyle,
+    /// Scales `iris_size` (1..1.6): the big irises of stylised eyes. The
+    /// iris stays within `MAX_IRIS` of the eye's width.
+    #[serde(skip_serializing_if = "is_one")]
+    pub iris_scale: f32,
+    /// A small glowing spot on the iris, up and to the right in the eye's
+    /// own frame, seen through the cornea: the catch-light of animated
+    /// eyes, there whatever the lighting.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub catchlight: bool,
 }
+
+/// How an eye is drawn (Stage 4d).
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EyeStyle {
+    #[default]
+    Realistic,
+    Stylized,
+}
+
+impl EyeStyle {
+    fn is_realistic(&self) -> bool {
+        *self == EyeStyle::Realistic
+    }
+}
+
+fn is_one(v: &f32) -> bool {
+    *v == 1.0
+}
+
+/// Widest iris, as a part of the eye's width.
+pub const MAX_IRIS: f32 = 0.9;
+/// Bounds of `Eye::iris_scale`.
+pub const IRIS_SCALE: (f32, f32) = (1.0, 1.6);
+/// The catch-light's glow (`Material::emission`).
+const CATCHLIGHT_GLOW: f32 = 4.0;
+
+/// What `style: stylized` fills in when a call does not say otherwise
+/// (stored, so the eye reads back as it is drawn): iris_scale 1.3, a
+/// flatter cornea (0.03 against 0.05), no veins, a crisp limbal ring
+/// (0.8), a catch-light.
+pub const STYLIZED: [(&str, f64); 4] = [("iris_scale", 1.3), ("cornea", 0.03), ("veins", 0.0), ("limbal_ring", 0.8)];
 
 /// The lid margins (the lid edges around the eye opening), in the eye's
 /// parent space (a human head's space), each from the inner corner to the
@@ -73,6 +118,9 @@ impl Default for Eye {
             veins: 0.4,
             limbal_ring: 0.6,
             lids: None,
+            style: EyeStyle::Realistic,
+            iris_scale: 1.0,
+            catchlight: false,
         }
     }
 }
@@ -93,6 +141,8 @@ const IRIS: u32 = 1;
 const CORNEA: u32 = 2;
 const TEAR: u32 = 3;
 const CARUNCLE: u32 = 4;
+/// Present only on eyes with a catch-light.
+const CATCHLIGHT: u32 = 5;
 
 fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
     let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
@@ -117,7 +167,8 @@ impl Eye {
     pub fn sanitize(&mut self) {
         let fix = |v: f32, lo: f32, hi: f32, d: f32| if v.is_finite() { v.clamp(lo, hi) } else { d };
         let d = Eye::default();
-        self.iris_size = fix(self.iris_size, 0.05, 0.9, d.iris_size);
+        self.iris_size = fix(self.iris_size, 0.05, MAX_IRIS, d.iris_size);
+        self.iris_scale = fix(self.iris_scale, IRIS_SCALE.0, IRIS_SCALE.1, 1.0);
         self.pupil_size = fix(self.pupil_size, 0.05, 0.95, d.pupil_size);
         self.cornea = fix(self.cornea, 0.0, 0.2, d.cornea);
         self.veins = fix(self.veins, 0.0, 1.0, d.veins);
@@ -136,12 +187,41 @@ impl Eye {
         }
     }
 
+    /// The iris width drawn (a part of the eye's width): `iris_size`
+    /// times `iris_scale`, at most `MAX_IRIS`.
+    pub fn iris_width(&self) -> f32 {
+        (self.iris_size * self.iris_scale).min(MAX_IRIS)
+    }
+
+    /// Applies `style: stylized`'s values (`STYLIZED`) except those
+    /// `given` names, and a catch-light unless `given` has catchlight.
+    pub fn stylize(&mut self, given: &dyn Fn(&str) -> bool) {
+        self.style = EyeStyle::Stylized;
+        for (k, v) in STYLIZED {
+            if given(k) {
+                continue;
+            }
+            let v = v as f32;
+            match k {
+                "iris_scale" => self.iris_scale = v,
+                "cornea" => self.cornea = v,
+                "veins" => self.veins = v,
+                "limbal_ring" => self.limbal_ring = v,
+                _ => unreachable!("STYLIZED keys"),
+            }
+        }
+        if !given("catchlight") {
+            self.catchlight = true;
+        }
+    }
+
     /// Angles from +Z of the pupil edge, iris edge, and cornea edge.
     fn angles(&self) -> (f32, f32, f32) {
         let mut e = self.clone();
         e.sanitize();
-        let iris = e.iris_size.asin();
-        let pupil = (e.iris_size * e.pupil_size).asin();
+        let size = e.iris_width();
+        let iris = size.asin();
+        let pupil = (size * e.pupil_size).asin();
         (pupil, iris, (iris * 1.04).min(FRAC_PI_2))
     }
 
@@ -177,11 +257,20 @@ impl Eye {
         (around * rho + Vec3::Z * z, n)
     }
 
+    /// How far the cornea's crown reaches past the ball (radius 0.5), in
+    /// eye widths: nothing of the eye is farther from its centre than
+    /// 0.5 plus this. Lids clear it (`lids.rs`).
+    pub fn cornea_bulge(&self) -> f32 {
+        let c = if self.cornea.is_finite() { self.cornea.clamp(0.0, 0.2) } else { Eye::default().cornea };
+        c + 0.012
+    }
+
     /// Height of the cornea dome over the limbus plane at radius `rho`.
     fn cornea_at(&self, rho: f32) -> (Vec3, f32) {
         let (_, _, edge) = self.angles();
         let rc = 0.5 * edge.sin();
         let zc = 0.5 * edge.cos() + 0.0006;
+        // (Summed in this order: the realistic eye is pinned bit for bit.)
         let apex = 0.5 + self.cornea.clamp(0.0, 0.2) + 0.012;
         // A steep rim: no thin glass wedge where the cornea meets the white
         // (light bounces around inside one and darkens the limbus).
@@ -260,6 +349,10 @@ impl Eye {
             }
         }
         crate::bake::tangents(&mut mesh);
+        // Before the cornea, so the viewport draws it under the dome.
+        if eye.catchlight {
+            catchlight(&mut mesh, &eye, &mut push);
+        }
 
         // Cornea: a clear dome from the limbus over the iris.
         let base = mesh.vertices.len() as u32;
@@ -293,6 +386,37 @@ impl Eye {
             caruncle(&mut mesh, l, &mut push);
         }
         mesh
+    }
+}
+
+/// The catch-light: a small glowing disc lying on the iris (a hair above
+/// it, so it neither floats under the cornea nor shadows the iris), up
+/// and to the right of the pupil in the eye's frame, seen through the
+/// cornea's refraction. Its own material slot (`CATCHLIGHT`) glows white;
+/// its area is so small that the light it gives the scene is lost in the
+/// render's noise (measured in `film::style_checks`).
+fn catchlight(mesh: &mut Mesh, eye: &Eye, push: &mut Push) {
+    mesh.materials.push(Material { name: "catchlight".into(), roughness: 1.0, metallic: 0.0, clearcoat: 0.0, sheen: 0.0, emission: CATCHLIGHT_GLOW, ..Material::default() });
+    let (pupil, iris, _) = eye.angles();
+    // Between the pupil's edge and the iris's, 45 degrees up.
+    let t = pupil + (iris - pupil) * 0.35;
+    let p = std::f32::consts::FRAC_PI_4;
+    let (center, n) = eye.surface_at(t, p);
+    let radius = 0.5 * iris.sin() * 0.16;
+    let center = center + n * 0.0015;
+    let side = n.cross(Vec3::Y).normalize_or(Vec3::X);
+    let up = side.cross(n);
+    let base = mesh.vertices.len() as u32;
+    let segments = 24;
+    push(mesh, center, n, Vec3::ONE, CATCHLIGHT, Vec2::ZERO);
+    for k in 0..segments {
+        let a = TAU * k as f32 / segments as f32;
+        // A soft oval, a little wider than tall.
+        push(mesh, center + (side * a.cos() * 1.2 + up * a.sin()) * radius, n, Vec3::ONE, CATCHLIGHT, Vec2::ZERO);
+    }
+    // Counter-clockwise seen from outside (the viewport culls back faces).
+    for k in 0..segments as u32 {
+        mesh.indices.extend_from_slice(&[base, base + 1 + (k + 1) % segments as u32, base + 1 + k]);
     }
 }
 
@@ -481,6 +605,19 @@ fn paint_texture(eye: &Eye) -> Textures {
             let c = Vec3::from(eye.pupil_color);
             return [c.x, c.y, c.z, -0.3, 0.3];
         }
+        if t < iris && eye.style == EyeStyle::Stylized {
+            // Stylised: a clean radial gradient, lighter toward the pupil,
+            // a few soft fibers, a crisp dark limbal ring.
+            let u = (t - pupil) / (iris - pupil);
+            let light = (iris_color * 1.45 + Vec3::splat(0.08)).min(Vec3::ONE);
+            let mut c = light.lerp(iris_color, smoothstep(0.0, 0.85, u));
+            let fibers = fbm(p * 14.0, u * 2.0, 1.0);
+            c *= 0.92 + 0.16 * fibers;
+            c *= 1.0 - eye.limbal_ring * 0.85 * smoothstep(0.82, 0.97, u);
+            c *= 0.7 + 0.3 * smoothstep(0.0, 0.05, u);
+            let c = c.clamp(Vec3::ZERO, Vec3::ONE);
+            return [c.x, c.y, c.z, fibers * 0.15, 0.4];
+        }
         if t < iris {
             let u = (t - pupil) / (iris - pupil);
             // Fibers: streaks fanning out, a little wavy.
@@ -522,7 +659,7 @@ fn paint_texture(eye: &Eye) -> Textures {
         if t > 2.0 {
             c = c.lerp(Vec3::new(0.85, 0.55, 0.55), smoothstep(2.0, 2.8, t) * 0.45);
         }
-        let mottle = fbm(p * 8.0, s * 8.0, 9.0);
+        let mottle = if eye.style == EyeStyle::Stylized { 0.5 } else { fbm(p * 8.0, s * 8.0, 9.0) };
         c *= 0.97 + 0.06 * mottle;
         let c = c.clamp(Vec3::ZERO, Vec3::ONE);
         [c.x, c.y, c.z, v * 0.3 + mottle * 0.15, 0.12 + 0.05 * mottle]
@@ -683,5 +820,70 @@ mod tests {
         // Saved and loaded unchanged.
         let back: Eye = serde_json::from_str(&serde_json::to_string(&eye).unwrap()).unwrap();
         assert_eq!(back, eye);
+    }
+
+    /// The bits of an eye's mesh and texture.
+    fn eye_hash(m: &Mesh) -> u64 {
+        use std::hash::Hasher;
+        let mut h = xxhash_rust::xxh3::Xxh3::new();
+        for v in &m.vertices {
+            for x in v.pos.iter().chain(&v.normal).chain(&v.color).chain(&v.uv).chain(&v.surface).chain(&v.light) { h.write_u32(x.to_bits()); }
+            h.write_u32(v.material);
+        }
+        for i in &m.indices { h.write_u32(*i); }
+        let t = m.textures.as_ref().unwrap();
+        h.write(&t.color);
+        h.write(&t.normal);
+        h.write(&t.orm);
+        for mat in &m.materials { h.write(serde_json::to_string(mat).unwrap().as_bytes()); }
+        h.finish()
+    }
+
+    /// The realistic eye is the same bits as before Stage 4d (pinned).
+    #[test]
+    fn realistic_eye_is_pinned() {
+        let got = eye_hash(&Eye::default().build_mesh());
+        eprintln!("realistic eye: {got:#x}");
+        assert_eq!(got, 0xb65dff6c8090cbfa);
+    }
+
+    /// A stylised eye: a bigger iris than the realistic one, a catch-light
+    /// disc (its own glowing slot) on the iris under the cornea, facing
+    /// out, and a texture without veins; turning the catch-light off
+    /// leaves no disc and no slot.
+    #[test]
+    fn stylized_eye_has_a_big_iris_and_a_catchlight() {
+        let mut e = Eye::default();
+        e.stylize(&|_| false);
+        assert!(e.catchlight && e.iris_scale == 1.3 && e.veins == 0.0 && e.cornea == 0.03);
+        let (_, iris, _) = e.angles();
+        let (_, real_iris, _) = Eye::default().angles();
+        assert!(iris > real_iris * 1.25, "{iris} against {real_iris}");
+        let m = e.build_mesh();
+        assert_eq!(m.materials.len(), 6);
+        assert!(m.materials[CATCHLIGHT as usize].emission > 1.0);
+        let disc: Vec<u32> = m.indices.chunks_exact(3).filter(|t| m.vertices[t[0] as usize].material == CATCHLIGHT).flatten().copied().collect();
+        assert!(!disc.is_empty());
+        // Drawn before the cornea: the viewport draws the dome over it.
+        let first = |slot: u32| m.indices.chunks_exact(3).position(|t| m.vertices[t[0] as usize].material == slot).unwrap();
+        assert!(first(CATCHLIGHT) < first(CORNEA));
+        let corner = |i: u32| Vec3::from(m.vertices[i as usize].pos);
+        for t in disc.chunks_exact(3) {
+            let face = (corner(t[1]) - corner(t[0])).cross(corner(t[2]) - corner(t[0]));
+            assert!(face.dot(Vec3::from(m.vertices[t[0] as usize].normal)) > 0.0, "the disc faces out");
+            // Up and to the right of the pupil, on the iris, under the cornea.
+            let p = corner(t[0]);
+            assert!(p.x > 0.0 && p.y > 0.0 && p.z < 0.5 + e.cornea);
+        }
+        // The iris texture of a stylised eye has no red veins.
+        let tex = m.textures.as_ref().unwrap();
+        let reddest = tex.color.chunks_exact(4).map(|c| c[0] as i32 - c[1] as i32).max().unwrap();
+        assert!(reddest < 60, "{reddest}");
+        // Huge scales stay a sane iris.
+        let big = Eye { iris_size: 0.9, iris_scale: 1.6, ..e.clone() };
+        assert!(big.angles().1.is_finite() && (big.iris_width() - MAX_IRIS).abs() < 1e-6);
+        let off = Eye { catchlight: false, ..e };
+        let m = off.build_mesh();
+        assert!(m.materials.len() == 5 && m.vertices.iter().all(|v| v.material != CATCHLIGHT));
     }
 }

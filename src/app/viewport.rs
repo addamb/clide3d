@@ -90,6 +90,16 @@ impl ClideApp {
                 ui.radio_value(&mut self.shading, Shading::Wireframe, "Wireframe");
                 ui.radio_value(&mut self.shading, Shading::Shaded, "Smooth Shade All");
                 ui.radio_value(&mut self.shading, Shading::WireOnShaded, "Wireframe on Shaded");
+                // Quality shades (render_views shade): the set_display call
+                // an agent sends.
+                ui.separator();
+                ui.label("Quality");
+                for (shade, label) in [("beauty", "Beauty"), ("curvature", "Curvature"), ("lumpiness", "Lumpiness"), ("normals", "Normals"), ("wire", "Wire")] {
+                    if ui.radio(self.meshes.shade.name() == shade, label).on_hover_text("set_display shade").clicked() {
+                        self.send_ui_call("set_display", serde_json::json!({ "shade": shade }));
+                        ui.close();
+                    }
+                }
             });
             ui.menu_button("Lighting", |ui| {
                 // render_film's environments (with its studio lights), as
@@ -277,7 +287,7 @@ impl ClideApp {
                 Some(theme::WIRE_SELECTED)
             } else if selected_tree.contains(&o.id) {
                 Some(WIRE_OTHER)
-            } else if self.shading != Shading::Shaded {
+            } else if self.shading != Shading::Shaded || self.meshes.shade == crate::quality::Shade::Wire {
                 Some(theme::WIRE_DEFAULT)
             } else {
                 None
@@ -324,6 +334,7 @@ impl ClideApp {
 
         self.paint_reference(ui, kind, rect);
         self.paint_bones(&painter, rect, view_proj);
+        self.paint_guides(&painter, rect, view_proj);
         let alt = ui.input(|i| i.modifiers.alt);
         self.run_gizmo(ui, kind, rect, view, proj, alt, snap, pivot_mode);
         self.camera_and_picking(ui, kind, rect, view_proj, alt, &eval);
@@ -369,7 +380,7 @@ impl ClideApp {
     #[allow(clippy::too_many_arguments)]
     fn run_gizmo(&mut self, ui: &mut Ui, kind: ViewKind, rect: Rect, view: Mat4, proj: Mat4, alt: bool, snap: bool, pivot_mode: bool) {
         let modes = match (self.tool, pivot_mode) {
-            (Tool::Sculpt | Tool::Paint | Tool::Mask | Tool::Groups, _) => return,
+            (Tool::Sculpt | Tool::Paint | Tool::Mask | Tool::Groups | Tool::Groom, _) => return,
             (_, true) => GizmoMode::all_from_kind(GizmoModeKind::Translate),
             (Tool::Select, false) => return,
             (Tool::Move, _) => GizmoMode::all_from_kind(GizmoModeKind::Translate),
@@ -627,8 +638,8 @@ impl ClideApp {
     pub(super) fn pick_surface(&self, pos: Pos2, rect: Rect, view_proj: Mat4, eval: &Evaluated) -> Option<(u64, f32, Vec3)> {
         let (origin, dir) = Self::ray(pos, rect, view_proj);
         self.scene
-            .objects
-            .iter()
+            .geometry()
+            // Reference image planes are locked: never picked.
             .filter(|o| o.shape.is_mesh())
             .filter_map(|o| {
                 let &(world, visible) = eval.get(&o.id)?;
@@ -663,8 +674,7 @@ impl ClideApp {
         };
         let center_hit = self.pick(sel.center(), rect, view_proj, eval);
         self.scene
-            .objects
-            .iter()
+            .geometry()
             .filter(|o| o.shape.is_mesh())
             .filter(|o| {
                 let Some(&(world, true)) = eval.get(&o.id) else { return false };

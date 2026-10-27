@@ -46,13 +46,14 @@ use crate::scene::Shape;
 /// Sculpt brushes the tool offers: the ones a drag over the surface
 /// gives (grab and snakehook take the drag across the view plane; noise
 /// needs a pattern, stretch a delta per point).
-pub(super) const UI_BRUSHES: [Brush; 19] = [
+pub(super) const UI_BRUSHES: [Brush; 20] = [
     Brush::Standard,
     Brush::Clay,
     Brush::ClayBuildup,
     Brush::ClayTubes,
     Brush::TrimDynamic,
     Brush::Polish,
+    Brush::ClayPolish,
     Brush::Add,
     Brush::Carve,
     Brush::Inflate,
@@ -69,6 +70,12 @@ pub(super) const UI_BRUSHES: [Brush; 19] = [
     // Sent to the mask tool.
     Brush::MaskPaint,
 ];
+/// The groom brushes the Groom tool offers (cut needs a length or plane:
+/// agents send it).
+const GROOM_BRUSHES: [crate::groom::Kind; 8] = {
+    use crate::groom::Kind::*;
+    [Comb, Clump, Twist, Smooth, Puff, Relax, Lengthen, Shorten]
+};
 /// Requests kept in `ui_activity`, and how many replies show.
 const KEEP_ACTIVITY: usize = 32;
 const SHOW_ACTIVITY: usize = 5;
@@ -102,11 +109,13 @@ pub(super) struct CurrentBrush {
     pub tablet: bool,
     /// The polygroup the Groups tool paints.
     pub group: u16,
+    /// The Groom tool's brush.
+    pub groom: crate::groom::Kind,
 }
 
 impl Default for CurrentBrush {
     fn default() -> Self {
-        Self { brush: Brush::Standard, radius: 0.05, strength: 0.5, invert: false, color: [0.75, 0.2, 0.15], symmetry: None, preset: None, falloff: None, alpha: None, pressure: PressureCurves::default(), lazy: None, velocity: false, tablet: false, group: 1 }
+        Self { brush: Brush::Standard, radius: 0.05, strength: 0.5, invert: false, color: [0.75, 0.2, 0.15], symmetry: None, preset: None, falloff: None, alpha: None, pressure: PressureCurves::default(), lazy: None, velocity: false, tablet: false, group: 1, groom: crate::groom::Kind::Comb }
     }
 }
 
@@ -126,6 +135,9 @@ pub(super) enum Drag {
     /// Grab and Snakehook: the drag across the view plane at the press.
     Grab,
     Snakehook,
+    /// A groom stroke (the Groom tool): the drag across the view plane at
+    /// the press, sent to `groom` on the Hair.
+    Groom,
 }
 
 impl Drag {
@@ -137,6 +149,7 @@ impl Drag {
             Tool::Mask if m.shift => Drag::Lasso { sub: m.alt },
             Tool::Mask => Drag::MaskPaint { erase: m.alt },
             Tool::Groups => Drag::Group,
+            Tool::Groom => Drag::Groom,
             _ if ctrl && m.shift => Drag::Lasso { sub: m.alt },
             _ if ctrl => Drag::MaskPaint { erase: m.alt },
             _ if m.shift => Drag::Sculpt { smooth: true, invert: false },
@@ -154,12 +167,13 @@ impl Drag {
             Drag::Paint { .. } => "paint",
             Drag::MaskPaint { .. } | Drag::Lasso { .. } => "mask",
             Drag::Group => "group",
+            Drag::Groom => "groom",
         }
     }
 
     /// Whether its samples are screen pixels on the clay.
     fn screen(self) -> bool {
-        !matches!(self, Drag::Grab | Drag::Snakehook)
+        !matches!(self, Drag::Grab | Drag::Snakehook | Drag::Groom)
     }
 }
 
@@ -284,6 +298,7 @@ pub(super) fn tool_name(t: Tool) -> &'static str {
         Tool::Paint => "paint",
         Tool::Mask => "mask",
         Tool::Groups => "groups",
+        Tool::Groom => "groom",
     }
 }
 
@@ -377,7 +392,7 @@ impl Plan {
 impl ClideApp {
     /// True while the tool draws strokes instead of picking.
     pub(super) fn stroke_tool(&self) -> bool {
-        matches!(self.tool, Tool::Sculpt | Tool::Paint | Tool::Mask | Tool::Groups)
+        matches!(self.tool, Tool::Sculpt | Tool::Paint | Tool::Mask | Tool::Groups | Tool::Groom)
     }
 
     /// `brush_preset`: the presets (built in and the scene's, which are
@@ -444,7 +459,7 @@ impl ClideApp {
 
     pub(super) fn current_brush_json(&self) -> Value {
         let b = &self.brush;
-        json!({ "tool": tool_name(self.tool), "brush": b.brush, "radius": b.radius, "strength": b.strength, "invert": b.invert, "color": b.color, "symmetry": b.symmetry, "preset": b.preset, "falloff": b.falloff, "alpha": b.alpha, "pressure": b.pressure, "lazy": b.lazy, "velocity": b.velocity, "tablet": b.tablet, "group": b.group })
+        json!({ "tool": tool_name(self.tool), "brush": b.brush, "radius": b.radius, "strength": b.strength, "invert": b.invert, "color": b.color, "symmetry": b.symmetry, "preset": b.preset, "falloff": b.falloff, "alpha": b.alpha, "pressure": b.pressure, "lazy": b.lazy, "velocity": b.velocity, "tablet": b.tablet, "group": b.group, "groom": b.groom })
     }
 
     /// The settings of the current brush as a preset would hold them
@@ -469,7 +484,7 @@ impl ClideApp {
 
     /// Merges `set_current`'s fields; all or nothing.
     fn set_current_brush(&mut self, args: &Value) -> Result<(), String> {
-        const KEYS: [&str; 16] = ["action", "tool", "brush", "radius", "strength", "invert", "color", "symmetry", "preset", "falloff", "alpha", "pressure", "lazy", "velocity", "tablet", "group"];
+        const KEYS: [&str; 17] = ["action", "tool", "brush", "radius", "strength", "invert", "color", "symmetry", "preset", "falloff", "alpha", "pressure", "lazy", "velocity", "tablet", "group", "groom"];
         if let Some(k) = args.as_object().into_iter().flat_map(|o| o.keys()).find(|k| !KEYS.contains(&k.as_str())) {
             return Err(format!("unknown field {k}; set_current takes {}", KEYS[1..].join(", ")));
         }
@@ -481,8 +496,18 @@ impl ClideApp {
             Some(Some("paint")) => Some(Tool::Paint),
             Some(Some("mask")) => Some(Tool::Mask),
             Some(Some("groups")) => Some(Tool::Groups),
-            Some(_) => return Err("tool must be sculpt, paint, mask or groups".into()),
+            Some(Some("groom")) => Some(Tool::Groom),
+            Some(_) => return Err("tool must be sculpt, paint, mask, groups or groom".into()),
         };
+        if let Some(v) = given("groom") {
+            let k: crate::groom::Kind = serde_json::from_value(v.clone()).map_err(|_| "groom must be one of comb, clump, twist, smooth, puff, relax, lengthen or shorten")?;
+            // A cut needs a length or a plane a drag cannot give: agents
+            // send it with groom.
+            if k == crate::groom::Kind::Cut {
+                return Err("the Groom tool does not cut (it needs a length or a plane): send a groom call with brush cut".into());
+            }
+            b.groom = k;
+        }
         // A preset sets the brush and its strength (the fields given with
         // it still win), and goes into every stroke the tool sends.
         match args.get("preset") {
@@ -623,11 +648,43 @@ impl ClideApp {
             self.status = "Press on a clay object to use the brush on it.".into();
             return false;
         };
-        if self.scene.get(target).is_none_or(|o| o.shape != Shape::Clay) {
-            self.status = "Only clay objects take brush strokes.".into();
+        let drag = Drag::of(self.tool, &self.brush, m);
+        // The Groom tool grooms the Hair pressed on, or the selected Hair
+        // when the press is on its head (or anything else).
+        let (target, drag) = if drag == Drag::Groom {
+            let hair = if self.scene.get(target).is_some_and(|o| o.shape == Shape::Hair) { Some(target) } else { self.lead().filter(|&l| self.scene.get(l).is_some_and(|o| o.shape == Shape::Hair)) };
+            let Some(hair) = hair else {
+                self.status = "The Groom tool grooms a Hair: select one (or press on its cards).".into();
+                return false;
+            };
+            (hair, drag)
+        } else {
+            (target, drag)
+        };
+        // groom works on the rest pose: a hair shown away from it waits.
+        if drag == Drag::Groom && self.posed_now(target, eval) {
+            self.status = "This hair is posed or moved by animation at this frame: groom works on the rest pose. Go to a frame where it is at rest (or turn its clip off).".into();
             return false;
         }
-        let drag = Drag::of(self.tool, &self.brush, m);
+        if drag == Drag::Groom {
+            let camera = self.stroke_camera(kind, rect, ppp);
+            let (origin, dir) = Self::ray(start, rect, view_proj);
+            let anchor = Some(origin + dir * t);
+            let mut capture = Capture { view: kind, target, generation: self.scene_generation, drag, camera, lens: self.cams.proj(kind, 1.0), trail: Trail::default(), brush: self.brush.clone(), ppp, pen: brush::Pen::default(), pressure_source: None, anchor, path: anchor.into_iter().collect(), posed: None, live: None };
+            capture.sample(start, rect, &camera, time);
+            self.capture = Some(capture);
+            return true;
+        }
+        // A Poly takes paint strokes into its texture tiles (Stage 4b).
+        let poly = self.scene.get(target).is_some_and(|o| o.shape == Shape::Poly);
+        if poly && !matches!(drag, Drag::Paint { .. }) {
+            self.status = "A Poly object takes Paint strokes (its texture tiles); sculpt, mask and groups work on clay.".into();
+            return false;
+        }
+        if !poly && self.scene.get(target).is_none_or(|o| o.shape != Shape::Clay) {
+            self.status = "Only clay objects and Polys take brush strokes.".into();
+            return false;
+        }
         // The press is picked on the clay the view shows, but the handler
         // strokes the rest pose (`at_rest`): a posed clay takes sculpt
         // strokes as points on the posed clay (posable), the rest waits.
@@ -649,7 +706,8 @@ impl ClideApp {
         pen.read(events);
         let mut capture = Capture { view: kind, target, generation: self.scene_generation, drag, camera, lens: self.cams.proj(kind, 1.0), trail: Trail::default(), brush: self.brush.clone(), ppp, pen, pressure_source: None, anchor, path: anchor.into_iter().collect(), posed, live: None };
         capture.sample(start, rect, &camera, time);
-        capture.live = self.start_preview(&capture);
+        // Poly paint shows when the call lands (no clay preview).
+        capture.live = if poly { None } else { self.start_preview(&capture) };
         if let Some(input) = capture.input(self)
             && let Some(live) = capture.live.as_mut()
         {
@@ -865,6 +923,19 @@ impl ClideApp {
                 plan.group = Some(b.group);
             }
             Drag::Lasso { .. } => {}
+            Drag::Groom => {
+                // The groom stroke's own fields (no pressure or symmetry).
+                let mut g = json!({ "brush": b.groom, "radius": b.radius, "strength": b.strength });
+                if let Some(f) = &b.falloff {
+                    g["falloff"] = json!(f);
+                }
+                match b.groom {
+                    crate::groom::Kind::Lengthen | crate::groom::Kind::Shorten => g["length"] = json!(b.radius * 0.5),
+                    crate::groom::Kind::Twist => g["angle"] = json!(if b.invert { -45.0 } else { 45.0 }),
+                    _ => {}
+                }
+                stroke = g;
+            }
         }
         plan.stroke = stroke;
         plan
@@ -914,12 +985,23 @@ impl ClideApp {
         if c.generation != self.scene_generation {
             return Err("The scene changed (new, open, undo or redo) after the stroke; nothing was sent.".into());
         }
-        if self.scene.get(id).is_none_or(|o| o.shape != Shape::Clay) {
-            return Err("The stroke's clay object is gone; nothing was sent.".into());
+        if self.scene.get(id).is_none_or(|o| !matches!(o.shape, Shape::Clay | Shape::Poly | Shape::Hair)) {
+            return Err("The stroke's object is gone; nothing was sent.".into());
         }
         let plan = self.plan(c);
         let camera = c.camera;
         let mut request = match c.drag {
+            Drag::Groom => {
+                // The drag across the view plane at the press, in world
+                // space; the viewport shows the result (no pictures).
+                let path = thin(&c.path, crate::groom::MAX_PATH);
+                if path.is_empty() {
+                    return Err("The drag was too short; nothing was sent.".into());
+                }
+                let mut stroke = plan.stroke.clone();
+                stroke["points"] = json!(path.iter().map(|p| p.to_array()).collect::<Vec<_>>());
+                return Ok(("groom", json!({ "target": id, "render": false, "strokes": [stroke] })));
+            }
             Drag::Lasso { sub } => {
                 // The outline as drawn, through the press's camera.
                 let px: Vec<[f32; 2]> = thin(&c.px(), 4096);
@@ -936,6 +1018,12 @@ impl ClideApp {
             _ => {
                 let px = self.at_rest(|app| -> Result<_, String> {
                     app.meshes.sync(&app.scene);
+                    // A Poly's samples are cast on its drawn level, as its
+                    // handler casts them.
+                    if app.scene.get(id).is_some_and(|o| o.shape == Shape::Poly) {
+                        let cast = app.poly_caster(id)?;
+                        return Ok(kept(&c.trail.samples, &camera, app.scene.world_matrix(id).inverse(), &cast));
+                    }
                     let cast = app.clay_caster(id)?;
                     Ok(kept(&c.trail.samples, &camera, app.scene.world_matrix(id).inverse(), &cast))
                 })?;
@@ -1140,7 +1228,7 @@ impl ClideApp {
                 crate::levels::fill(clay, &mut raw, None)?;
             }
             let levels = levels.get_or_insert_with(|| crate::levels::cells(clay));
-            let ctx = crate::brush::resolve::ResolveCtx { to_local, radius_scale, world_to_local, snap: None, cast: Some(&cast), view_far: 100.0, snap_call: None, snap_single: default_brush.is_some(), alpha: None, unpose: None, levels: Some(levels.as_slice()) };
+            let ctx = crate::brush::resolve::ResolveCtx { to_local, radius_scale, world_to_local, snap: None, cast: Some(&cast), view_far: 100.0, snap_call: None, snap_single: default_brush.is_some(), alpha: None, unpose: None, levels: Some(levels.as_slice()), center: None };
             let (spec, mut r) = crate::sculpt::prepare(&[raw], default_brush, &ctx)?.remove(0);
             // A stroke at a finer level first grows a detail region there,
             // which only the request does: the preview is close, not exact.
@@ -1349,6 +1437,7 @@ impl ClideApp {
             }
             Tool::Mask => Color32::from_rgb(90, 170, 255),
             Tool::Groups => Color32::from_rgb(110, 230, 120),
+            Tool::Groom => Color32::from_rgb(230, 190, 120),
             _ => Color32::from_gray(235),
         }
     }
@@ -1361,7 +1450,7 @@ impl ClideApp {
         }
         let at = ui.input(|i| i.pointer.hover_pos()).filter(|p| rect.contains(*p))?;
         let (id, t, normal) = self.pick_surface(at, rect, view_proj, eval)?;
-        self.scene.get(id).filter(|o| o.shape == Shape::Clay)?;
+        self.scene.get(id).filter(|o| o.shape == Shape::Clay || (self.tool == Tool::Groom && o.shape == Shape::Hair))?;
         let (origin, dir) = Self::ray(at, rect, view_proj);
         // Where the falloff is at half: smooth's (1 - t^2)^2 = 0.5 at
         // 0.541, moved by the focal shift (t to t^(2^(-2 focal))).
@@ -1375,9 +1464,17 @@ impl ClideApp {
     /// `brush_preset set_current`, as an agent would.
     pub(super) fn brush_shelf(&mut self, ui: &mut Ui) {
         let mut patch = serde_json::Map::new();
-        for (tool, icon, tip) in [(Tool::Sculpt, Icon::Sculpt, "Sculpt Tool: drag on a clay"), (Tool::Paint, Icon::Paint, "Paint Tool: drag on a clay"), (Tool::Mask, Icon::Lasso, "Mask Tool: drag paints the mask (Alt erases, Shift lassos)"), (Tool::Groups, Icon::FaceMode, "Groups Tool: drag paints the polygroup")] {
+        for (tool, icon, tip) in [(Tool::Sculpt, Icon::Sculpt, "Sculpt Tool: drag on a clay"), (Tool::Paint, Icon::Paint, "Paint Tool: drag on a clay"), (Tool::Mask, Icon::Lasso, "Mask Tool: drag paints the mask (Alt erases, Shift lassos)"), (Tool::Groups, Icon::FaceMode, "Groups Tool: drag paints the polygroup"), (Tool::Groom, Icon::Paint, "Groom Tool: drag over a selected Hair to groom its guides")] {
             if icons::button(ui, icon, 32.0, self.tool == tool, true, tip).clicked() {
                 patch.insert("tool".into(), json!(tool_name(tool)));
+            }
+        }
+        // The Groom tool's brush (agents send groom strokes themselves).
+        if self.tool == Tool::Groom {
+            for k in GROOM_BRUSHES {
+                if ui.selectable_label(self.brush.groom == k, k.name()).clicked() {
+                    patch.insert("groom".into(), json!(k));
+                }
             }
         }
         ui.separator();

@@ -88,6 +88,17 @@ impl Gate {
         Ok(Gate { mask, invert: m.is_some_and(|m| m.invert_channel), groups, hidden, only: m.and_then(|m| m.groups.clone()), auto: m.filter(|m| m.auto()).cloned() })
     }
 
+    /// The gate of the persistent mask and polygroups a record froze
+    /// (`ledger::freeze`), with no stroke mask: an action's (ClayPolish).
+    pub fn frozen(clay: &Clay, frozen: Option<crate::brush::resolve::FrozenRef>) -> Result<Gate, String> {
+        let f = frozen.unwrap_or_default();
+        let lost = "the clay no longer keeps the mask or groups this record read; resend it";
+        let mask = f.mask.map(|h| crate::ledger::frozen_mask(clay, h).ok_or(lost)).transpose()?;
+        let groups = f.groups.map(|h| crate::ledger::frozen_groups(clay, h).ok_or(lost)).transpose()?;
+        let hidden = groups.as_ref().map(|g| g.hidden()).unwrap_or_default();
+        Ok(Gate { mask, invert: false, groups, hidden, only: None, auto: None })
+    }
+
     /// Whether the persistent mask or groups hold anything back.
     pub fn points(&self) -> bool {
         self.mask.is_some() || !self.hidden.is_empty() || self.only.is_some() || self.invert
@@ -524,6 +535,40 @@ impl Sweep<'_> {
         let (d, r, g) = self.locate(p);
         curve.weight(d, r) * g
     }
+
+    /// The largest radius along the path.
+    pub fn reach(&self) -> f32 {
+        self.radii.as_ref().map_or(self.radius, |r| r.iter().copied().fold(self.radius, f32::max))
+    }
+
+    /// `weight` looking only at the segments `segs` (ascending): the same
+    /// value when they hold every segment within `reach` of `p` (a falloff
+    /// is 0 at its radius and beyond).
+    pub fn weight_among(&self, curve: &Curve, p: Vec3, segs: &[u32]) -> f32 {
+        if self.points.len() == 1 {
+            return self.weight(curve, p);
+        }
+        if segs.is_empty() {
+            return 0.0;
+        }
+        if self.uniform() {
+            let d = segs.iter().map(|&k| segment_distance(p, self.points[k as usize], self.points[k as usize + 1])).fold(f32::MAX, f32::min);
+            return curve.weight(d, self.radius);
+        }
+        let (mut best, mut seg, mut t) = (f32::MAX, 0, 0.0);
+        for &k in segs {
+            let (a, b) = (self.points[k as usize], self.points[k as usize + 1]);
+            let ab = b - a;
+            let s = if ab.length_squared() < 1e-12 { 0.0 } else { ((p - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0) };
+            let d = (p - (a + ab * s)).length();
+            if d < best {
+                (best, seg, t) = (d, k as usize, s);
+            }
+        }
+        let r = self.radii.as_ref().map_or(self.radius, |r| if t == 0.0 { r[seg] } else { r[seg] + (r[seg + 1] - r[seg]) * t });
+        let g = self.gains.map_or(1.0, |g| if t == 0.0 { g[seg] } else { g[seg] + (g[seg + 1] - g[seg]) * t });
+        curve.weight(best, r) * g
+    }
 }
 
 /// The detail grid spacing a clay gets on its first stroke: its
@@ -533,7 +578,7 @@ pub(super) fn first_voxel(clay: &Clay, radius: f32) -> f32 {
 }
 
 /// The field a stroke reads: the blobs plus `detail` (no paint or decals).
-fn field_for(clay: &Clay, detail: &Detail, voxel: f32) -> Field {
+pub(super) fn field_for(clay: &Clay, detail: &Detail, voxel: f32) -> Field {
     let probe = Clay { blobs: clay.blobs.clone(), resolution: clay.resolution, detail: Some(detail.clone()), paint: None, detail_cell: clay.detail_cell, shell: clay.shell, sharp: clay.sharp, assets: clay.assets.clone(), ..Clay::default() };
     let field = Field::new(&probe, voxel);
     // The blob field on the detail grid's points, memoized (the same
@@ -844,7 +889,7 @@ fn under(level: &crate::clay::Level, lower: &[(Vec3, f32)]) -> Vec<[i32; 3]> {
 /// (coarser levels written) against `pre` (the grid before the dab).
 /// Bricks in key order, points in brick order, in parallel by brick: the
 /// same on any number of threads.
-fn take_back(k: usize, post: &DetailGrid, pre: &DetailGrid, lower: &[(Vec3, f32)], written: &[([i32; 3], f32)]) -> Vec<([i32; 3], f32)> {
+pub(super) fn take_back(k: usize, post: &DetailGrid, pre: &DetailGrid, lower: &[(Vec3, f32)], written: &[([i32; 3], f32)]) -> Vec<([i32; 3], f32)> {
     if lower.is_empty() {
         return Vec::new();
     }
@@ -930,6 +975,8 @@ fn brush(params: &Params, alpha: Option<&Alpha>, gate: &Gate, dab: &Dab, sweep: 
     let margin = match params.brush {
         Brush::Add | Brush::Carve => radius * 1.6,
         Brush::Smooth => radius + (smooth_passes + 1) as f32 * voxel,
+        // The guard reads two points around each one it moves.
+        Brush::ClayPolish => radius + 3.0 * voxel,
         Brush::Grab | Brush::Stretch => radius + delta.length(),
         Brush::Crease | Brush::Layer => radius + strength.abs(),
         Brush::Standard => radius + height.abs(),
@@ -1044,6 +1091,10 @@ fn brush(params: &Params, alpha: Option<&Alpha>, gate: &Gate, dab: &Dab, sweep: 
     let changes = if (n.x as f64) * (n.y as f64) * (n.z as f64) <= MAX_REGION as f64 {
         job.region(i0, i1, i0, i1)
     } else {
+        // Its volume shift is one sum over the dab.
+        if params.brush == Brush::ClayPolish {
+            return Err(format!("a clay_polish dab is too big for the detail grid at cell size {voxel:.4}; use a smaller radius, or edit_clay polish with a region"));
+        }
         // Auto-masking reads the surface around the dab as one region.
         if gate.auto.is_some() {
             return Err(format!("the stroke is too big to auto-mask (backface, cavity, connected, normal_angle) at cell size {voxel:.4}; use a smaller radius"));

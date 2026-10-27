@@ -638,7 +638,7 @@ fn clip_summary(c: &Clip) -> Value {
 }
 
 /// A thick line (or a dot when `a == b`) on an image.
-fn line(img: &mut ColorImage, a: (f32, f32), b: (f32, f32), width: f32, color: Color32) {
+pub(super) fn line(img: &mut ColorImage, a: (f32, f32), b: (f32, f32), width: f32, color: Color32) {
     let [w, h] = img.size;
     let len = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
     if !len.is_finite() || len > 4.0 * (w + h) as f32 {
@@ -720,8 +720,9 @@ fn draw_bones_on(img: &mut ColorImage, view_proj: Mat4, bones: &[(bool, Vec3, Ve
 
 /// The scene's bounding sphere (visible top-level objects).
 fn scene_sphere_of(scene: &crate::scene::Scene, meshes: &crate::mesh::MeshLib) -> (Vec3, f32) {
-    let bounds = |o: &crate::scene::Object| meshes.bounds(o);
-    let b = scene.children(None).into_iter().filter(|&id| scene.is_visible(id)).filter_map(|id| scene.subtree_bounds(id, scene.world_matrix(id), &bounds).or_else(|| { let p = scene.pivot_world(id); Some((p, p)) })).reduce(|(a, b), (c, d)| (a.min(c), b.max(d)));
+    // Reference planes are left out at any depth; objects under one count.
+    let bounds = |o: &crate::scene::Object| if o.is_reference() { None } else { meshes.bounds(o) };
+    let b = scene.children(None).into_iter().filter(|&id| scene.is_visible(id)).filter_map(|id| scene.subtree_bounds(id, scene.world_matrix(id), &bounds).or_else(|| { let p = scene.pivot_world(id); scene.get(id).is_some_and(|o| !o.is_reference()).then_some((p, p)) })).reduce(|(a, b), (c, d)| (a.min(c), b.max(d)));
     match b {
         Some((lo, hi)) => ((lo + hi) * 0.5, ((hi - lo).length() * 0.5).max(0.05)),
         None => (Vec3::ZERO, 1.0),

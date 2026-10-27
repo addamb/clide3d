@@ -3,6 +3,7 @@
 use glam::{IVec3, Vec3};
 
 use super::engine::{BUILDUP, Gate, Sweep, allowed, closest, closest_normal, hook_source, stretch_source};
+use super::flow;
 use super::noise::smooth01;
 use crate::brush::alpha::{Stamp, Use};
 use crate::brush::resolve::Params;
@@ -310,6 +311,12 @@ impl Job<'_> {
                         }
                     }
                 }
+            }
+            Brush::ClayPolish => {
+                // Curvature flow that keeps creases and lines, the dab's
+                // weight as its falloff, strength setting the passes.
+                let s = flow::Settings { angle: params.angle.unwrap_or(30.0), keep_volume: params.keep_volume.unwrap_or(true), passes: self.smooth_passes };
+                out = flow::polish_box(&t, n, &w, voxel, &s);
             }
             Brush::Flatten => {
                 let c = points.iter().copied().sum::<Vec3>() / points.len() as f32;

@@ -174,7 +174,7 @@ impl Mesher {
         let mut hard = Vec::with_capacity(field.prims.len());
         for b in clay.blobs.iter().take(super::MAX_BLOBS) {
             let h = clay.shell.is_some()
-                || !matches!(b.form, super::Form::Sphere { .. } | super::Form::Ellipsoid { .. } | super::Form::Capsule { .. } | super::Form::Human { .. } | super::Form::Torus { .. } | super::Form::Chain { .. } | super::Form::Membrane { .. })
+                || !matches!(b.form, super::Form::Sphere { .. } | super::Form::Ellipsoid { .. } | super::Form::Capsule { .. } | super::Form::Human { .. } | super::Form::Torus { .. } | super::Form::Lid { .. } | super::Form::Chain { .. } | super::Form::Membrane { .. })
                 || matches!(b.op, super::Op::Plate | super::Op::Engrave | super::Op::Emboss)
                 || b.join == hard_surface::Join::Chamfer;
             hard.extend(std::iter::repeat_n(h, if b.mirror { 2 } else { 1 }));

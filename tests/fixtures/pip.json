@@ -1,0 +1,1777 @@
+{
+  "objects": [
+    {
+      "id": 1,
+      "name": "Pip",
+      "shape": "Clay",
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "visible": true,
+      "parent": null,
+      "pivot": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "pivot_comp": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "clay": {
+        "blobs": [
+          {
+            "name": "pelvis",
+            "type": "ellipsoid",
+            "center": [
+              0.0,
+              0.29315627,
+              0.0
+            ],
+            "radii": [
+              0.22343749,
+              0.15170002,
+              0.1828125
+            ],
+            "rotate": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "op": "add",
+            "blend": 0.0,
+            "color": [
+              0.36,
+              0.62,
+              0.78
+            ],
+            "bone": "hips",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0
+          },
+          {
+            "name": "torso",
+            "type": "ellipsoid",
+            "center": [
+              0.0,
+              0.4638188,
+              0.0
+            ],
+            "radii": [
+              0.14625,
+              0.17066252,
+              0.12593749
+            ],
+            "rotate": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "op": "add",
+            "blend": 0.043875,
+            "color": [
+              0.36,
+              0.62,
+              0.78
+            ],
+            "bone": "spine",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0
+          },
+          {
+            "name": "neck",
+            "type": "capsule",
+            "a": [
+              0.0,
+              0.5416667,
+              -0.008333333
+            ],
+            "b": [
+              0.0,
+              0.68750006,
+              0.0
+            ],
+            "radius": 0.083333336,
+            "radius_b": 0.083333336,
+            "op": "add",
+            "blend": 0.041666668,
+            "color": [
+              0.36,
+              0.62,
+              0.78
+            ],
+            "bone": "head",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0
+          },
+          {
+            "name": "thigh.L",
+            "type": "capsule",
+            "a": [
+              0.12289062,
+              0.2009375,
+              0.0
+            ],
+            "b": [
+              0.12289062,
+              0.14885417,
+              0.008333333
+            ],
+            "radius": 0.08145833,
+            "radius_b": 0.06708333,
+            "op": "add",
+            "blend": 0.03333333,
+            "color": [
+              0.36,
+              0.62,
+              0.78
+            ],
+            "mirror": true,
+            "bone": "thigh.L",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0
+          },
+          {
+            "name": "shin.L",
+            "type": "capsule",
+            "a": [
+              0.12289062,
+              0.14885417,
+              0.008333333
+            ],
+            "b": [
+              0.12289062,
+              0.09677083,
+              0.0
+            ],
+            "radius": 0.06708333,
+            "radius_b": 0.055104163,
+            "op": "add",
+            "blend": 0.020833334,
+            "color": [
+              0.36,
+              0.62,
+              0.78
+            ],
+            "mirror": true,
+            "bone": "shin.L",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0
+          },
+          {
+            "name": "foot.L",
+            "type": "ellipsoid",
+            "center": [
+              0.12289062,
+              0.041666668,
+              0.03333333
+            ],
+            "radii": [
+              0.083333336,
+              0.041666668,
+              0.10833333
+            ],
+            "rotate": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "op": "add",
+            "blend": 0.020833334,
+            "color": [
+              0.36,
+              0.62,
+              0.78
+            ],
+            "mirror": true,
+            "bone": "foot.L",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0
+          },
+          {
+            "name": "upper_arm.L",
+            "type": "sweep",
+            "profile": {
+              "circle": 0.0790625,
+              "sides": 16
+            },
+            "points": [
+              [
+                0.11992499,
+                0.5586313,
+                0.0
+              ],
+              [
+                0.1575274,
+                0.48615503,
+                0.01989372
+              ],
+              [
+                0.21393104,
+                0.3774406,
+                0.049734302
+              ]
+            ],
+            "taper": 1.0,
+            "twist": 0.0,
+            "path_smooth": true,
+            "radii": [
+              0.0790625,
+              0.07666666,
+              0.057499994
+            ],
+            "field": "segments",
+            "op": "add",
+            "blend": 0.03333333,
+            "color": [
+              0.36,
+              0.62,
+              0.78
+            ],
+            "mirror": true,
+            "bone": "upper_arm.L",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0
+          },
+          {
+            "name": "forearm.L",
+            "type": "sweep",
+            "profile": {
+              "circle": 0.057499994,
+              "sides": 16
+            },
+            "points": [
+              [
+                0.21393104,
+                0.3774406,
+                0.049734294
+              ],
+              [
+                0.23251848,
+                0.3460564,
+                0.09317851
+              ],
+              [
+                0.2758891,
+                0.27282664,
+                0.19454828
+              ]
+            ],
+            "taper": 1.0,
+            "twist": 0.0,
+            "path_smooth": true,
+            "radii": [
+              0.057499994,
+              0.06708333,
+              0.047916666
+            ],
+            "field": "segments",
+            "op": "add",
+            "blend": 0.016666666,
+            "color": [
+              0.36,
+              0.62,
+              0.78
+            ],
+            "mirror": true,
+            "bone": "forearm.L",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0
+          },
+          {
+            "name": "hand.L",
+            "type": "ellipsoid",
+            "center": [
+              0.2919711,
+              0.24567276,
+              0.2321366
+            ],
+            "radii": [
+              0.043456253,
+              0.061350003,
+              0.061350003
+            ],
+            "rotate": [
+              52.65748,
+              -15.567443,
+              -168.74283
+            ],
+            "op": "add",
+            "blend": 0.020833334,
+            "color": [
+              0.36,
+              0.62,
+              0.78
+            ],
+            "mirror": true,
+            "bone": "hand.L",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0
+          },
+          {
+            "name": "finger1.L",
+            "type": "sweep",
+            "profile": {
+              "circle": 0.019660309,
+              "sides": 16
+            },
+            "points": [
+              [
+                0.3028565,
+                0.19588825,
+                0.23557329
+              ],
+              [
+                0.310602,
+                0.16915512,
+                0.2596343
+              ],
+              [
+                0.31031865,
+                0.1459648,
+                0.28120118
+              ]
+            ],
+            "taper": 1.0,
+            "twist": 0.0,
+            "path_smooth": true,
+            "radii": [
+              0.019660309,
+              0.019267103,
+              0.01848069
+            ],
+            "field": "segments",
+            "op": "add",
+            "blend": 0.010416667,
+            "color": [
+              0.36,
+              0.62,
+              0.78
+            ],
+            "mirror": true,
+            "bone": "hand.L",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0
+          },
+          {
+            "name": "finger2.L",
+            "type": "sweep",
+            "profile": {
+              "circle": 0.019660309,
+              "sides": 16
+            },
+            "points": [
+              [
+                0.30302745,
+                0.22700445,
+                0.25797856
+              ],
+              [
+                0.31291133,
+                0.20288554,
+                0.29139924
+              ],
+              [
+                0.31437755,
+                0.18183407,
+                0.32062408
+              ]
+            ],
+            "taper": 1.0,
+            "twist": 0.0,
+            "path_smooth": true,
+            "radii": [
+              0.019660309,
+              0.019267103,
+              0.01848069
+            ],
+            "field": "segments",
+            "op": "add",
+            "blend": 0.010416667,
+            "color": [
+              0.36,
+              0.62,
+              0.78
+            ],
+            "mirror": true,
+            "bone": "hand.L",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0
+          },
+          {
+            "name": "finger3.L",
+            "type": "sweep",
+            "profile": {
+              "circle": 0.019660309,
+              "sides": 16
+            },
+            "points": [
+              [
+                0.3031984,
+                0.25812066,
+                0.28038386
+              ],
+              [
+                0.31101167,
+                0.24372259,
+                0.31332672
+              ],
+              [
+                0.3107838,
+                0.23062453,
+                0.34216055
+              ]
+            ],
+            "taper": 1.0,
+            "twist": 0.0,
+            "path_smooth": true,
+            "radii": [
+              0.019660309,
+              0.019267103,
+              0.01848069
+            ],
+            "field": "segments",
+            "op": "add",
+            "blend": 0.010416667,
+            "color": [
+              0.36,
+              0.62,
+              0.78
+            ],
+            "mirror": true,
+            "bone": "hand.L",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0
+          },
+          {
+            "name": "thumb.L",
+            "type": "sweep",
+            "profile": {
+              "circle": 0.022609355,
+              "sides": 16
+            },
+            "points": [
+              [
+                0.28803474,
+                0.28163028,
+                0.24347496
+              ],
+              [
+                0.27910292,
+                0.28894576,
+                0.27696615
+              ],
+              [
+                0.26911104,
+                0.29439694,
+                0.30513045
+              ]
+            ],
+            "taper": 1.0,
+            "twist": 0.0,
+            "path_smooth": true,
+            "radii": [
+              0.022609355,
+              0.022157168,
+              0.021252794
+            ],
+            "field": "segments",
+            "op": "add",
+            "blend": 0.012499999,
+            "color": [
+              0.36,
+              0.62,
+              0.78
+            ],
+            "mirror": true,
+            "bone": "hand.L",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0
+          },
+          {
+            "name": "head",
+            "type": "ellipsoid",
+            "center": [
+              0.0,
+              0.7916667,
+              0.0
+            ],
+            "radii": [
+              0.252,
+              0.20833333,
+              0.19999999
+            ],
+            "rotate": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "op": "add",
+            "blend": 0.06666666,
+            "color": [
+              0.36,
+              0.62,
+              0.78
+            ],
+            "bone": "head",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0
+          },
+          {
+            "name": "muzzle",
+            "type": "ellipsoid",
+            "center": [
+              0.0,
+              0.682,
+              0.125
+            ],
+            "radii": [
+              0.115,
+              0.058,
+              0.075
+            ],
+            "rotate": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "op": "add",
+            "blend": 0.03,
+            "color": [
+              0.8,
+              0.9,
+              0.95
+            ],
+            "bone": "head",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0,
+            "color_blend": 0.025
+          },
+          {
+            "name": "cheek.L",
+            "type": "ellipsoid",
+            "center": [
+              0.155,
+              0.705,
+              0.115
+            ],
+            "radii": [
+              0.055,
+              0.042,
+              0.045
+            ],
+            "rotate": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "op": "add",
+            "blend": 0.035,
+            "color": [
+              0.74,
+              0.58,
+              0.78
+            ],
+            "mirror": true,
+            "bone": "head",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0,
+            "color_blend": 0.04
+          },
+          {
+            "name": "brow.L",
+            "type": "capsule",
+            "a": [
+              0.05,
+              0.915,
+              0.165
+            ],
+            "b": [
+              0.15,
+              0.9,
+              0.14
+            ],
+            "radius": 0.009,
+            "radius_b": 0.006,
+            "op": "add",
+            "blend": 0.02,
+            "color": [
+              0.2,
+              0.4,
+              0.6
+            ],
+            "mirror": true,
+            "bone": "head",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0,
+            "color_blend": 0.006
+          },
+          {
+            "name": "belly",
+            "type": "ellipsoid",
+            "center": [
+              0.0,
+              0.34,
+              0.11
+            ],
+            "radii": [
+              0.16,
+              0.15,
+              0.085
+            ],
+            "rotate": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "op": "add",
+            "blend": 0.04,
+            "color": [
+              0.8,
+              0.9,
+              0.95
+            ],
+            "bone": "spine",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0,
+            "color_blend": 0.03
+          },
+          {
+            "name": "tuft0",
+            "type": "sweep",
+            "profile": {
+              "circle": 0.026,
+              "sides": 16
+            },
+            "points": [
+              [
+                0.0,
+                0.985,
+                0.02
+              ],
+              [
+                0.0,
+                1.01487,
+                0.04314
+              ],
+              [
+                0.0,
+                1.0425,
+                0.06271
+              ],
+              [
+                0.0,
+                1.0658,
+                0.07566
+              ],
+              [
+                0.0,
+                1.08303,
+                0.07982
+              ],
+              [
+                0.0,
+                1.0929,
+                0.07429
+              ],
+              [
+                0.0,
+                1.09466,
+                0.05947
+              ],
+              [
+                0.0,
+                1.08817,
+                0.03707
+              ],
+              [
+                0.0,
+                1.07393,
+                0.00988
+              ]
+            ],
+            "taper": 1.0,
+            "twist": 0.0,
+            "path_smooth": true,
+            "radii": [
+              0.03,
+              0.02737,
+              0.02465,
+              0.02185,
+              0.01893,
+              0.01586,
+              0.01258,
+              0.00893,
+              0.004
+            ],
+            "field": "segments",
+            "op": "add",
+            "blend": 0.02,
+            "color": [
+              0.2,
+              0.4,
+              0.6
+            ],
+            "bone": "head",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0,
+            "color_blend": 0.02
+          },
+          {
+            "name": "tuft1",
+            "type": "sweep",
+            "profile": {
+              "circle": 0.026,
+              "sides": 16
+            },
+            "points": [
+              [
+                -0.035,
+                0.985,
+                0.02
+              ],
+              [
+                -0.03757,
+                1.00808,
+                0.04314
+              ],
+              [
+                -0.04014,
+                1.02943,
+                0.06271
+              ],
+              [
+                -0.04271,
+                1.04744,
+                0.07566
+              ],
+              [
+                -0.04528,
+                1.06075,
+                0.07982
+              ],
+              [
+                -0.04785,
+                1.06838,
+                0.07429
+              ],
+              [
+                -0.05042,
+                1.06973,
+                0.05947
+              ],
+              [
+                -0.05299,
+                1.06472,
+                0.03707
+              ],
+              [
+                -0.05556,
+                1.05372,
+                0.00988
+              ]
+            ],
+            "taper": 1.0,
+            "twist": 0.0,
+            "path_smooth": true,
+            "radii": [
+              0.03,
+              0.02737,
+              0.02465,
+              0.02185,
+              0.01893,
+              0.01586,
+              0.01258,
+              0.00893,
+              0.004
+            ],
+            "field": "segments",
+            "op": "add",
+            "blend": 0.02,
+            "color": [
+              0.2,
+              0.4,
+              0.6
+            ],
+            "bone": "head",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0,
+            "color_blend": 0.02
+          },
+          {
+            "name": "tuft2",
+            "type": "sweep",
+            "profile": {
+              "circle": 0.026,
+              "sides": 16
+            },
+            "points": [
+              [
+                0.035,
+                0.985,
+                0.02
+              ],
+              [
+                0.03742,
+                1.00672,
+                0.04314
+              ],
+              [
+                0.03984,
+                1.02681,
+                0.06271
+              ],
+              [
+                0.04226,
+                1.04376,
+                0.07566
+              ],
+              [
+                0.04468,
+                1.0563,
+                0.07982
+              ],
+              [
+                0.0471,
+                1.06347,
+                0.07429
+              ],
+              [
+                0.04952,
+                1.06475,
+                0.05947
+              ],
+              [
+                0.05193,
+                1.06003,
+                0.03707
+              ],
+              [
+                0.05435,
+                1.04968,
+                0.00988
+              ]
+            ],
+            "taper": 1.0,
+            "twist": 0.0,
+            "path_smooth": true,
+            "radii": [
+              0.03,
+              0.02737,
+              0.02465,
+              0.02185,
+              0.01893,
+              0.01586,
+              0.01258,
+              0.00893,
+              0.004
+            ],
+            "field": "segments",
+            "op": "add",
+            "blend": 0.02,
+            "color": [
+              0.2,
+              0.4,
+              0.6
+            ],
+            "bone": "head",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0,
+            "color_blend": 0.02
+          },
+          {
+            "name": "ear.L",
+            "type": "ellipsoid",
+            "center": [
+              0.215,
+              0.945,
+              -0.03
+            ],
+            "radii": [
+              0.04,
+              0.13,
+              0.08
+            ],
+            "rotate": [
+              0.0,
+              0.0,
+              -32.0
+            ],
+            "op": "add",
+            "blend": 0.035,
+            "color": [
+              0.36,
+              0.62,
+              0.78
+            ],
+            "mirror": true,
+            "bone": "head",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0
+          },
+          {
+            "name": "ear_inner.L",
+            "type": "ellipsoid",
+            "center": [
+              0.227,
+              0.95,
+              0.008
+            ],
+            "radii": [
+              0.022,
+              0.088,
+              0.04
+            ],
+            "rotate": [
+              0.0,
+              0.0,
+              -32.0
+            ],
+            "op": "add",
+            "blend": 0.012,
+            "color": [
+              0.62,
+              0.62,
+              0.86
+            ],
+            "mirror": true,
+            "bone": "head",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0,
+            "color_blend": 0.012
+          },
+          {
+            "name": "nose",
+            "type": "ellipsoid",
+            "center": [
+              0.0,
+              0.712,
+              0.198
+            ],
+            "radii": [
+              0.048,
+              0.034,
+              0.038
+            ],
+            "rotate": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "op": "add",
+            "blend": 0.029166667,
+            "color": [
+              0.13,
+              0.15,
+              0.27
+            ],
+            "bone": "head",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0,
+            "color_blend": 0.006
+          },
+          {
+            "name": "mouth",
+            "type": "sweep",
+            "profile": {
+              "circle": 0.008749999,
+              "sides": 16
+            },
+            "points": [
+              [
+                -0.087875076,
+                0.67817193,
+                0.17013
+              ],
+              [
+                -0.058640435,
+                0.6570081,
+                0.17784
+              ],
+              [
+                -0.02933719,
+                0.64428234,
+                0.17567
+              ],
+              [
+                0.0,
+                0.64003587,
+                0.17377
+              ],
+              [
+                0.029337196,
+                0.64428234,
+                0.17567
+              ],
+              [
+                0.058640435,
+                0.6570081,
+                0.17784
+              ],
+              [
+                0.087875076,
+                0.67817193,
+                0.17013
+              ]
+            ],
+            "taper": 1.0,
+            "twist": 0.0,
+            "path_smooth": true,
+            "radii": [
+              0.008749999,
+              0.010833333,
+              0.012083333,
+              0.012499999,
+              0.012083332,
+              0.010833333,
+              0.008749999
+            ],
+            "field": "segments",
+            "op": "carve",
+            "blend": 0.008333333,
+            "color": [
+              0.36,
+              0.62,
+              0.78
+            ],
+            "bone": "head",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0
+          },
+          {
+            "name": "mouth_line",
+            "type": "sweep",
+            "profile": {
+              "circle": 0.0039374996,
+              "sides": 16
+            },
+            "points": [
+              [
+                -0.083874285,
+                0.6861162,
+                0.17103
+              ],
+              [
+                -0.05536463,
+                0.66847694,
+                0.18337
+              ],
+              [
+                -0.02751826,
+                0.6581593,
+                0.18597
+              ],
+              [
+                0.0,
+                0.6547643,
+                0.18622
+              ],
+              [
+                0.027518265,
+                0.6581593,
+                0.18597
+              ],
+              [
+                0.05536463,
+                0.66847694,
+                0.18337
+              ],
+              [
+                0.083874285,
+                0.6861162,
+                0.17103
+              ]
+            ],
+            "taper": 1.0,
+            "twist": 0.0,
+            "path_smooth": true,
+            "radii": [
+              0.0039374996,
+              0.0048749996,
+              0.0054374994,
+              0.0056249993,
+              0.0054374994,
+              0.0048749996,
+              0.0039374996
+            ],
+            "field": "segments",
+            "op": "add",
+            "blend": 0.0062499996,
+            "color": [
+              0.3,
+              0.07,
+              0.07
+            ],
+            "bone": "head",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0
+          },
+          {
+            "name": "eye_socket.L",
+            "type": "capsule",
+            "a": [
+              0.0975,
+              0.77500004,
+              0.16341607
+            ],
+            "b": [
+              0.0975,
+              0.77500004,
+              0.34622854
+            ],
+            "radius": 0.017934872,
+            "radius_b": 0.1793487,
+            "op": "carve",
+            "blend": 0.016666666,
+            "color": [
+              0.36,
+              0.62,
+              0.78
+            ],
+            "mirror": true,
+            "bone": "head",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0
+          },
+          {
+            "name": "lid.L",
+            "type": "ellipsoid",
+            "center": [
+              0.0975,
+              0.828,
+              0.148
+            ],
+            "radii": [
+              0.075,
+              0.047,
+              0.072
+            ],
+            "rotate": [
+              -14.0,
+              0.0,
+              8.0
+            ],
+            "op": "add",
+            "blend": 0.012,
+            "color": [
+              0.36,
+              0.62,
+              0.78
+            ],
+            "mirror": true,
+            "bone": "head",
+            "smooth": 0.0,
+            "join": "round",
+            "join_size": null,
+            "wall": 0.004,
+            "rim": 0.0,
+            "ridge": 0.0,
+            "flare": 0.0
+          }
+        ],
+        "resolution": 320,
+        "shell": null,
+        "sharp": true
+      },
+      "rig": {
+        "bones": [
+          {
+            "name": "hips",
+            "head": [
+              0.0,
+              0.2009375,
+              0.0
+            ],
+            "tail": [
+              0.0,
+              0.36426565,
+              0.0
+            ]
+          },
+          {
+            "name": "spine",
+            "parent": "hips",
+            "head": [
+              0.0,
+              0.36426565,
+              0.0
+            ],
+            "tail": [
+              0.0,
+              0.56250006,
+              0.0
+            ]
+          },
+          {
+            "name": "neck",
+            "parent": "spine",
+            "head": [
+              0.0,
+              0.56250006,
+              0.0
+            ],
+            "tail": [
+              0.0,
+              0.6666667,
+              0.0
+            ],
+            "deform": false
+          },
+          {
+            "name": "head",
+            "parent": "neck",
+            "head": [
+              0.0,
+              0.6666667,
+              0.0
+            ],
+            "tail": [
+              0.0,
+              0.9666667,
+              0.0
+            ]
+          },
+          {
+            "name": "upper_arm.L",
+            "parent": "spine",
+            "head": [
+              0.11992499,
+              0.5586313,
+              0.0
+            ],
+            "tail": [
+              0.21393104,
+              0.3774406,
+              0.049734302
+            ]
+          },
+          {
+            "name": "upper_arm.R",
+            "parent": "spine",
+            "head": [
+              -0.11992499,
+              0.5586313,
+              0.0
+            ],
+            "tail": [
+              -0.21393104,
+              0.3774406,
+              0.049734302
+            ]
+          },
+          {
+            "name": "forearm.L",
+            "parent": "upper_arm.L",
+            "head": [
+              0.21393104,
+              0.3774406,
+              0.049734294
+            ],
+            "tail": [
+              0.2758891,
+              0.27282664,
+              0.19454828
+            ]
+          },
+          {
+            "name": "forearm.R",
+            "parent": "upper_arm.R",
+            "head": [
+              -0.21393104,
+              0.3774406,
+              0.049734294
+            ],
+            "tail": [
+              -0.2758891,
+              0.27282664,
+              0.19454828
+            ]
+          },
+          {
+            "name": "hand.L",
+            "parent": "forearm.L",
+            "head": [
+              0.2758891,
+              0.27282664,
+              0.19454828
+            ],
+            "tail": [
+              0.31002128,
+              0.21519561,
+              0.27432516
+            ]
+          },
+          {
+            "name": "hand.R",
+            "parent": "forearm.R",
+            "head": [
+              -0.2758891,
+              0.27282664,
+              0.19454828
+            ],
+            "tail": [
+              -0.31002128,
+              0.21519561,
+              0.27432516
+            ]
+          },
+          {
+            "name": "thigh.L",
+            "parent": "hips",
+            "head": [
+              0.12289062,
+              0.2009375,
+              0.0
+            ],
+            "tail": [
+              0.12289062,
+              0.14885417,
+              0.008333333
+            ]
+          },
+          {
+            "name": "thigh.R",
+            "parent": "hips",
+            "head": [
+              -0.12289062,
+              0.2009375,
+              0.0
+            ],
+            "tail": [
+              -0.12289062,
+              0.14885417,
+              0.008333333
+            ]
+          },
+          {
+            "name": "shin.L",
+            "parent": "thigh.L",
+            "head": [
+              0.12289062,
+              0.14885417,
+              0.008333333
+            ],
+            "tail": [
+              0.12289062,
+              0.09677083,
+              0.0
+            ]
+          },
+          {
+            "name": "shin.R",
+            "parent": "thigh.R",
+            "head": [
+              -0.12289062,
+              0.14885417,
+              0.008333333
+            ],
+            "tail": [
+              -0.12289062,
+              0.09677083,
+              0.0
+            ]
+          },
+          {
+            "name": "foot.L",
+            "parent": "shin.L",
+            "head": [
+              0.12289062,
+              0.09677083,
+              0.0
+            ],
+            "tail": [
+              0.12289062,
+              0.041666668,
+              0.10916666
+            ]
+          },
+          {
+            "name": "foot.R",
+            "parent": "shin.R",
+            "head": [
+              -0.12289062,
+              0.09677083,
+              0.0
+            ],
+            "tail": [
+              -0.12289062,
+              0.041666668,
+              0.10916666
+            ]
+          }
+        ],
+        "clips": [],
+        "split": false
+      },
+      "material": "Pip_skin"
+    },
+    {
+      "id": 2,
+      "name": "Pip_eye.L",
+      "shape": "Eye",
+      "translation": [
+        0.0975,
+        0.77500004,
+        0.14310357
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        0.13541666,
+        0.13541666,
+        0.13541666
+      ],
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "visible": true,
+      "parent": 1,
+      "pivot": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "pivot_comp": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "bone": "head",
+      "eye": {
+        "iris_color": [
+          0.86,
+          0.52,
+          0.12
+        ],
+        "iris_size": 0.5,
+        "pupil_size": 0.42,
+        "sclera_color": [
+          0.9,
+          0.86,
+          0.82
+        ],
+        "pupil_color": [
+          0.02,
+          0.02,
+          0.025
+        ],
+        "cornea": 0.03,
+        "veins": 0.0,
+        "limbal_ring": 0.8,
+        "style": "stylized",
+        "iris_scale": 1.35,
+        "catchlight": true
+      }
+    },
+    {
+      "id": 3,
+      "name": "Pip_eye.R",
+      "shape": "Eye",
+      "translation": [
+        -0.0975,
+        0.77500004,
+        0.14310357
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        0.13541666,
+        0.13541666,
+        0.13541666
+      ],
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "visible": true,
+      "parent": 1,
+      "pivot": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "pivot_comp": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "bone": "head",
+      "eye": {
+        "iris_color": [
+          0.86,
+          0.52,
+          0.12
+        ],
+        "iris_size": 0.5,
+        "pupil_size": 0.42,
+        "sclera_color": [
+          0.9,
+          0.86,
+          0.82
+        ],
+        "pupil_color": [
+          0.02,
+          0.02,
+          0.025
+        ],
+        "cornea": 0.03,
+        "veins": 0.0,
+        "limbal_ring": 0.8,
+        "style": "stylized",
+        "iris_scale": 1.35,
+        "catchlight": true
+      }
+    }
+  ],
+  "next_id": 3,
+  "materials": [
+    {
+      "name": "Pip_skin",
+      "keep_paint": true,
+      "roughness": 0.45,
+      "metallic": 0.0,
+      "clearcoat": 0.0,
+      "sheen": 0.15,
+      "subsurface": 0.6,
+      "scatter": [
+        0.0056,
+        0.002,
+        0.0007
+      ],
+      "subsurface_radius": 0.45,
+      "pores": 0.0,
+      "mottling": 0.1,
+      "skin_specular": 0.4,
+      "ior": 1.5,
+      "dirt_color": [
+        0.24,
+        0.19,
+        0.14
+      ],
+      "detail_strength": 1.0,
+      "detail_color": 0.35
+    }
+  ],
+  "guides": {
+    "head_units": {
+      "count": 3,
+      "bottom": -0.25,
+      "top": 1.0
+    },
+    "lines": [
+      {
+        "name": "center",
+        "x": 0.0
+      },
+      {
+        "name": "eye_line",
+        "y": 0.77500004
+      }
+    ],
+    "targets": [
+      {
+        "name": "head_ratio",
+        "of": [
+          "head"
+        ],
+        "to": "total_height",
+        "value": 0.41666666,
+        "tolerance": 0.008333333
+      },
+      {
+        "name": "eye_size",
+        "of": [
+          "Pip_eye.L"
+        ],
+        "to": "head",
+        "value": 0.325,
+        "tolerance": 0.0064999997
+      },
+      {
+        "name": "eye_spacing",
+        "between": [
+          "Pip_eye.R",
+          "Pip_eye.L"
+        ],
+        "axis": "x",
+        "per": "head_unit",
+        "value": 0.468,
+        "tolerance": 0.00936
+      },
+      {
+        "name": "eyes_on_line",
+        "between": [
+          "eye_line",
+          "Pip_eye.L"
+        ],
+        "value": 0.0,
+        "tolerance": 0.0041666664
+      }
+    ]
+  }
+}

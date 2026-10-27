@@ -192,6 +192,29 @@ impl ClideApp {
         own.or_else(|| self.scene.objects.iter().find(|o| has(o))).map(|o| o.id)
     }
 
+    /// Splits each mirrored blob of the rig clay that `moves` would move
+    /// asymmetrically (`pose::asymmetric_blobs`) into its two sides,
+    /// checked first so a refusal changes nothing.
+    pub(super) fn split_for_moves(&mut self, rig_id: u64, moves: &[pose::Move]) -> Result<Vec<pose::Split>, String> {
+        let o = self.scene.get(rig_id).ok_or("object vanished")?;
+        let (Some(rig), Some(clay)) = (o.rig.as_ref(), o.clay.as_ref()) else { return Ok(Vec::new()) };
+        let found = pose::asymmetric_blobs(clay, rig, moves);
+        if found.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (rig, mut clay) = (rig.clone(), clay.clone());
+        let mut out = Vec::new();
+        // From the last, so earlier indices stay put.
+        for (i, why) in found.into_iter().rev() {
+            let from = clay.blobs[i].name.clone();
+            let (a, b) = pose::split_mirrored(&mut clay, i, Some(&rig))?;
+            out.push(pose::Split { from, into: [a, b], why });
+        }
+        out.reverse();
+        self.scene.get_mut(rig_id).expect("checked").clay = Some(clay);
+        Ok(out)
+    }
+
     /// `pose_bone`: moves a bone's rest pose, carrying what rides it.
     pub(super) fn pose_bone(&mut self, args: &Value) -> ToolResult {
         let bone = args["bone"].as_str().ok_or("bone is required")?.to_string();
@@ -239,12 +262,24 @@ impl ClideApp {
             let ids: Vec<u64> = self.scene.objects.iter().map(|o| o.id).collect();
             self.settle_clays(ids)?;
         }
-        let mut reports = vec![(bone.clone(), pose::pose_rest(&mut self.scene, rig_id, &bone, delta, carry, &extra)?)];
+        let mut moves = vec![pose::Move { bone: bone.clone(), delta, extra: extra.clone() }];
         if args["mirror"].as_bool().unwrap_or(false) {
             let other = crate::rig::mirror_name(&bone).ok_or_else(|| format!("{bone} has no side suffix (.L/.R) to mirror"))?;
+            let o = self.scene.get(rig_id).ok_or("object vanished")?;
+            if o.rig.as_ref().is_none_or(|r| r.bone_index(&other).is_none()) {
+                return Err(format!("{} has no bone {other} to mirror {bone} onto", o.name));
+            }
             let f = Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0));
             let extra_m: Vec<String> = extra.iter().map(|n| pose::side_name(n)).collect();
-            reports.push((other.clone(), pose::pose_rest(&mut self.scene, rig_id, &other, f * delta * f, carry, &extra_m)?));
+            moves.push(pose::Move { bone: other, delta: f * delta * f, extra: extra_m });
+        }
+        // A mirrored blob is one stored side reflected across x = 0: a
+        // move that is not its own mirror (a head tilt, one arm) writes it
+        // out as its two sides first, each then moved by its own bone.
+        let split = if carry { self.split_for_moves(rig_id, &moves)? } else { Vec::new() };
+        let mut reports = Vec::new();
+        for m in &moves {
+            reports.push((m.bone.clone(), pose::pose_rest(&mut self.scene, rig_id, &m.bone, m.delta, carry, &m.extra)?));
         }
         let name = |id: u64| self.scene.get(id).map(|o| o.name.clone());
         let mut list = Vec::new();
@@ -255,12 +290,15 @@ impl ClideApp {
                 "objects_carried": r.objects.iter().filter_map(|&i| name(i)).collect::<Vec<_>>(),
                 "blobs_carried": r.blobs,
                 "weight_strokes_carried": r.strokes,
-                "approximate_blobs": Some(&r.approximate).filter(|a| !a.is_empty()),
+                "approximate_blobs": Some(r.approximate.iter().map(|(n, why)| json!({ "name": n, "why": why })).collect::<Vec<_>>()).filter(|a| !a.is_empty()),
             }));
         }
         let rig = self.scene.get(rig_id).and_then(|o| o.rig.as_ref()).expect("still there");
         let joints: serde_json::Map<String, Value> = reports.iter().flat_map(|(_, r)| r.bones.iter()).filter_map(|n| rig.bones.iter().find(|x| &x.name == n)).map(|x| (x.name.clone(), json!({ "head": round3(world.transform_point3(x.head)), "tail": round3(world.transform_point3(x.tail)) }))).collect();
         let mut out = json!({ "rig": name(rig_id), "posed": list, "rest_joints_world": joints });
+        if !split.is_empty() {
+            out["split_blobs"] = json!(split);
+        }
         if had_detail && carry {
             out["note"] = json!("sculpt and paint grids (and layers) of the rig clay stay where they are; only blobs moved");
         }

@@ -32,6 +32,14 @@ pub struct Asset {
     targets: HashMap<String, (Vec<u16>, Vec<[i16; 3]>)>,
 }
 
+/// The base mesh's points and faces (quads; `u32::MAX` 4th index = a
+/// triangle), for tests that subdivide it.
+#[cfg(test)]
+pub fn base_cage() -> (&'static [Vec3], &'static [[u32; 4]]) {
+    let a = asset();
+    (&a.base, &a.faces)
+}
+
 /// The built-in human data, unpacked on first use.
 pub fn asset() -> &'static Asset {
     static ASSET: OnceLock<Asset> = OnceLock::new();

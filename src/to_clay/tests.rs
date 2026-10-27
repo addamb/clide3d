@@ -351,3 +351,15 @@ fn primitive_clay_renders_like_the_primitive() {
         assert!(psnr >= bound, "{shape:?}: {psnr:.1} dB");
     }
 }
+
+/// The DynaMesh polish (curvature flow on the remeshed field) gives the
+/// grid it gave before its step moved into `sculpt::flow`, bit for bit.
+#[test]
+fn to_clay_polish_unchanged() {
+    let progress = crate::progress::Progress::default();
+    let boxy = clay(json!([{ "type": "box", "center": [0, 0, 0], "size": [1, 0.8, 0.6], "blend": 0 }, { "type": "sphere", "center": [0.4, 0.3, 0.2], "radius": 0.25 }]), 64);
+    let (polished, _) = remesh(&boxy, 64, 0.5, 0.7, &progress).unwrap();
+    let h = Detail::hash(polished.detail.as_ref());
+    eprintln!("dynamesh polish hash {h}");
+    assert_eq!(h.to_string(), "0c4687b91789289d8593b76a65ced678");
+}

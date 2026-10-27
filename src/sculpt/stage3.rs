@@ -283,6 +283,23 @@ fn the_mask_survives_a_resolution_change() {
     assert!((b - a).abs() <= 0.02 * a, "{a} -> {b}");
 }
 
+/// A mirrored blob makes two field prims but one group, labelled by its
+/// blob index (`Clay::blobs`), so the blobs after it keep their numbers.
+#[test]
+fn from_blobs_numbers_blobs_not_prims() {
+    let c = clay(json!([
+        { "type": "sphere", "name": "body", "center": [0, 0, 0], "radius": 0.4, "blend": 0.05 },
+        { "type": "sphere", "name": "ear", "center": [0.3, 0.3, 0], "radius": 0.12, "blend": 0.05, "mirror": true },
+        { "type": "sphere", "center": [0, -0.45, 0], "radius": 0.12, "blend": 0.05 }
+    ]), 64, Some(0.02));
+    let g = crate::groups::act(&c, None, &GroupOp::FromBlobs, &|_| None).unwrap().unwrap();
+    let info: Vec<(u16, String)> = g.data().info.iter().map(|(id, i)| (*id, i.name.clone())).collect();
+    assert_eq!(info, vec![(1, "body".to_string()), (2, "ear".to_string()), (3, "blob 2".to_string())], "{info:?}");
+    // Both ears in the ear's group.
+    let (right, left) = (g.label(Vec3::new(0.38, 0.38, 0.0)), g.label(Vec3::new(-0.38, 0.38, 0.0)));
+    assert_eq!((right, left), (2, 2));
+}
+
 #[test]
 fn from_blobs_labels_each_blob_and_hidden_groups_stop_brushes() {
     let c0 = clay(json!([

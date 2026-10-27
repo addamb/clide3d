@@ -313,18 +313,8 @@ fn smooth(clay: &Clay, blur: f32, polish: f32, progress: &crate::progress::Progr
                     if v.abs() > 4.0 {
                         continue;
                     }
-                    let (dx, dy, dz) = (1, nx, nx * ny);
-                    let g = |d: usize| (src[i + d] - src[i - d]) * 0.5;
-                    let gg = |d: usize| src[i + d] - 2.0 * v + src[i - d];
-                    let x2 = |a: usize, b: usize| (src[i + a + b] - src[i + a - b] - src[i - a + b] + src[i - a - b]) * 0.25;
-                    let (px, py, pz) = (g(dx), g(dy), g(dz));
-                    let (pxx, pyy, pzz) = (gg(dx), gg(dy), gg(dz));
-                    let (pxy, pxz, pyz) = (x2(dx, dy), x2(dx, dz), x2(dy, dz));
-                    let g2 = px * px + py * py + pz * pz;
-                    if g2 < 1e-8 {
-                        continue;
-                    }
-                    let flow = (pxx * (py * py + pz * pz) + pyy * (px * px + pz * pz) + pzz * (px * px + py * py) - 2.0 * (px * py * pxy + px * pz * pxz + py * pz * pyz)) / g2;
+                    let (sy, sz) = (nx as isize, (nx * ny) as isize);
+                    let Some(flow) = crate::sculpt::flow::curvature(|a, b, c| src[(i as isize + a + b * sy + c * sz) as usize]) else { continue };
                     slice[x + nx * y] = v + 0.15 * flow;
                 }
             }

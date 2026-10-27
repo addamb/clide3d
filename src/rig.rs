@@ -731,7 +731,11 @@ pub fn build_parts(clay: &Clay, rig: &Rig, whole: &Mesh, library: &[Material], f
     let mut parts = Vec::new();
     let list = field.bounds().map(|(lo, hi)| field.near(lo, hi)).unwrap_or_default();
     let nearest = NearestVertex::new(whole, cell * 2.0);
-    for (key, mut keep) in groups {
+    // Each part's build fills its share of what is left of the bar.
+    let (start, count) = (crate::clay::progress_fraction().unwrap_or(0.0), groups.len().max(1) as f32);
+    for (n, (key, mut keep)) in groups.into_iter().enumerate() {
+        let step = (1.0 - start) / count;
+        crate::clay::progress_range(start + step * n as f32, start + step * (n + 1) as f32);
         // Carving cuts every part.
         for i in (0..np).filter(|&i| field.is_carve(i)) {
             keep[i] = true;

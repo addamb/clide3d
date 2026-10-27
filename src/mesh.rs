@@ -4,7 +4,7 @@
 //! The renderer draws both sides and turns normals toward the camera, so the
 //! viewport would hide a backward triangle; exported files would not.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::f32::consts::{PI, TAU};
 use std::sync::Arc;
 
@@ -55,6 +55,15 @@ pub struct MeshLib {
     pub aliases_installed: usize,
     #[cfg(test)]
     pub fine_builds: usize,
+    /// Viewport quality shades measured (`sync_overlays`' jobs started).
+    #[cfg(test)]
+    pub shade_jobs: usize,
+    /// While set, shade jobs wait before measuring (tests hold them).
+    #[cfg(test)]
+    pub hold_shades: Arc<std::sync::atomic::AtomicBool>,
+    /// While set, background Poly mesh builds wait before building.
+    #[cfg(test)]
+    pub hold_polys: Arc<std::sync::atomic::AtomicBool>,
     /// Clay builds `sync` waited for (not finished when it joined them).
     #[cfg(test)]
     pub blocking_joins: usize,
@@ -66,7 +75,12 @@ pub struct MeshLib {
     clay: HashMap<u64, ClayEntry>,
     /// Eye meshes by object, with the glow (emission) they were built with.
     eyes: HashMap<u64, (EyeKey, Arc<Mesh>)>,
-    hairs: HashMap<u64, (Hair, Arc<Mesh>)>,
+    /// Hair cards by object: what they were built from, the mesh, and
+    /// how many cards the head moved (`Hair::build_mesh_kept_out`).
+    hairs: HashMap<u64, (HairKey, Arc<Mesh>, usize)>,
+    /// Reference image planes by object (`refplane.rs`): what each mesh was
+    /// made from.
+    refs: HashMap<u64, (crate::refplane::RefPlane, Arc<Mesh>)>,
     fires: HashMap<u64, (crate::fire::Settings, usize, usize, Arc<Mesh>)>,
     /// Kit pieces and terrains, by object, with what they were built from.
     kits: HashMap<u64, (EnvKey, Arc<Mesh>)>,
@@ -80,11 +94,17 @@ pub struct MeshLib {
     pub show_fine: bool,
     /// The mask and group overlay the viewport draws clay with.
     pub overlay: crate::overlay::Overlay,
+    /// The quality shade the viewport draws clay with (`set_display
+    /// shade`): curvature, lumpiness or normals as vertex colors.
+    pub shade: crate::quality::Shade,
     /// How long the last overlay tint took (ms).
     #[cfg(test)]
     pub overlay_ms: f64,
     /// Clay meshes and fine meshes being built on other threads.
     pending: Pending,
+    /// Seconds each clay object's last mesh build took, by (object, fine)
+    /// (what `edit_clay` estimates a pending build from).
+    last_build: HashMap<(u64, bool), f32>,
     /// Clay objects drawing the same mesh as a lower id: that id, whose
     /// `MeshKey` they draw with (see `key_of`).
     owner_of: HashMap<u64, u64>,
@@ -123,7 +143,14 @@ enum EnvKey {
     Terrain(crate::envkit::terrain::Terrain, Option<Material>, Vec<Material>),
     Part(crate::kitbash::Part, Vec<Material>),
     /// An imported mesh (`Shape::Mesh`), drawn in its object's material.
+    /// Damage is not drawn on it (the damage tool refuses it; a file's is
+    /// left out, see `sync_env`).
     Imported(crate::mesh_asset::MeshAsset),
+    /// A polygon object (`Shape::Poly`) as its shown level draws it: the
+    /// object less what does not change that (`made_by`, finer levels).
+    /// No damage, as `Imported`. Built on another thread in the
+    /// background (`Pending::poly`).
+    Poly(crate::poly::Poly),
 }
 
 /// Background builds by object id. Not copied with the library (a copy is
@@ -142,6 +169,22 @@ struct Pending {
     alias: HashMap<u64, (u64, BuildKey)>,
     /// `content_hash` of each clay build's key, when it can be shared.
     hashes: HashMap<u64, u64>,
+    /// The viewport's quality shade being measured, by clay object: what
+    /// it is for (as `ClayEntry::shaded`) and the thread making the
+    /// colored mesh. A job for an older key finishes unseen.
+    shade: HashMap<u64, (TintKey, std::thread::JoinHandle<Arc<Mesh>>)>,
+    /// Clay builds that mesh the shape anew (not a shading refresh or a
+    /// new skin on the old shell): only their time is `last_build`.
+    geometry: HashSet<u64>,
+    /// Poly meshes (a shown level of up to 4M faces) being built, by
+    /// object: the old mesh shows until the build for the current key
+    /// is in; one for an older key finishes unseen.
+    poly: HashMap<u64, Build<EnvKey, Mesh>>,
+    /// Hair cards being built (and kept out of the head), by object: the
+    /// old cards show until they are in. One build runs per hair at a
+    /// time; one for an older key is still put in when it ends (closer
+    /// than nothing), and the next starts from there.
+    hair: HashMap<u64, (HairKey, std::thread::JoinHandle<(Mesh, usize)>)>,
 }
 
 /// A fine mesh (with its skin) or why it could not be built.
@@ -223,7 +266,19 @@ impl Drop for FineSlot {
     }
 }
 
-type Build<K, T> = (K, String, std::time::Instant, std::thread::JoinHandle<T>);
+/// (what it builds for, object name, start, the thread, how far it is).
+type Build<K, T> = (K, String, std::time::Instant, std::thread::JoinHandle<T>, Arc<crate::progress::Progress>);
+
+/// A mesh build running in the background (`MeshLib::building`).
+#[derive(Debug)]
+pub struct Building {
+    /// The clay object (None for a fine mesh, which objects may share).
+    pub object: Option<u64>,
+    pub what: String,
+    pub seconds: f32,
+    /// 0..1, never going back (`Clay::build_window_cells` reports it).
+    pub fraction: f32,
+}
 
 impl Clone for Pending {
     fn clone(&self) -> Self {
@@ -241,6 +296,42 @@ struct BuildKey {
     fallback: String,
     /// The bones and split mode, for rigged clay.
     rig: Option<(Vec<Bone>, bool, Vec<rig::WeightStroke>)>,
+}
+
+/// What a hair object's cards are built from (`MeshLib::hair_key`).
+#[derive(Clone, PartialEq)]
+struct HairKey {
+    hair: Hair,
+    head: Option<HeadKey>,
+}
+
+/// The clay a hair sits on, as its mesh is drawn: the clay that mesh was
+/// built from, the mesh (its bounds are read on the card thread; the key
+/// compares it by pointer, so no frame scans its vertices), and where the
+/// head and the hair are.
+#[derive(Clone)]
+struct HeadKey {
+    clay: Clay,
+    whole: Arc<Mesh>,
+    head_world: Mat4,
+    hair_world: Mat4,
+}
+
+impl PartialEq for HeadKey {
+    fn eq(&self, o: &Self) -> bool {
+        Arc::ptr_eq(&self.whole, &o.whole) && self.head_world == o.head_world && self.hair_world == o.hair_world && self.clay == o.clay
+    }
+}
+
+/// A hair's cards for `key`, kept out of its head (to the hair's lift, in
+/// world units as film strands are) when it has one, and how many moved.
+fn hair_cards(key: &HairKey) -> (Mesh, usize) {
+    let Some(h) = &key.head else { return (key.hair.build_mesh(), 0) };
+    let Ok(head) = crate::groom::head::Head::new(&h.clay, h.whole.bounds(), h.head_world) else { return (key.hair.build_mesh(), 0) };
+    let mut hair = key.hair.clone();
+    hair.sanitize();
+    let scale = h.hair_world.to_scale_rotation_translation().0.abs().max_element().max(1e-9);
+    key.hair.build_mesh_kept_out(Some(&crate::groom::head::InHair::new(&head, h.hair_world, hair.lift * scale)))
 }
 
 /// What a clay object's meshes are built from.
@@ -326,7 +417,13 @@ impl BuildKey {
     /// Builds the meshes; `whole` reuses an existing shell when only the
     /// rig changed.
     fn build(&self, whole: Option<Arc<Mesh>>) -> Built {
-        let whole = whole.unwrap_or_else(|| Arc::new(self.clay.build_mesh_with(&self.library, &self.fallback)));
+        // A split rig meshes again per part: the whole shell fills the
+        // first half of the bar, the parts the rest (`rig::build_parts`).
+        let split = self.rig.as_ref().is_some_and(|r| r.1);
+        let whole = whole.unwrap_or_else(|| {
+            if split { crate::clay::progress_range(0.0, 0.5); }
+            Arc::new(self.clay.build_mesh_with(&self.library, &self.fallback))
+        });
         let Some((bones, split, weights)) = &self.rig else { return Built { fine: None, rest: whole.clone(), whole, parts: Vec::new(), skin: None } };
         let rig = Rig { bones: bones.clone(), clips: Vec::new(), active: None, split: *split, weights: weights.clone() };
         if *split {
@@ -369,9 +466,15 @@ struct ClayEntry {
     /// The drawn mesh with the mask and group overlay (see `overlay.rs`),
     /// and what it was made from: (drawn mesh, mask, groups, overlay).
     tinted: Option<(TintKey, Arc<Mesh>)>,
+    /// `tinted` (else the drawn mesh) colored by the viewport's quality
+    /// shade (`MeshLib::shade`), and what it was made from.
+    shaded: Option<(TintKey, Arc<Mesh>)>,
 }
 
-type TintKey = (usize, Option<usize>, Option<usize>, crate::overlay::Overlay);
+type TintKey = (usize, Option<usize>, Option<usize>, crate::overlay::Overlay, crate::quality::Shade);
+
+/// Surface points the viewport's lumpiness shade measures per clay.
+pub const SHADE_SAMPLES: usize = 20_000;
 
 /// A mesh made from a clay entry's `rest`: a baked game mesh (see
 /// `bake.rs`) or a fine mesh.
@@ -380,6 +483,9 @@ struct Baked {
     settings: bake::Settings,
     /// The rest mesh it was baked from; a new one makes it stale.
     from: Arc<Mesh>,
+    /// `lowpoly: {poly}`: the Poly and placement it was baked from; a
+    /// changed Poly (a new projection, UVs) makes it stale.
+    low: Option<LowJob>,
     mesh: Arc<Mesh>,
     skin: Option<Arc<Skin>>,
     shown: Arc<Mesh>,
@@ -388,7 +494,7 @@ struct Baked {
 
 impl MeshLib {
     pub fn new() -> Self {
-        Self { #[cfg(test)] geometry_builds:0, #[cfg(test)] shading_updates:0, #[cfg(test)] aliases_installed:0, #[cfg(test)] fine_builds:0, #[cfg(test)] blocking_joins: 0, #[cfg(test)] no_sharing:false, #[cfg(test)] overlay_ms: 0.0, overlay: crate::overlay::Overlay::default(), owner_of: HashMap::new(), solids: HashMap::new(), prims: Mesh::all().into_iter().map(|(s, m)| (s, Arc::new(m))).collect(), clay: HashMap::new(), eyes: HashMap::new(), hairs: HashMap::new(), fires: HashMap::new(), kits: HashMap::new(), scatter_bounds: HashMap::new(), frame: None, show_baked: false, show_fine: false, pending: Pending::default(), chunked: HashMap::new(), sessions: Default::default(), sculpt_tool: Default::default(), previews: Default::default(), session_now: None, bvhs: Default::default(), chunk_timing: (0.0, 0.0), deferred: Default::default(), palettes: Default::default(), #[cfg(test)] chunk_builds: 0, #[cfg(test)] slim_updates: 0 }
+        Self { #[cfg(test)] geometry_builds:0, #[cfg(test)] shading_updates:0, #[cfg(test)] aliases_installed:0, #[cfg(test)] fine_builds:0, #[cfg(test)] shade_jobs: 0, #[cfg(test)] hold_shades: Default::default(), #[cfg(test)] hold_polys: Default::default(), #[cfg(test)] blocking_joins: 0, #[cfg(test)] no_sharing:false, #[cfg(test)] overlay_ms: 0.0, overlay: crate::overlay::Overlay::default(), shade: crate::quality::Shade::default(), owner_of: HashMap::new(), solids: HashMap::new(), prims: Mesh::all().into_iter().map(|(s, m)| (s, Arc::new(m))).collect(), clay: HashMap::new(), eyes: HashMap::new(), hairs: HashMap::new(), refs: HashMap::new(), fires: HashMap::new(), kits: HashMap::new(), scatter_bounds: HashMap::new(), frame: None, show_baked: false, show_fine: false, pending: Pending::default(), last_build: HashMap::new(), chunked: HashMap::new(), sessions: Default::default(), sculpt_tool: Default::default(), previews: Default::default(), session_now: None, bvhs: Default::default(), chunk_timing: (0.0, 0.0), deferred: Default::default(), palettes: Default::default(), #[cfg(test)] chunk_builds: 0, #[cfg(test)] slim_updates: 0 }
     }
 
     pub fn prims(&self) -> impl Iterator<Item = (MeshKey, Arc<Mesh>)> + '_ {
@@ -416,21 +522,34 @@ impl MeshLib {
 
     /// Whether builds are running (see `sync_background`).
     pub fn busy(&self) -> bool {
-        !self.pending.clay.is_empty() || !self.pending.fine.is_empty() || !self.deferred.is_empty()
+        !self.pending.clay.is_empty() || !self.pending.fine.is_empty() || !self.pending.poly.is_empty() || !self.pending.hair.is_empty() || !self.deferred.is_empty()
     }
 
     /// Whether `sync` would build anything now: a clay's meshes are not
     /// for its shape as it is (its build not started yet, or deferred),
-    /// or a fine mesh it shows is not built. `busy` covers builds already
+    /// or a fine mesh it shows is not built, or a Poly's drawn mesh is not
+    /// for its shown level as it is. `busy` covers builds already
     /// running; the window waits for neither before a call that syncs.
     pub fn stale(&self, scene: &Scene) -> bool {
-        scene.objects.iter().filter(|o| o.shape == Shape::Clay).any(|o| match self.clay.get(&o.id) {
+        scene.objects.iter().any(|o| match o.shape {
+            Shape::Clay => self.stale_object(scene, o),
+            // Its drawn mesh is not for its shown level as it is.
+            Shape::Poly => poly_key(o).is_some_and(|k| !self.kits.get(&o.id).is_some_and(|(have, _)| *have == k)),
+            // Its cards are not for the hair (or its head) as it is.
+            Shape::Hair => !self.hairs.get(&o.id).is_some_and(|(have, _, _)| *have == self.hair_key(scene, o)),
+            _ => false,
+        })
+    }
+
+    /// `stale` for one clay object: its meshes are not for it as it is.
+    pub fn stale_object(&self, scene: &Scene, o: &Object) -> bool {
+        match self.clay.get(&o.id) {
             None => true,
             Some(e) => {
                 let fine = e.fine.as_ref().is_some_and(|f| Arc::ptr_eq(&f.from, &e.rest)) || e.fine_error.as_ref().is_some_and(|f| Arc::ptr_eq(&f.0, &e.rest));
                 e.key != clay_key(scene, o, &self.palettes) || (self.show_fine && !e.use_baked && e.key.clay.detail_cell.is_some() && !fine)
             }
-        })
+        }
     }
 
     /// `sync`, then joins sculpt sessions' chunk builds (which `sync`
@@ -443,10 +562,34 @@ impl MeshLib {
         self.sync_chunks(&clays, &keys, true);
     }
 
-    /// Running builds: (what, seconds so far).
-    pub fn building(&self) -> Vec<(String, f32)> {
-        let clay = self.pending.clay.values().map(|(_, n, t, _)| (format!("Building mesh {n}"), t.elapsed().as_secs_f32()));
-        clay.chain(self.pending.fine.values().map(|((_, n, t, _), _)| (format!("Building fine mesh {n}"), t.elapsed().as_secs_f32()))).collect()
+    /// Running builds, clay meshes by object id, then fine meshes.
+    pub fn building(&self) -> Vec<Building> {
+        let mut clay: Vec<(&u64, &Build<BuildKey, Built>)> = self.pending.clay.iter().collect();
+        clay.sort_by_key(|(id, _)| **id);
+        let clay = clay.into_iter().map(|(id, (_, n, t, _, p))| Building { object: Some(*id), what: format!("Building mesh {n}"), seconds: t.elapsed().as_secs_f32(), fraction: p.fraction() });
+        let mut poly: Vec<(&u64, &Build<EnvKey, Mesh>)> = self.pending.poly.iter().collect();
+        poly.sort_by_key(|(id, _)| **id);
+        let poly = poly.into_iter().map(|(id, (_, n, t, _, p))| Building { object: Some(*id), what: format!("Building mesh {n}"), seconds: t.elapsed().as_secs_f32(), fraction: p.fraction() });
+        clay.chain(poly).chain(self.pending.fine.values().map(|((_, n, t, _, p), _)| Building { object: None, what: format!("Building fine mesh {n}"), seconds: t.elapsed().as_secs_f32(), fraction: p.fraction() })).collect()
+    }
+
+    /// How long a clay object's last regular (or fine) mesh build took
+    /// (None before its first).
+    pub fn last_build_seconds(&self, id: u64, fine: bool) -> Option<f32> {
+        self.last_build.get(&(id, fine)).copied()
+    }
+
+    /// The build making an object's meshes now, and whether it is a fine
+    /// mesh: its own clay build, the build of the object it waits for (the
+    /// same shape, see `Pending::alias`; `object` is that one), or the fine
+    /// mesh it shows (objects sharing a rest mesh share that build).
+    pub fn building_for(&self, id: u64) -> Option<(Building, bool)> {
+        let builder = if self.pending.clay.contains_key(&id) { Some(id) } else { self.pending.alias.get(&id).map(|a| a.0) };
+        if let Some(b) = builder && let Some((_, n, t, _, p)) = self.pending.clay.get(&b) {
+            return Some((Building { object: Some(b), what: format!("Building mesh {n}"), seconds: t.elapsed().as_secs_f32(), fraction: p.fraction() }, false));
+        }
+        let ((_, n, t, _, p), _) = self.pending.fine.get(&self.clay.get(&id)?.fine_slot())?;
+        Some((Building { object: None, what: format!("Building fine mesh {n}"), seconds: t.elapsed().as_secs_f32(), fraction: p.fraction() }, true))
     }
 
     fn sync_with(&mut self, scene: &Scene, wait: bool, wait_fine: bool) {
@@ -472,13 +615,8 @@ impl MeshLib {
             }
         }
         self.kits.retain(|id, _| live.contains(id));
-        for o in objects.iter().filter(|o| o.shape == Shape::Hair) {
-            let hair = o.hair.clone().unwrap_or_default();
-            if !self.hairs.get(&o.id).is_some_and(|(h, _)| *h == hair) {
-                let mesh = Arc::new(hair.build_mesh());
-                self.hairs.insert(o.id, (hair, mesh));
-            }
-        }
+        self.pending.poly.retain(|id, _| live.contains(id));
+        self.pending.hair.retain(|id, _| live.contains(id));
         for o in objects.iter().filter(|o| o.shape == Shape::Eye) {
             // An eye keeps its own sclera and cornea; a glowing object
             // material (glowing eyes) lights both.
@@ -501,7 +639,9 @@ impl MeshLib {
         self.clay.retain(|id, _| live.contains(id));
         self.palettes.lock().unwrap_or_else(|e| e.into_inner()).retain(|id, _| live.contains(id));
         self.pending.clay.retain(|id, _| live.contains(id));
+        self.last_build.retain(|(id, _), _| live.contains(id));
         self.pending.alias.retain(|id, _| live.contains(id));
+        self.pending.shade.retain(|id, _| live.contains(id));
         self.pending.hashes.retain(|id, _| live.contains(id));
         let clays: Vec<&Object> = objects.iter().filter(|o| o.shape == Shape::Clay).collect();
         let keys: Vec<BuildKey> = clays.iter().map(|o| clay_key(scene, o, &self.palettes)).collect();
@@ -585,10 +725,13 @@ impl MeshLib {
                 let copy = key.rig.is_some() && reuse.as_ref().is_some_and(|w| self.clay.iter().any(|(id, e)| *id != o.id && (Arc::ptr_eq(&e.whole, w) || Arc::ptr_eq(&e.rest, w))));
                 let shading = self.clay.get(&o.id).filter(|e| e.key.same_geometry(key) && e.key.rig == key.rig)
                     .map(|e| (e.whole.clone(), e.rest.clone(), e.parts.clone(), e.skin.clone(), e.fine.as_ref().filter(|f|Arc::ptr_eq(&f.from,&e.rest)).cloned()));
+                let geometry = shading.is_none() && reuse.is_none();
                 #[cfg(test)]
-                {if shading.is_some(){self.shading_updates+=1;}else if reuse.is_none(){self.geometry_builds+=1;}}
+                {if shading.is_some(){self.shading_updates+=1;}else if geometry{self.geometry_builds+=1;}}
                 let k = key.clone();
-                let handle = std::thread::Builder::new().name(format!("mesh {}", o.name)).spawn(move || {
+                let progress = Arc::new(crate::progress::Progress::default());
+                let reports = progress.clone();
+                let handle = std::thread::Builder::new().name(format!("mesh {}", o.name)).spawn(move || crate::clay::with_progress(reports, || {
                     if let Some((whole, rest, parts, skin, fine)) = shading {
                         let shared = Arc::ptr_eq(&whole, &rest);
                         let whole = Arc::new(crate::mesh_shading::refresh(&k.clay, &k.library, &k.fallback, &whole, &[]));
@@ -601,9 +744,10 @@ impl MeshLib {
                         });
                         Built { fine, whole, rest, parts, skin }
                     } else { k.build(reuse.map(|w| if copy { Arc::new(Mesh::clone(&w)) } else { w })) }
-                }).expect("mesh thread starts");
+                })).expect("mesh thread starts");
                 // A build for older settings is dropped (it finishes unseen).
-                self.pending.clay.insert(o.id, (key.clone(), o.name.clone(), std::time::Instant::now(), handle));
+                self.pending.clay.insert(o.id, (key.clone(), o.name.clone(), std::time::Instant::now(), handle, progress));
+                if geometry { self.pending.geometry.insert(o.id); } else { self.pending.geometry.remove(&o.id); }
                 match h {
                     Some(h) => self.pending.hashes.insert(o.id, *h),
                     None => self.pending.hashes.remove(&o.id),
@@ -622,8 +766,11 @@ impl MeshLib {
             if wait || ready {
                 #[cfg(test)]
                 {self.blocking_joins += usize::from(!ready);}
-                let (built_key, _, _, handle) = self.pending.clay.remove(&o.id).expect("pending");
+                let (built_key, _, started, handle, _) = self.pending.clay.remove(&o.id).expect("pending");
                 let built = handle.join().expect("mesh build");
+                if self.pending.geometry.remove(&o.id) {
+                    self.last_build.insert((o.id, false), started.elapsed().as_secs_f32());
+                }
                 stale |= built_key != *key;
                 self.install(o.id, built_key, built);
             }
@@ -643,7 +790,19 @@ impl MeshLib {
         if stale && wait { self.sync_with(scene, true, wait_fine); return; }
         for o in objects.iter().filter(|o| o.shape == Shape::Clay) {
             let rig = o.rig.as_ref().filter(|r| !r.bones.is_empty());
+            // A bake from a Poly is stale once what it read of the Poly
+            // (cage, creases, UVs, displacement, placement) changes, or the
+            // setting names another simple mesh: it is dropped, so it is
+            // neither shown nor exported (the next bake or export makes it
+            // again).
+            let low_stale = self.clay.get(&o.id).and_then(|e| e.baked.as_ref()).is_some_and(|b| {
+                let want = o.bake.and_then(|s| low_job(scene, o.id, s).ok().flatten());
+                b.low != want
+            });
             let Some(e) = self.clay.get_mut(&o.id) else { continue };
+            if low_stale {
+                e.baked = None;
+            }
             // Pose only with a skin made for these bones (one may be on its way).
             let Some(rig) = rig.filter(|r| e.skin.as_ref().is_some_and(|(b, _, _)| *b == r.bones)) else {
                 if e.posed_for.is_some() || !Arc::ptr_eq(&e.shown, &e.rest) {
@@ -715,7 +874,8 @@ impl MeshLib {
             }
         }
         self.solids.retain(|id,_|objects.iter().any(|o|o.id==*id));
-        for o in objects.iter().filter(|o| !o.shape.own_mesh() && o.shape.is_mesh() && crate::damage::own_primitive(o)) {
+        // (A reference plane draws its image whatever its material: `refs`.)
+        for o in objects.iter().filter(|o| !o.shape.own_mesh() && o.shape.is_mesh() && !o.is_reference() && crate::damage::own_primitive(o)) {
             let m=crate::damage::world_material(scene.material_of(o),scene.world_matrix(o.id));
             let key=(o.shape,m.clone(),o.damage.clone());
             if self.solids.get(&o.id).is_some_and(|(k,_)|*k==key) {continue;}
@@ -725,8 +885,16 @@ impl MeshLib {
             crate::damage::displace_mesh(&mut mesh,&o.damage);
             self.solids.insert(o.id,(key,Arc::new(mesh)));
         }
-        self.sync_env(scene);
+        self.sync_env(scene, wait);
         self.sync_fine(scene, wait_fine);
+        self.sync_hairs(scene, wait);
+        self.refs.retain(|id, _| scene.get(*id).is_some_and(Object::is_reference));
+        for o in scene.objects.iter() {
+            let Some(r) = &o.reference else { continue };
+            if !self.refs.get(&o.id).is_some_and(|(k, _)| k == r) {
+                self.refs.insert(o.id, (r.clone(), Arc::new(r.mesh())));
+            }
+        }
         self.sync_overlays(scene);
         // Who draws with whose mesh: the lowest id among objects showing
         // the same one (a tinted mesh is its own).
@@ -748,29 +916,103 @@ impl MeshLib {
     /// the mesh, the mask, the groups or the overlay changed. No mesh is
     /// built.
     fn sync_overlays(&mut self, scene: &Scene) {
-        let overlay = self.overlay;
+        let (overlay, shade) = (self.overlay, self.shade);
+        let sculpting: HashSet<u64> = if shade.colors() { self.clay.keys().copied().filter(|id| self.sculpting_now(*id)).collect() } else { HashSet::new() };
         for o in scene.objects.iter().filter(|o| o.shape == Shape::Clay) {
             let Some(e) = self.clay.get_mut(&o.id) else { continue };
             let clay = o.clay.as_ref();
             let mask = clay.and_then(|c| c.sculpt_mask.as_ref()).filter(|_| overlay != crate::overlay::Overlay::None);
             let groups = clay.and_then(|c| c.groups.as_ref()).filter(|g| overlay == crate::overlay::Overlay::Groups || !g.hidden().is_empty());
+            let tint_key = (Arc::as_ptr(e.drawn()) as usize, mask.map(|m| m.addr()), groups.map(|g| g.addr()), overlay, crate::quality::Shade::Beauty);
             if mask.is_none() && groups.is_none() {
                 e.tinted = None;
+            } else if !e.tinted.as_ref().is_some_and(|t| t.0 == tint_key) {
+                #[cfg(test)]
+                let t = std::time::Instant::now();
+                let mesh = crate::overlay::tint(e.drawn(), e.unposed(), mask, groups, overlay == crate::overlay::Overlay::Groups);
+                #[cfg(test)]
+                {
+                    self.overlay_ms = t.elapsed().as_secs_f64() * 1000.0;
+                }
+                e.tinted = Some((tint_key, Arc::new(mesh)));
+            }
+            if !shade.colors() {
+                e.shaded = None;
+                self.pending.shade.remove(&o.id);
                 continue;
             }
-            let key = (Arc::as_ptr(e.drawn()) as usize, mask.map(|m| m.addr()), groups.map(|g| g.addr()), overlay);
-            if e.tinted.as_ref().is_some_and(|t| t.0 == key) {
+            let key = (tint_key.0, tint_key.1, tint_key.2, overlay, shade);
+            if e.shaded.as_ref().is_some_and(|t| t.0 == key) {
+                self.pending.shade.remove(&o.id);
                 continue;
             }
-            #[cfg(test)]
-            let t = std::time::Instant::now();
-            let mesh = crate::overlay::tint(e.drawn(), e.unposed(), mask, groups, overlay == crate::overlay::Overlay::Groups);
+            // Out of date: drawn plain (as without the shade) until the
+            // colors for this mesh are measured, off this thread. One job
+            // per clay at a time: a newer mesh waits for the running one
+            // (a burst of edits measures twice, not once per edit).
+            e.shaded = None;
+            if let Some((k, job)) = self.pending.shade.remove(&o.id) {
+                if !job.is_finished() {
+                    self.pending.shade.insert(o.id, (k, job));
+                    continue;
+                }
+                let done = job.join().expect("shade thread");
+                if k == key {
+                    e.shaded = Some((key, done));
+                    continue;
+                }
+            }
+            // Not while strokes come in: their chunks show meanwhile, and the
+            // regular mesh the colors are for is rebuilt once they pause.
+            if sculpting.contains(&o.id) {
+                continue;
+            }
+            let Some(clay) = clay.cloned() else { continue };
+            let (plain, unposed) = (e.plain().clone(), e.unposed().clone());
             #[cfg(test)]
             {
-                self.overlay_ms = t.elapsed().as_secs_f64() * 1000.0;
+                self.shade_jobs += 1;
             }
-            e.tinted = Some((key, Arc::new(mesh)));
+            #[cfg(test)]
+            let hold = self.hold_shades.clone();
+            let job = std::thread::Builder::new().name(format!("shade {}", o.name)).spawn(move || {
+                #[cfg(test)]
+                {
+                    while hold.load(std::sync::atomic::Ordering::Acquire) {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                // The quality shade's colors replace the tint's (hidden
+                // groups stay hidden: the vertices are the same).
+                let mut mesh = Mesh::clone(&plain);
+                if let Some(colors) = crate::quality::shade_colors(shade, &clay, &unposed, SHADE_SAMPLES) {
+                    for (v, c) in mesh.vertices.iter_mut().zip(colors) {
+                        v.color = c;
+                    }
+                }
+                Arc::new(mesh)
+            }).expect("shade thread starts");
+            self.pending.shade.insert(o.id, (key, job));
         }
+    }
+
+    /// Whether the viewport's quality shade is being measured (or waits
+    /// for strokes to pause) for some clay: its colors show once done.
+    pub fn shading(&self) -> bool {
+        !self.pending.shade.is_empty() || (self.shade.colors() && self.clay.iter().any(|(id, e)| e.shaded.is_none() && self.sculpting_now(*id)))
+    }
+
+    /// Whether clay `id` is drawn in the viewport's quality shade now: its
+    /// colors are measured for the mesh it shows, and no stroke or regular
+    /// rebuild is on its way (chunks or the plain mesh show meanwhile).
+    pub fn shaded_now(&self, id: u64) -> bool {
+        self.shade.colors() && self.clay.get(&id).is_some_and(|e| e.shaded.is_some()) && !self.sculpting_now(id) && !self.deferred.contains(&id) && !self.pending.clay.contains_key(&id)
+    }
+
+    /// A clay's drawn mesh unposed (in its own space: vertex i is the drawn
+    /// mesh's vertex i), where its field is.
+    pub fn unposed(&self, id: u64) -> Option<&Arc<Mesh>> {
+        self.clay.get(&id).map(ClayEntry::unposed)
     }
 
     /// The mesh the viewport draws and picks for an object: as `get`, with
@@ -806,8 +1048,8 @@ impl MeshLib {
     }
 
     /// Builds kit pieces and terrains whose settings changed, and measures
-    /// scatter objects.
-    fn sync_env(&mut self, scene: &Scene) {
+    /// scatter objects. Poly meshes build on other threads unless `wait`.
+    fn sync_env(&mut self, scene: &Scene, wait: bool) {
         let own_material = |o: &Object| o.material.as_ref().map(|_| crate::damage::world_material(scene.material_of(o),scene.world_matrix(o.id)));
         for o in &scene.objects {
             let key = match (o.shape, &o.kit, &o.terrain) {
@@ -820,9 +1062,18 @@ impl MeshLib {
                     EnvKey::Part(p,lib)
                 },
                 (Shape::Mesh, _, _) if o.mesh.is_some() => EnvKey::Imported(o.mesh.clone().expect("checked")),
-                _ => continue,
+                (Shape::Poly, _, _) if o.poly.is_some() => poly_key(o).expect("checked"),
+                _ => {
+                    self.pending.poly.remove(&o.id);
+                    continue;
+                }
             };
             if self.kits.get(&o.id).is_some_and(|(k, _)| *k == key) {
+                self.pending.poly.remove(&o.id);
+                continue;
+            }
+            if let EnvKey::Poly(p) = &key {
+                self.sync_poly(o, &key, p, wait);
                 continue;
             }
             if let Some((old, source))=self.kits.get(&o.id)
@@ -838,8 +1089,13 @@ impl MeshLib {
                 EnvKey::Terrain(t, m, lib) => t.build(lib, m.as_ref()),
                 EnvKey::Part(p, lib) => p.build(lib),
                 EnvKey::Imported(a) => Mesh::imported(a),
+                EnvKey::Poly(p) => Mesh::poly(p),
             };
-            if !o.damage.is_empty() {crate::damage::displace_mesh(&mut mesh,&o.damage);}
+            // Imported meshes and Polys carry no materials of their own
+            // (they draw in the object's): the damage tool refuses them,
+            // and a file's damage on one is left out, not displaced (which
+            // read their materials and panicked).
+            if !o.damage.is_empty() && !matches!(key, EnvKey::Imported(_)) {crate::damage::displace_mesh(&mut mesh,&o.damage);}
             self.kits.insert(o.id, (key, Arc::new(mesh)));
         }
         self.scatter_bounds.clear();
@@ -866,6 +1122,112 @@ impl MeshLib {
         }
     }
 
+    /// What hair object `o`'s cards are built from: the hair, and the clay
+    /// it sits on (its nearest clay ancestor, as `groom` and film strands
+    /// use) as that clay's mesh is drawn, once it has one. Both at rest
+    /// (`Scene::rest_world_matrix`): the head's field is its rest shape,
+    /// and the cards, in the hair's space, follow the pose when drawn.
+    fn hair_key(&self, scene: &Scene, o: &Object) -> HairKey {
+        let hair = o.hair.clone().unwrap_or_default();
+        let head = scene.ancestors(o.id).into_iter().find(|&a| scene.get(a).is_some_and(|p| p.shape == Shape::Clay)).and_then(|a| {
+            let e = self.clay.get(&a)?;
+            Some(HeadKey { clay: e.key.clay.clone(), whole: e.whole.clone(), head_world: scene.rest_world_matrix(a), hair_world: scene.rest_world_matrix(o.id) })
+        });
+        HairKey { hair, head }
+    }
+
+    /// Hair cards for every hair object: built on another thread in the
+    /// background (`wait` false; the old cards show until they are in),
+    /// one build per hair at a time; `wait` joins a build for the current
+    /// key or builds here.
+    fn sync_hairs(&mut self, scene: &Scene, wait: bool) {
+        let live: HashSet<u64> = scene.objects.iter().filter(|o| o.shape == Shape::Hair).map(|o| o.id).collect();
+        self.hairs.retain(|id, _| live.contains(id));
+        self.pending.hair.retain(|id, _| live.contains(id));
+        for o in scene.objects.iter().filter(|o| o.shape == Shape::Hair) {
+            let key = self.hair_key(scene, o);
+            if let Some((have, _, _)) = self.hairs.get_mut(&o.id)
+                && *have == key
+            {
+                // Equal: keep the mesh, and the scene's copy as the key,
+                // so later frames compare shared guides by pointer.
+                *have = key;
+                self.pending.hair.remove(&o.id);
+                continue;
+            }
+            let running = self.pending.hair.get(&o.id).map(|(k, h)| (*k == key, h.is_finished()));
+            match running {
+                Some((current, finished)) if finished || (wait && current) => {
+                    let (built, handle) = self.pending.hair.remove(&o.id).expect("running");
+                    let (mesh, moved) = handle.join().expect("hair card build");
+                    self.hairs.insert(o.id, (built, Arc::new(mesh), moved));
+                    if !current {
+                        // Built for an older key: start again from here.
+                        self.start_hair(o, key, wait);
+                    }
+                }
+                Some((false, _)) if wait => {
+                    self.pending.hair.remove(&o.id);
+                    self.start_hair(o, key, true);
+                }
+                Some(_) => {}
+                None => self.start_hair(o, key, wait),
+            }
+        }
+    }
+
+    /// Builds hair `o`'s cards for `key`, here (`wait`) or on a thread.
+    fn start_hair(&mut self, o: &Object, key: HairKey, wait: bool) {
+        if wait {
+            let (mesh, moved) = hair_cards(&key);
+            self.hairs.insert(o.id, (key, Arc::new(mesh), moved));
+            return;
+        }
+        let k = key.clone();
+        let handle = std::thread::Builder::new().name(format!("hair cards {}", o.name)).spawn(move || hair_cards(&k)).expect("hair card thread starts");
+        self.pending.hair.insert(o.id, (key, handle));
+    }
+
+    /// How many of hair `id`'s drawn cards its head moved (None before
+    /// its cards are built).
+    pub fn hair_cards_moved(&self, id: u64) -> Option<usize> {
+        self.hairs.get(&id).map(|e| e.2)
+    }
+
+    /// A Poly's drawn mesh for `key`: its shown level of up to 4M faces
+    /// takes a while, so in the background (`wait` false) it is built on
+    /// another thread and the old mesh shows until it is in (a build for
+    /// an older key finishes unseen); `wait` joins it, or builds here.
+    fn sync_poly(&mut self, o: &Object, key: &EnvKey, p: &crate::poly::Poly, wait: bool) {
+        let running = self.pending.poly.get(&o.id).is_some_and(|b| b.0 == *key);
+        if !running {
+            if wait {
+                self.pending.poly.remove(&o.id);
+                self.kits.insert(o.id, (key.clone(), Arc::new(Mesh::poly(p))));
+                return;
+            }
+            let p = p.clone();
+            #[cfg(test)]
+            let hold = self.hold_polys.clone();
+            let handle = std::thread::Builder::new().name(format!("poly mesh {}", o.name)).spawn(move || {
+                #[cfg(test)]
+                {
+                    while hold.load(std::sync::atomic::Ordering::Acquire) {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                Mesh::poly(&p)
+            }).expect("poly mesh thread starts");
+            self.pending.poly.insert(o.id, (key.clone(), o.name.clone(), std::time::Instant::now(), handle, Arc::new(crate::progress::Progress::default())));
+            return;
+        }
+        if wait || self.pending.poly[&o.id].3.is_finished() {
+            let (built_key, _, _, handle, _) = self.pending.poly.remove(&o.id).expect("running");
+            let mesh = handle.join().expect("poly mesh build");
+            self.kits.insert(o.id, (built_key, Arc::new(mesh)));
+        }
+    }
+
     /// Puts freshly built meshes in place (a new rest mesh makes bakes and
     /// fine meshes stale).
     fn install(&mut self, id: u64, key: BuildKey, b: Built) {
@@ -879,7 +1241,7 @@ impl MeshLib {
                 e.posed_for = None;
             }
             None => {
-                let entry = ClayEntry { key, hash, shown: b.rest.clone(), whole: b.whole, rest: b.rest, skin: b.skin, posed_for: None, parts: b.parts, baked: None, use_baked: false, fine: b.fine, use_fine: false, fine_error: None, tinted: None };
+                let entry = ClayEntry { key, hash, shown: b.rest.clone(), whole: b.whole, rest: b.rest, skin: b.skin, posed_for: None, parts: b.parts, baked: None, use_baked: false, fine: b.fine, use_fine: false, fine_error: None, tinted: None, shaded: None };
                 self.clay.insert(id, entry);
             }
         }
@@ -917,13 +1279,15 @@ impl MeshLib {
             let from = (rest.clone(), skin.clone());
             let ticket = FineTicket::default();
             let done = ticket.clone();
+            let progress = Arc::new(crate::progress::Progress::default());
+            let reports = progress.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("fine mesh {}", o.name))
                 .spawn(move || {
                     let done = Done(done);
                     let built = {
                         let _slot = FineSlot::take();
-                        key.clay.build_fine(&key.library, &key.fallback)
+                        crate::clay::with_progress(reports, || key.clay.build_fine(&key.library, &key.fallback))
                     };
                     let baked = built.map(|mesh| {
                         let skin = skin.map(|s| {
@@ -932,21 +1296,24 @@ impl MeshLib {
                             Arc::new(Skin { joints: pick.iter().map(|&i| s.joints[i]).collect(), weights: pick.iter().map(|&i| s.weights[i]).collect() })
                         });
                         let mesh = Arc::new(mesh);
-                        Baked { settings: bake::Settings::default(), from: rest, shown: mesh.clone(), mesh, skin, posed_for: None }
+                        Baked { settings: bake::Settings::default(), from: rest, low: None, shown: mesh.clone(), mesh, skin, posed_for: None }
                     });
                     done.0.finish(baked.as_ref().map(|b| (b.mesh.clone(), b.skin.clone())).map_err(Clone::clone));
                     baked
                 })
                 .expect("fine mesh thread starts");
-            self.pending.fine.insert(slot, ((from, o.name.clone(), std::time::Instant::now(), handle), ticket));
+            self.pending.fine.insert(slot, ((from, o.name.clone(), std::time::Instant::now(), handle, progress), ticket));
         }
         for o in scene.objects.iter().filter(|o| o.shape == Shape::Clay) {
             if let Some(slot) = self.clay.get(&o.id).filter(|e| stale(e)).map(|e| e.fine_slot())
                 && let Some(p) = self.pending.fine.get(&slot)
                 && (wait || p.0.3.is_finished())
             {
-                let (((from, _), _, _, handle), _) = self.pending.fine.remove(&slot).expect("pending");
+                let (((from, _), _, started, handle, _), _) = self.pending.fine.remove(&slot).expect("pending");
                 let built = handle.join().expect("fine mesh build");
+                let seconds = started.elapsed().as_secs_f32();
+                let ids: Vec<u64> = self.clay.iter().filter(|(_, e)| e.fine_slot() == slot).map(|(id, _)| *id).collect();
+                self.last_build.extend(ids.into_iter().map(|id| ((id, true), seconds)));
                 // Every object showing this rest mesh and skin gets it.
                 for e in self.clay.values_mut().filter(|e| e.fine_slot() == slot) {
                     match &built {
@@ -977,7 +1344,7 @@ impl MeshLib {
     pub fn fine_building(&self, o: &Object) -> Option<(FineTicket, f32, Option<Vec<Mat4>>)> {
         let e = self.clay.get(&o.id).filter(|e| self.show_fine && !e.use_baked && !e.use_fine)?;
         // Objects sharing a rest mesh wait on the same build.
-        let ((_, _, started, _), ticket) = self.pending.fine.get(&e.fine_slot())?;
+        let ((_, _, started, _, _), ticket) = self.pending.fine.get(&e.fine_slot())?;
         let rig = o.rig.as_ref().filter(|r| !r.bones.is_empty());
         let frame = rig.and_then(|r| r.is_posed(self.frame).then_some(self.frame).flatten());
         let pose = rig.filter(|_| frame.is_some()).map(|r| r.skin_matrices(frame));
@@ -999,7 +1366,8 @@ impl MeshLib {
     pub fn bake_job(&self, scene: &Scene, id: u64, settings: bake::Settings) -> Result<Option<BakeJob>, String> {
         scene.get(id).ok_or("object vanished")?;
         let e = self.clay.get(&id).ok_or("not a clay object")?;
-        if e.baked.as_ref().is_some_and(|b| b.settings == settings && Arc::ptr_eq(&b.from, &e.rest)) {
+        let low = low_job(scene, id, settings)?;
+        if e.baked.as_ref().is_some_and(|b| b.settings == settings && Arc::ptr_eq(&b.from, &e.rest) && b.low == low) {
             return Ok(None);
         }
         self.bake_inputs(scene, id, settings).map(Some)
@@ -1023,6 +1391,7 @@ impl MeshLib {
             // A fine mesh already made for this rest mesh saves the bake
             // building it again.
             fine: e.fine.as_ref().filter(|f| Arc::ptr_eq(&f.from, &e.rest)).map(|f| f.mesh.clone()),
+            low: low_job(scene, id, settings)?,
         })
     }
 
@@ -1030,7 +1399,7 @@ impl MeshLib {
     pub fn install_bake(&mut self, job: &BakeJob, mesh: Mesh, skin: Option<Skin>) -> bool {
         let Some(e) = self.clay.get_mut(&job.id).filter(|e| Arc::ptr_eq(&e.rest, &job.rest)) else { return false };
         let mesh = Arc::new(mesh);
-        e.baked = Some(Baked { settings: job.settings, from: e.rest.clone(), shown: mesh.clone(), mesh, skin: skin.map(Arc::new), posed_for: None });
+        e.baked = Some(Baked { settings: job.settings, from: e.rest.clone(), low: job.low.clone(), shown: mesh.clone(), mesh, skin: skin.map(Arc::new), posed_for: None });
         true
     }
 
@@ -1064,7 +1433,7 @@ impl MeshLib {
 
     /// Which mesh an object draws with, ignoring sharing (see `key_of`).
     pub fn key(o: &Object) -> MeshKey {
-        if o.shape.own_mesh() || crate::damage::own_primitive(o) { MeshKey::Own(o.id) } else { MeshKey::Prim(o.shape) }
+        if o.shape.own_mesh() || o.is_reference() || crate::damage::own_primitive(o) { MeshKey::Own(o.id) } else { MeshKey::Prim(o.shape) }
     }
 
     /// Which GPU mesh an object draws with: clay showing the same mesh as
@@ -1081,7 +1450,7 @@ impl MeshLib {
     pub fn get(&self, o: &Object) -> Option<&Arc<Mesh>> {
         match Self::key(o) {
             MeshKey::Prim(s) => self.prims.get(&s),
-            MeshKey::Own(id) => self.solids.get(&id).map(|e|&e.1).or_else(||self.clay.get(&id).map(ClayEntry::drawn)).or_else(|| self.eyes.get(&id).map(|e| &e.1)).or_else(|| self.hairs.get(&id).map(|e| &e.1)).or_else(|| self.kits.get(&id).map(|e| &e.1)).or_else(|| self.fires.get(&id).map(|e| &e.3)),
+            MeshKey::Own(id) => self.solids.get(&id).map(|e|&e.1).or_else(||self.clay.get(&id).map(ClayEntry::drawn)).or_else(|| self.eyes.get(&id).map(|e| &e.1)).or_else(|| self.hairs.get(&id).map(|e| &e.1)).or_else(|| self.kits.get(&id).map(|e| &e.1)).or_else(|| self.fires.get(&id).map(|e| &e.3)).or_else(|| self.refs.get(&id).map(|e| &e.1)),
             // `key` never names a chunk (chunks are drawn, never read).
             MeshKey::Chunk(..) => None,
         }
@@ -1100,13 +1469,52 @@ impl MeshLib {
         self.get(o).filter(|m| !m.vertices.is_empty()).map(|m| m.bounds())
     }
 
-    /// Every per-object mesh (clay as drawn, eyes).
+    /// Every per-object mesh (clay as the viewport draws it, eyes).
     pub fn own_meshes(&self) -> Vec<(MeshKey, Arc<Mesh>)> {
-        // Objects drawing another's mesh draw with its key (see `key_of`).
-        let clay = self.clay.iter().filter(|(id, _)| !self.owner_of.contains_key(id)).map(|(id, e)| (MeshKey::Own(*id), e.display().clone()));
-        let eyes = self.eyes.iter().map(|(id, e)| (MeshKey::Own(*id), e.1.clone()));
-        clay.chain(eyes).chain(self.solids.iter().map(|(id,e)|(MeshKey::Own(*id),e.1.clone()))).chain(self.hairs.iter().map(|(id, e)| (MeshKey::Own(*id), e.1.clone()))).chain(self.kits.iter().map(|(id, e)| (MeshKey::Own(*id), e.1.clone()))).chain(self.fires.iter().map(|(id, e)| (MeshKey::Own(*id), e.3.clone()))).collect()
+        self.own_meshes_with(true)
     }
+
+    /// `own_meshes`, with clay colored by the viewport's quality shade
+    /// (`shade`, where `shaded_now`) or without it (its overlay tint only).
+    pub fn own_meshes_with(&self, shade: bool) -> Vec<(MeshKey, Arc<Mesh>)> {
+        // Objects drawing another's mesh draw with its key (see `key_of`).
+        let clay = self.clay.iter().filter(|(id, _)| !self.owner_of.contains_key(id)).map(|(id, e)| (MeshKey::Own(*id), if shade && self.shaded_now(*id) { e.display() } else { e.plain() }.clone()));
+        let eyes = self.eyes.iter().map(|(id, e)| (MeshKey::Own(*id), e.1.clone()));
+        clay.chain(eyes).chain(self.solids.iter().map(|(id,e)|(MeshKey::Own(*id),e.1.clone()))).chain(self.hairs.iter().map(|(id, e)| (MeshKey::Own(*id), e.1.clone()))).chain(self.kits.iter().map(|(id, e)| (MeshKey::Own(*id), e.1.clone()))).chain(self.fires.iter().map(|(id, e)| (MeshKey::Own(*id), e.3.clone()))).chain(self.refs.iter().map(|(id, e)| (MeshKey::Own(*id), e.1.clone()))).collect()
+    }
+}
+
+/// `bake lowpoly: {poly, level}`'s Poly as it was when the bake started,
+/// and its placement in the clay's space.
+#[derive(Clone, PartialEq)]
+pub struct LowJob {
+    pub poly: crate::poly::Poly,
+    pub to_clay: Mat4,
+}
+
+/// Whether a bake's `lowpoly` names an object that is not a Poly (any
+/// more): the bake then falls back to meshopt.
+pub fn lowpoly_dangling(scene: &Scene, settings: bake::Settings) -> bool {
+    settings.lowpoly.is_some_and(|l| scene.get(l.poly).is_none_or(|o| o.poly.is_none()))
+}
+
+/// The Poly a bake's settings name, if any. A lowpoly whose object is
+/// gone or no longer a Poly (deleted, or lost when a file was renumbered)
+/// is no simple mesh: the bake falls back to meshopt (`lowpoly_dangling`
+/// says so), so unrelated exports never fail on it.
+///
+/// Only what the bake reads is kept: the shown level, `made_by` and
+/// `projected` are cleared, so stepping the shown level (Page Up/Down) or
+/// a new `made_by` does not make a fresh bake stale.
+pub(crate) fn low_job(scene: &Scene, id: u64, settings: bake::Settings) -> Result<Option<LowJob>, String> {
+    let Some(l) = settings.lowpoly else { return Ok(None) };
+    let Some(mut poly) = scene.get(l.poly).and_then(|o| o.poly.clone()) else { return Ok(None) };
+    (poly.level, poly.made_by, poly.projected) = (0, None, None);
+    let to_clay = scene.world_matrix(id).inverse() * scene.world_matrix(l.poly);
+    if !to_clay.is_finite() {
+        return Err("the clay's placement cannot be inverted (a zero scale)".into());
+    }
+    Ok(Some(LowJob { poly, to_clay }))
 }
 
 /// A bake's inputs, owned (see `MeshLib::bake_job`).
@@ -1121,6 +1529,7 @@ pub struct BakeJob {
     library: Vec<Material>,
     fallback: String,
     fine: Option<Arc<Mesh>>,
+    pub low: Option<LowJob>,
 }
 
 impl BakeJob {
@@ -1132,8 +1541,17 @@ impl BakeJob {
 
     pub fn run(&self, progress: &crate::progress::Progress) -> Result<(Mesh, Option<Skin>), String> {
         if self.cloth { return crate::cloth::bake(&self.rest, self.skin.as_deref(), self.settings, progress); }
-        let src = bake::Source { clay: &self.clay, rest: &self.rest, skin: self.skin.as_deref(), parts: &self.parts, library: &self.library, fallback: &self.fallback, fine: self.fine.as_deref() };
+        let low = self.low_mesh(progress)?;
+        let src = bake::Source { clay: &self.clay, rest: &self.rest, skin: self.skin.as_deref(), parts: &self.parts, library: &self.library, fallback: &self.fallback, fine: self.fine.as_deref(), low: low.as_ref() };
         bake::bake(&src, self.settings, progress)
+    }
+
+    /// The Poly's level as the simple mesh (`lowpoly: {poly, level}`).
+    pub fn low_mesh(&self, progress: &crate::progress::Progress) -> Result<Option<crate::poly::low::Low>, String> {
+        match (&self.low, self.settings.lowpoly) {
+            (Some(l), Some(lp)) => crate::poly::low::Low::new(&l.poly, lp.level, l.to_clay, &self.rest, self.settings.texture, progress).map(Some),
+            _ => Ok(None),
+        }
     }
 
     /// Displacement maps of `mesh` (this job's bake) against the clay.
@@ -1141,8 +1559,15 @@ impl BakeJob {
         if self.cloth {
             return Err("cloth bakes have no displacement maps".into());
         }
-        let src = bake::Source { clay: &self.clay, rest: &self.rest, skin: self.skin.as_deref(), parts: &self.parts, library: &self.library, fallback: &self.fallback, fine: self.fine.as_deref() };
+        let low = self.low_mesh(progress)?;
+        let src = bake::Source { clay: &self.clay, rest: &self.rest, skin: self.skin.as_deref(), parts: &self.parts, library: &self.library, fallback: &self.fallback, fine: self.fine.as_deref(), low: low.as_ref() };
         bake::displacement(&src, mesh, maps, progress)
+    }
+
+    /// What a bake of this job reads, with `low` as its simple mesh
+    /// (`export_poly` makes its own Poly level).
+    pub fn source<'a>(&'a self, low: Option<&'a crate::poly::low::Low>) -> bake::Source<'a> {
+        bake::Source { clay: &self.clay, rest: &self.rest, skin: self.skin.as_deref(), parts: &self.parts, library: &self.library, fallback: &self.fallback, fine: self.fine.as_deref(), low }
     }
 
     /// The clay's cell (the displacement check's unit).
@@ -1192,8 +1617,14 @@ impl ClayEntry {
         }
     }
 
-    /// What the viewport draws: `drawn`, with the overlay if it has one.
+    /// What the viewport draws: `plain`, colored by the quality shade if
+    /// one is on.
     fn display(&self) -> &Arc<Mesh> {
+        self.shaded.as_ref().map_or_else(|| self.plain(), |t| &t.1)
+    }
+
+    /// `drawn`, with the overlay if it has one.
+    fn plain(&self) -> &Arc<Mesh> {
         self.tinted.as_ref().map_or_else(|| self.drawn(), |t| &t.1)
     }
 }
@@ -1320,6 +1751,32 @@ impl Mesh {
         m
     }
 
+    /// A polygon object at its shown level: each face a triangle fan,
+    /// area-weighted normals, and the faces' sides (no diagonals) as the
+    /// wireframe.
+    pub fn poly(poly: &crate::poly::Poly) -> Mesh {
+        let Ok(s) = crate::poly::subdiv::evaluate(poly, poly.level) else { return Mesh::default() };
+        let normals = s.normals();
+        let mut m = Mesh::default();
+        m.vertices.reserve(s.points.len());
+        for (p, n) in s.points.iter().zip(&normals) {
+            m.vert(*p, *n);
+        }
+        m.indices = s.triangles().into_iter().flatten().collect();
+        m.edges = s.edges.iter().flatten().copied().collect();
+        // Painted colour tiles (Stage 4b) as vertex colours: each point the
+        // mean of its corners' samples.
+        if let Some(paint) = &poly.paint
+            && let Some(uv) = crate::poly::uv::at_level(poly, poly.level)
+            && let Some(colors) = crate::poly::texture::point_colors(&paint.textures, &s.corners, &uv, m.vertices.len())
+        {
+            for (v, c) in m.vertices.iter_mut().zip(colors) {
+                v.color = c;
+            }
+        }
+        m
+    }
+
     pub fn all() -> HashMap<Shape, Mesh> {
         Shape::ALL.iter().map(|&s| (s, Mesh::build(s))).collect()
     }
@@ -1332,7 +1789,7 @@ impl Mesh {
             Shape::Cone => Mesh::cone(),
             Shape::Plane => Mesh::plane(),
             Shape::Torus => Mesh::torus(),
-            Shape::Group | Shape::Clay | Shape::Eye | Shape::Hair | Shape::Cloth | Shape::Fire | Shape::Kit | Shape::Terrain | Shape::Scatter | Shape::Part | Shape::Mesh => Mesh::default(),
+            Shape::Group | Shape::Clay | Shape::Eye | Shape::Hair | Shape::Cloth | Shape::Fire | Shape::Kit | Shape::Terrain | Shape::Scatter | Shape::Part | Shape::Mesh | Shape::Poly => Mesh::default(),
         };
         mesh.dedupe_edges();
         mesh.orient_faces();
@@ -1382,7 +1839,7 @@ impl Mesh {
         self.edges = out;
     }
 
-    fn vert(&mut self, pos: Vec3, normal: Vec3) -> u32 {
+    pub(crate) fn vert(&mut self, pos: Vec3, normal: Vec3) -> u32 {
         self.vertices.push(Vertex {
             pos: pos.into(),
             normal: normal.normalize_or_zero().into(),
@@ -1687,6 +2144,92 @@ mod tests {
         }
     }
 
+    /// A split rig meshes the whole shell and then each part: the bar
+    /// gives each its share, only rises, and ends full (it used to wait at
+    /// 0.9 from the end of the first build on).
+    #[test]
+    fn split_rig_builds_fill_the_progress_bar() {
+        let mut scene = Scene::default();
+        let id = scene.add(Shape::Clay);
+        let o = scene.get_mut(id).unwrap();
+        o.clay = Some(serde_json::from_value(serde_json::json!({"blobs":[{"type":"capsule","a":[0,0,0],"b":[0,1,0],"radius":0.25,"bone":"base","blend":0.05},{"type":"capsule","a":[0,1,0],"b":[0,2,0],"radius":0.2,"bone":"tip","blend":0.05}],"resolution":128})).unwrap());
+        o.rig = Some(Rig {bones: vec![Bone {name:"base".into(),parent:None,head:Vec3::ZERO,tail:Vec3::Y,deform:true},Bone {name:"tip".into(),parent:Some("base".into()),head:Vec3::Y,tail:Vec3::Y*2.0,deform:true}],split:true,..Default::default()});
+        let lib = MeshLib::new();
+        let key = clay_key(&scene, scene.get(id).unwrap(), &lib.palettes);
+        let progress = Arc::new(crate::progress::Progress::default());
+        let built = crate::clay::with_progress(progress.clone(), || key.build(None));
+        assert!(built.parts.len() >= 2, "{} parts", built.parts.len());
+        // Read the bar's every value and range call in order, not in time
+        // (sampling it in time failed once in a busy full run).
+        use crate::progress::Traced;
+        let trace = progress.trace();
+        let values: Vec<f32> = trace.iter().filter_map(|t| match t { Traced::Value(v) => Some(*v), _ => None }).collect();
+        assert!(values.windows(2).all(|w| w[1] >= w[0]), "the bar went back: {trace:?}");
+        assert!(values.last().is_some_and(|v| *v >= 0.999), "the bar ends at {:?}", values.last());
+        // The shell, then each part, gets its own share; the bar is full
+        // only in the last part's share, not once the shell is built.
+        let ranges: Vec<(usize, f32, f32)> = trace.iter().enumerate().filter_map(|(i, t)| match t { Traced::Range(a, b) => Some((i, *a, *b)), _ => None }).collect();
+        assert!(ranges.len() > built.parts.len(), "a range for the shell and each part: {ranges:?}");
+        assert!(ranges.windows(2).all(|w| w[1].1 >= w[0].2 - 1e-6), "the shares follow each other: {ranges:?}");
+        let last = ranges.last().unwrap();
+        assert!(last.2 >= 0.999 && last.1 < 0.999, "{ranges:?}");
+        let full = trace.iter().position(|t| matches!(t, Traced::Value(v) if *v >= 0.999)).unwrap();
+        assert!(full > last.0, "full at step {full}, before the last part's share (step {}): {trace:?}", last.0);
+    }
+
+    /// `last_build` (edit_clay's estimate) is the time of builds that mesh
+    /// the shape: a shading refresh (a new material) does not overwrite it.
+    #[test]
+    fn shading_refreshes_leave_the_build_estimate() {
+        let mut scene = Scene::default();
+        let id = scene.add(Shape::Clay);
+        scene.get_mut(id).unwrap().clay = Some(serde_json::from_value(serde_json::json!({"blobs":[{"type":"sphere","center":[0,0,0],"radius":0.5,"blend":0}],"resolution":48})).unwrap());
+        let mut lib = MeshLib::new();
+        lib.sync(&scene);
+        assert!(lib.last_build_seconds(id, false).is_some());
+        lib.last_build.insert((id, false), 1000.0);
+        scene.get_mut(id).unwrap().material = Some("metal".into());
+        let refreshes = lib.shading_updates;
+        lib.sync(&scene);
+        assert_eq!(lib.shading_updates, refreshes + 1);
+        assert_eq!(lib.last_build_seconds(id, false), Some(1000.0));
+        // A new shape is a geometry build, and is timed.
+        scene.get_mut(id).unwrap().clay.as_mut().unwrap().resolution = 40;
+        lib.sync(&scene);
+        assert!(lib.last_build_seconds(id, false).is_some_and(|s| s < 1000.0));
+    }
+
+    /// `building_for` finds the build an object's meshes come from: an
+    /// object with the same shape as one already building waits for that
+    /// build, and a fine mesh's build is found too (edit_clay's `build`).
+    #[test]
+    fn building_for_finds_shared_and_fine_builds() {
+        let mut scene = Scene::default();
+        let blobs = serde_json::json!({"blobs":[{"type":"array","source":{"type":"box","center":[0,0,0],"size":[0.05,0.3,0.05]},"count":24,"step":[0.08,0,0.01],"blend":0}],"resolution":256,"detail_cell":0.004});
+        let ids: Vec<u64> = (0..2).map(|_| {
+            let id = scene.add(Shape::Clay);
+            scene.get_mut(id).unwrap().clay = Some(serde_json::from_value(blobs.clone()).unwrap());
+            id
+        }).collect();
+        let mut lib = MeshLib::new();
+        lib.sync_background(&scene);
+        assert!(lib.busy());
+        let (first, fine) = lib.building_for(ids[0]).expect("its own build");
+        assert_eq!((first.object, fine), (Some(ids[0]), false));
+        let (shared, fine) = lib.building_for(ids[1]).expect("waits for the first one's build");
+        assert_eq!((shared.object, fine), (Some(ids[0]), false));
+        // Shown fine: once the regular meshes are in, the fine build.
+        lib.sync(&scene);
+        lib.show_fine = true;
+        lib.sync_shown(&scene);
+        for &id in &ids {
+            let (b, fine) = lib.building_for(id).expect("the fine build");
+            assert!(fine && b.object.is_none(), "{b:?}");
+        }
+        lib.sync(&scene);
+        assert!(lib.building_for(ids[0]).is_none() && lib.last_build_seconds(ids[1], true).is_some());
+    }
+
     /// An undo back to the shown meshes while a build runs drops that
     /// build: the library is not left busy for good.
     #[test]
@@ -1737,6 +2280,90 @@ mod tests {
             assert!(!m.edges.is_empty() && m.edges.len() % 2 == 0, "{shape:?}");
         }
     }
+
+    /// Damage on a Poly or an imported mesh (only a file can hold it: the
+    /// damage tool refuses both) is left out of the drawn mesh instead of
+    /// panicking on their missing materials: the editor opens the file and
+    /// draws them as without it.
+    #[test]
+    fn damage_on_polys_and_imported_meshes_is_left_out() {
+        let mut scene = Scene::default();
+        let poly = scene.add(Shape::Poly);
+        let mut p = crate::poly::tests::cube();
+        p.set_levels(3).unwrap();
+        p.level = 3;
+        scene.get_mut(poly).unwrap().poly = Some(p);
+        let imported = scene.add(Shape::Mesh);
+        let s = crate::poly::subdiv::evaluate(scene.get(poly).unwrap().poly.as_ref().unwrap(), 3).unwrap();
+        scene.get_mut(imported).unwrap().mesh = Some(crate::mesh_asset::MeshAsset::new(s.points.clone(), s.triangles()).unwrap());
+        let mut plain = MeshLib::new();
+        plain.sync(&scene);
+        let hit = crate::smart::Decal { shape: crate::smart::Shape::BulletHit, center: [0.0, 0.0, 1.0], normal: [0.0, 0.0, 1.0], size: 0.8, ..Default::default() };
+        let mut file = serde_json::to_value(&scene).unwrap();
+        for o in file["objects"].as_array_mut().unwrap() {
+            o["damage"] = serde_json::json!([hit]);
+        }
+        let damaged: Scene = serde_json::from_value(file).unwrap();
+        assert!([poly, imported].iter().all(|&id| damaged.get(id).unwrap().damage.len() == 1), "the file holds the damage");
+        let mut lib = MeshLib::new();
+        lib.sync(&damaged);
+        for id in [poly, imported] {
+            let (a, b) = (lib.get(damaged.get(id).unwrap()).unwrap(), plain.get(scene.get(id).unwrap()).unwrap());
+            assert!(a.vertices.len() == b.vertices.len() && a.vertices.iter().zip(&b.vertices).all(|(x, y)| x.pos == y.pos), "{id}: drawn as without it");
+        }
+    }
+
+    /// In the background a Poly's drawn mesh builds on another thread: the
+    /// old level shows (and the library is busy, the build listed) until
+    /// it is in; `sync` waits for it. Held, so nothing here races.
+    #[test]
+    fn poly_meshes_build_in_the_background() {
+        use std::sync::atomic::Ordering;
+        let mut scene = Scene::default();
+        let id = scene.add(Shape::Poly);
+        let mut p = crate::poly::tests::torus(16, 8);
+        p.set_levels(2).unwrap();
+        scene.get_mut(id).unwrap().poly = Some(p);
+        let mut lib = MeshLib::new();
+        lib.sync(&scene);
+        let cage = lib.get(scene.get(id).unwrap()).unwrap().clone();
+        assert_eq!(cage.indices.len() / 3, 2 * 16 * 8);
+        assert!(!lib.busy() && !lib.stale(&scene));
+        scene.get_mut(id).unwrap().poly.as_mut().unwrap().level = 2;
+        assert!(lib.stale(&scene), "the shown level changed: stale before any build starts");
+        lib.hold_polys.store(true, Ordering::Release);
+        lib.sync_background(&scene);
+        assert!(lib.busy() && lib.building().iter().any(|b| b.object == Some(id)), "{:?}", lib.building());
+        assert!(Arc::ptr_eq(lib.get(scene.get(id).unwrap()).unwrap(), &cage), "the old level shows meanwhile");
+        lib.sync_background(&scene);
+        assert!(lib.busy() && Arc::ptr_eq(lib.get(scene.get(id).unwrap()).unwrap(), &cage), "still held");
+        lib.hold_polys.store(false, Ordering::Release);
+        lib.sync(&scene);
+        assert!(!lib.busy() && !lib.stale(&scene));
+        assert_eq!(lib.get(scene.get(id).unwrap()).unwrap().indices.len() / 3, 2 * 16 * 8 * 16, "level 2");
+        // Level 1 asked for, then level 2 again while level 1's build is
+        // held: that build is dropped and its mesh never shows.
+        scene.get_mut(id).unwrap().poly.as_mut().unwrap().level = 1;
+        lib.hold_polys.store(true, Ordering::Release);
+        lib.sync_background(&scene);
+        scene.get_mut(id).unwrap().poly.as_mut().unwrap().level = 2;
+        lib.sync_background(&scene);
+        assert!(!lib.busy(), "the current mesh is the one wanted: the older build is dropped");
+        lib.hold_polys.store(false, Ordering::Release);
+        assert_eq!(lib.get(scene.get(id).unwrap()).unwrap().indices.len() / 3, 2 * 16 * 8 * 16);
+        // Released in the background, it shows once it is in.
+        scene.get_mut(id).unwrap().poly.as_mut().unwrap().level = 0;
+        lib.sync_background(&scene);
+        for _ in 0..100_000 {
+            if !lib.busy() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            lib.sync_background(&scene);
+        }
+        assert!(!lib.busy());
+        assert_eq!(lib.get(scene.get(id).unwrap()).unwrap().indices.len() / 3, 2 * 16 * 8);
+    }
 }
 
 
@@ -1770,6 +2397,14 @@ mod timing {
             }
         }
     }
+}
+
+/// What a Poly object's drawn mesh is built from (`EnvKey::Poly`).
+fn poly_key(o: &Object) -> Option<EnvKey> {
+    let mut p = o.poly.clone()?;
+    p.levels.truncate(p.level as usize);
+    p.made_by = None;
+    Some(EnvKey::Poly(p))
 }
 
 fn env_geometry(a:&EnvKey,b:&EnvKey)->bool {

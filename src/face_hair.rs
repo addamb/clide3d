@@ -35,6 +35,10 @@ impl Rng {
     }
 }
 
+/// Most guides one facial hair part grows (half the hair bound before
+/// Stage 4c raised it, so brows, lashes and fuzz stay as they were).
+const FACIAL_GUIDES: usize = 256;
+
 fn ss(a: f32, b: f32, x: f32) -> f32 {
     let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
@@ -72,7 +76,7 @@ pub fn brows(face: &Face, snap: &Snap, color: [f32; 3], density: f32, seed: u32)
     let target = 170usize;
     let mut guides = Vec::new();
     let mut tries = 0;
-    while guides.len() < target.min(crate::hair::MAX_GUIDES / 2) && tries < target * 20 {
+    while guides.len() < target.min(FACIAL_GUIDES) && tries < target * 20 {
         tries += 1;
         let (s, v) = (rng.next(), rng.next() * 2.0 - 1.0);
         let keep = (0.45 + 0.55 * ss(0.02, 0.2, s) * (1.0 - 0.45 * ss(0.65, 1.0, s))) * (1.0 - v.abs().powi(3) * 0.85);
@@ -162,7 +166,7 @@ pub fn lashes(face: &Face, lids: &crate::eyeball::Lids, eye_center: Vec3, color:
             }
         }
     }
-    guides.truncate(crate::hair::MAX_GUIDES / 2);
+    guides.truncate(FACIAL_GUIDES);
     facial(guides, color, color, 0.00011, seed)
 }
 
@@ -193,7 +197,7 @@ pub fn fuzz(face: &Face, snap: &Snap, color: [f32; 3], density: f32, seed: u32) 
             let comb = face.right * dir.x + face.up * dir.y;
             let length = 0.0016 * (0.7 + 0.6 * rng.next());
             guides.push(facial_guide(root, n, comb, length, 0.00008, false, snap));
-            if guides.len() >= crate::hair::MAX_GUIDES / 2 {
+            if guides.len() >= FACIAL_GUIDES {
                 break;
             }
         }
@@ -213,7 +217,7 @@ pub fn fuzz(face: &Face, snap: &Snap, color: [f32; 3], density: f32, seed: u32) 
 fn facial(guides: Vec<Guide>, root: [f32; 3], tip: [f32; 3], width: f32, seed: u32) -> Hair {
     let n = guides.len() as u32;
     Hair {
-        guides,
+        guides: guides.into(),
         width: 0.0005,
         taper: 0.05,
         cards: 1,
@@ -235,5 +239,8 @@ fn facial(guides: Vec<Guide>, root: [f32; 3], tip: [f32; 3], width: f32, seed: u
         melanin_variation: 0.35,
         interpolate: false,
         rise: 1.0,
+        // Facial hairs sit on the skin, as `grow` brow/lash keeps them.
+        lift: 0.0001,
+        fur: None,
     }
 }

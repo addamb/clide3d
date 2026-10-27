@@ -41,10 +41,14 @@ pub enum Action {
     /// With a brush tool: X symmetry on or off (wins over Snap to Grid's X,
     /// which brushes do not use).
     SymmetryX,
+    /// The lead Poly object's next finer / coarser shown subdivision level
+    /// (`poly set_level`).
+    PolyLevelUp,
+    PolyLevelDown,
 }
 
 impl Action {
-    pub const ALL: [Action; 22] = [
+    pub const ALL: [Action; 24] = [
         Action::SelectTool,
         Action::MoveTool,
         Action::RotateTool,
@@ -67,6 +71,8 @@ impl Action {
         Action::LevelFiner,
         Action::LevelCoarser,
         Action::SymmetryX,
+        Action::PolyLevelUp,
+        Action::PolyLevelDown,
     ];
 
     pub fn label(self) -> &'static str {
@@ -93,6 +99,8 @@ impl Action {
             Action::LevelFiner => "Finer Detail Level (brush tools)",
             Action::LevelCoarser => "Coarser Detail Level (brush tools)",
             Action::SymmetryX => "X Symmetry (brush tools)",
+            Action::PolyLevelUp => "Finer Poly Level",
+            Action::PolyLevelDown => "Coarser Poly Level",
         }
     }
 
@@ -215,6 +223,8 @@ impl Default for Hotkeys {
             (Action::LevelFiner, Binding::plain(Key::D)),
             (Action::LevelCoarser, shift(Key::D)),
             (Action::SymmetryX, Binding::plain(Key::X)),
+            (Action::PolyLevelUp, Binding::plain(Key::PageUp)),
+            (Action::PolyLevelDown, Binding::plain(Key::PageDown)),
         ]))
     }
 }
@@ -383,10 +393,11 @@ mod tests {
         saved.0.remove(&Action::LevelFiner);
         saved.0.remove(&Action::LevelCoarser);
         saved.0.remove(&Action::Group);
-        let old: Vec<Action> = Action::ALL.into_iter().filter(|a| !matches!(a, Action::LevelFiner | Action::LevelCoarser | Action::SymmetryX)).collect();
+        let old: Vec<Action> = Action::ALL.into_iter().filter(|a| !matches!(a, Action::LevelFiner | Action::LevelCoarser | Action::SymmetryX | Action::PolyLevelUp | Action::PolyLevelDown)).collect();
         let h = saved.with_new_defaults(&old);
         assert_eq!(h.get(Action::LevelFiner), Some(Binding::plain(Key::D)));
         assert_eq!(h.get(Action::LevelCoarser), Some(Binding { shift: true, ..Binding::plain(Key::D) }));
+        assert_eq!(h.get(Action::PolyLevelUp), Some(Binding::plain(Key::PageUp)));
         assert_eq!(h.get(Action::Group), None);
         let mut cleared = h.clone();
         cleared.0.remove(&Action::LevelFiner);

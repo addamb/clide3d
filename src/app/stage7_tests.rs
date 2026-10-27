@@ -201,13 +201,13 @@ fn parity(app: &mut ClideApp, ctx: &egui::Context, tx: &Sender<ToolCall>, pre: B
 /// and its record equals the preview of the stroke as it ended; every dab
 /// is on the surface; the request resent through MCP on the scene before
 /// the drag gives the same record; undo takes the drag back in one
-/// labelled step. Dab brushes (run a few dabs at a time), path brushes
-/// (run whole) and a stroke on a sculpt layer all check.
+/// labelled step. Dab brushes (run a few dabs at a time; clay_polish too),
+/// path brushes (run whole) and a stroke on a sculpt layer all check.
 #[test]
 fn a_drag_previews_what_it_commits_and_replays_through_mcp() {
     let Some((mut app, tx, ctx)) = editor() else { return };
     let id = id_of(&app, "Ball");
-    for (n, (brush, layer)) in [("standard", None), ("clay_buildup", None), ("inflate", None), ("standard", Some("detail"))].into_iter().enumerate() {
+    for (n, (brush, layer)) in [("standard", None), ("clay_buildup", None), ("inflate", None), ("clay_polish", None), ("standard", Some("detail"))].into_iter().enumerate() {
         if let Some(l) = layer {
             ok(&mut app, &ctx, &tx, "sculpt_layer", json!({ "target": "Ball", "action": "add", "name": l, "amount": 0.8 }));
             ok(&mut app, &ctx, &tx, "sculpt_layer", json!({ "target": "Ball", "action": "select", "name": l }));
@@ -370,6 +370,17 @@ fn every_hud_control_sends_its_tools_request() {
     let request = parity(&mut app, &ctx, &tx, pre, "group");
     assert!(request["actions"][0]["hide"].is_array(), "{request}");
     assert!(clay(&app).groups.as_ref().is_some_and(|g| !g.hidden().is_empty()));
+
+    // The quality shade (D-d): the Shading menu's set_display call.
+    let pre = before(&app);
+    frame(&mut app, &ctx, Vec::new());
+    let at = app.hud.rects["shade:curvature"].center();
+    click(&mut app, &ctx, at);
+    let request = parity(&mut app, &ctx, &tx, pre, "set_display");
+    assert_eq!(request, json!({ "shade": "curvature" }));
+    assert_eq!(app.meshes.shade, crate::quality::Shade::Curvature);
+    ok(&mut app, &ctx, &tx, "set_display", json!({ "shade": "beauty" }));
+    settle(&mut app, &ctx);
 
     // A mask action (Grow, after a mask exists).
     ok(&mut app, &ctx, &tx, "mask", json!({ "target": "Ball", "actions": [{ "by_height": { "min": 0.3 } }] }));
@@ -1009,4 +1020,192 @@ fn a_vdm_drag_with_a_preset_sends_only_what_a_stamp_takes() {
     let r = ledger::ledger::<Detail>(&clay(&app)).records().last().cloned().unwrap();
     assert!(r.stats.changed_points > 0, "the stamp went on");
     let _ = std::fs::remove_file(&image);
+}
+
+/// Stage 4b's `ui_poly_paint_matches_mcp`: the Paint tool dragged across
+/// a Poly (UDIM tiles) sends `paint`, and the same request from an agent
+/// on the scene before it gives the same reply and the same Poly, its
+/// stroke record included; sculpt drags on a Poly are refused in the
+/// editor with a status, nothing sent.
+#[test]
+fn ui_poly_paint_matches_mcp() {
+    let Some((mut app, tx, ctx)) = editor() else { return };
+    ok(&mut app, &ctx, &tx, "poly", json!({ "action": "from_clay", "source": "Ball" }));
+    settle(&mut app, &ctx);
+    ok(&mut app, &ctx, &tx, "update_object", json!({ "target": "Ball", "translate": [6, 0, 0] }));
+    let poly = id_of(&app, "Ball_poly");
+    ok(&mut app, &ctx, &tx, "poly", json!({ "target": poly, "action": "uv", "udim": true, "tiles": 2, "size": 512 }));
+    settle(&mut app, &ctx);
+    ok(&mut app, &ctx, &tx, "select_object", json!({ "target": "Ball_poly" }));
+    ok(&mut app, &ctx, &tx, "brush_preset", json!({ "action": "set_current", "tool": "sculpt", "radius": 0.08 }));
+    settle(&mut app, &ctx);
+    let sent = app.ui_activity.len();
+    let path = across(&app, 0.0);
+    drag(&mut app, &ctx, &path, Modifiers::NONE);
+    settle(&mut app, &ctx);
+    assert_eq!(app.ui_activity.len(), sent, "a sculpt drag on a Poly sends nothing");
+    assert!(app.status.contains("Paint"), "{}", app.status);
+    ok(&mut app, &ctx, &tx, "brush_preset", json!({ "action": "set_current", "tool": "paint", "radius": 0.08 }));
+    settle(&mut app, &ctx);
+    let pre = before(&app);
+    drag(&mut app, &ctx, &path, Modifiers::NONE);
+    let request = parity(&mut app, &ctx, &tx, pre, "paint");
+    assert_eq!(request["target"], json!(poly), "{request}");
+    assert!(request["strokes"][0]["frame"]["screen"]["px"].as_array().is_some_and(|p| p.len() > 3), "{request}");
+    let p = app.scene.get(poly).and_then(|o| o.poly.clone()).unwrap();
+    let paint = p.paint.as_ref().expect("painted");
+    assert_eq!(paint.records.len(), 1);
+    let r = &paint.records[0];
+    eprintln!("UI paint: record {} on {:?}, {} dabs, tiles {:?}", r.id, r.channel, r.stroke.dabs.len(), paint.textures.tiles(r.channel));
+    assert!(r.digest == r.digest() && !paint.textures.tiles(r.channel).is_empty());
+}
+
+/// The plan's `ui_groom_matches_mcp`: the Groom tool's drag over a
+/// selected Hair sends one `groom` request (world points across the view
+/// plane at the press, the HUD's groom brush, radius and strength, no
+/// pictures) and, sent through MCP on the scene before the drag, gives the
+/// same guides and the same reply.
+#[test]
+fn ui_groom_matches_mcp() {
+    let Some((mut app, tx, ctx)) = editor() else { return };
+    ok(&mut app, &ctx, &tx, "create_object", json!({ "shape": "Hair", "name": "Locks", "parent": "Ball", "hair": { "grow": { "on": "Ball", "count": 40, "length": 0.4 } } }));
+    settle(&mut app, &ctx);
+    let hair = id_of(&app, "Locks");
+    ok(&mut app, &ctx, &tx, "select_object", json!({ "target": "Locks" }));
+    // A press with nothing to groom says so and sends nothing.
+    ok(&mut app, &ctx, &tx, "brush_preset", json!({ "action": "set_current", "tool": "groom", "groom": "comb", "radius": 0.6, "strength": 1.0 }));
+    assert_eq!(ok(&mut app, &ctx, &tx, "brush_preset", json!({ "action": "get_current" }))["groom"], "comb");
+    settle(&mut app, &ctx);
+    let before_hair = app.scene.get(hair).and_then(|o| o.hair.clone()).unwrap();
+    let pre = before(&app);
+    let path = across(&app, -40.0);
+    drag(&mut app, &ctx, &path, Modifiers::NONE);
+    let request = parity(&mut app, &ctx, &tx, pre, "groom");
+    assert_eq!(request["target"], json!(hair), "{request}");
+    assert_eq!(request["render"], json!(false));
+    assert_eq!(request["strokes"][0]["brush"], "comb");
+    assert!(request["strokes"][0]["points"].as_array().is_some_and(|p| p.len() > 3), "{request}");
+    let after = app.scene.get(hair).and_then(|o| o.hair.clone()).unwrap();
+    assert_ne!(after.guides, before_hair.guides, "the drag combed the guides");
+    // Clump through the HUD's groom brush, then undo in one step.
+    ok(&mut app, &ctx, &tx, "brush_preset", json!({ "action": "set_current", "groom": "clump" }));
+    settle(&mut app, &ctx);
+    let pre = before(&app);
+    drag(&mut app, &ctx, &path, Modifiers::NONE);
+    let request = parity(&mut app, &ctx, &tx, pre, "groom");
+    assert_eq!(request["strokes"][0]["brush"], "clump");
+    ok(&mut app, &ctx, &tx, "undo", json!({}));
+    assert!(app.scene.get(hair).and_then(|o| o.hair.clone()).unwrap() == after, "undo takes the clump back exactly");
+}
+
+/// Stage 4d: the material tab's Stylised Look buttons send the agent's
+/// calls (set_material preset with apply_to; update_object eye style),
+/// each one request whose agent copy gives the same reply and scene.
+#[test]
+fn ui_stylised_look_matches_mcp() {
+    let Some((mut app, tx, ctx)) = editor() else { return };
+    let ball = id_of(&app, "Ball");
+    for (_, preset) in super::panels::STYLIZED_LOOKS {
+        let pre = before(&app);
+        let (tool, args) = super::panels::stylised_look_request(ball, Some(preset));
+        app.send_ui_call(tool, args);
+        let request = parity(&mut app, &ctx, &tx, pre, "set_material");
+        assert_eq!((request["preset"].as_str(), request["apply_to"].as_u64()), (Some(preset), Some(ball)), "{request}");
+        assert_eq!(app.scene.get(ball).unwrap().material.as_deref(), Some(preset));
+    }
+    ok(&mut app, &ctx, &tx, "create_object", json!({ "shape": "Eye", "name": "Peeper" }));
+    settle(&mut app, &ctx);
+    let eye = id_of(&app, "Peeper");
+    let pre = before(&app);
+    let (tool, args) = super::panels::stylised_look_request(eye, None);
+    app.send_ui_call(tool, args);
+    let request = parity(&mut app, &ctx, &tx, pre, "update_object");
+    assert_eq!(request["eye"]["style"], "stylized");
+    let e = app.scene.get(eye).unwrap().eye.clone().unwrap();
+    assert!(e.catchlight && e.style == crate::eyeball::EyeStyle::Stylized);
+}
+
+/// File > Load Turnaround Sheet… sends `set_reference {sheet}` (the
+/// request `sheet::sheet_request` builds, the one function the menu
+/// calls), and the agent's copy gives the same reply and scene.
+#[test]
+fn ui_sheet_matches_mcp() {
+    let Some((mut app, tx, ctx)) = editor() else { return };
+    let dir = std::env::temp_dir().join(format!("clide3d_ui_sheet_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sheet.png");
+    super::sheet::synthetic::sheet(400.0, 1.25, super::sheet::synthetic::DEPTH, true).0.save(&path).unwrap();
+    let pre = before(&app);
+    app.send_ui_call("set_reference", super::sheet::sheet_request(&path));
+    let request = parity(&mut app, &ctx, &tx, pre, "set_reference");
+    assert_eq!(request["sheet"]["path"].as_str(), Some(path.to_str().unwrap()));
+    assert_eq!(app.scene.objects.iter().filter(|o| o.is_reference()).count(), 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Stage 5b: Display > Measure Proportions sends `guides {action:
+/// measure, target: the selection}` (`measure_request`, the one function
+/// the menu calls) and Display > Proportion Guides `set_display
+/// {guides}`; the agent's copies give the same replies and scene.
+#[test]
+fn ui_guides_match_mcp() {
+    let Some((mut app, tx, ctx)) = editor() else { return };
+    assert!(app.measure_request().is_none(), "no guides: nothing to measure");
+    ok(&mut app, &ctx, &tx, "guides", json!({ "action": "set", "head_units": { "count": 3, "bottom": -0.5, "top": 0.65 }, "targets": [{ "name": "cap_ratio", "of": ["cap"], "value": 0.35, "tolerance": 0.01 }] }));
+    let ball = id_of(&app, "Ball");
+    let pre = before(&app);
+    let req = app.measure_request().expect("guides and a selection");
+    app.guides_job = Some(app.send_ui_call("guides", req));
+    let request = parity(&mut app, &ctx, &tx, pre, "guides");
+    assert_eq!((request["action"].as_str(), request["target"].as_u64()), (Some("measure"), Some(ball)));
+    let pre = before(&app);
+    app.send_ui_call("set_display", json!({ "guides": false }));
+    let request = parity(&mut app, &ctx, &tx, pre, "set_display");
+    assert_eq!(request["guides"], false);
+    assert!(!app.show_guides);
+}
+
+/// Stage 5c: Create > Character Base sends `create_character` with the
+/// defaults under a free name (`character_request`, the one function the
+/// menu calls); the agent's copy gives the same reply and scene.
+#[test]
+fn ui_character_matches_mcp() {
+    let Some((mut app, tx, ctx)) = editor() else { return };
+    let req = app.character_request();
+    assert_eq!(req, json!({ "name": "Character" }));
+    let pre = before(&app);
+    app.send_ui_call("create_character", req);
+    let request = parity(&mut app, &ctx, &tx, pre, "create_character");
+    assert_eq!(request["name"], "Character");
+    assert!(app.scene.objects.iter().any(|o| o.name == "Character_eye.R"));
+    // A second base takes the next free name.
+    assert_eq!(app.character_request(), json!({ "name": "Character2" }));
+}
+
+/// Character follow-ups: Create > Eyelids on Selected Clay and Create >
+/// Fur on Selected Clay send the requests an agent would (one lid a
+/// selected clay's eye; a Hair of fur under it), with the same reply and
+/// scene through MCP; without a selected clay neither is offered.
+#[test]
+fn ui_lids_and_fur_match_mcp() {
+    let Some((mut app, tx, ctx)) = editor() else { return };
+    ok(&mut app, &ctx, &tx, "select_object", json!({ "target": "Ball" }));
+    assert!(app.lids_request().is_none(), "no eyes under Ball");
+    super::pose_split_tests::open_pip(&mut app, &ctx, &tx);
+    app.selection.clear();
+    assert!(app.fur_request().is_none() && app.lids_request().is_none());
+    ok(&mut app, &ctx, &tx, "select_object", json!({ "target": "Pip" }));
+    let lids = app.lids_request().expect("Pip has eyes");
+    assert_eq!(lids, json!({ "target": "Pip", "add": [{ "type": "lid", "eye": "Pip_eye.L" }, { "type": "lid", "eye": "Pip_eye.R" }] }));
+    let pre = before(&app);
+    app.send_ui_call("edit_clay", lids);
+    parity(&mut app, &ctx, &tx, pre, "edit_clay");
+    ok(&mut app, &ctx, &tx, "select_object", json!({ "target": "Pip" }));
+    let fur = app.fur_request().expect("a clay is selected");
+    assert_eq!(fur["name"], "Pip_fur");
+    let pre = before(&app);
+    app.send_ui_call("create_object", fur);
+    parity(&mut app, &ctx, &tx, pre, "create_object");
+    ok(&mut app, &ctx, &tx, "select_object", json!({ "target": "Pip" }));
+    assert_eq!(app.fur_request().unwrap()["name"], "Pip_fur2");
 }

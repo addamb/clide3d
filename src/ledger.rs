@@ -317,9 +317,18 @@ fn regions_sane(regions: &[Region], cell: f32) -> bool {
     regions.len() <= MAX_REGIONS && cell.is_finite() && (1e-5..=1e3).contains(&cell) && regions.iter().all(region_sane)
 }
 
-/// The sculpt and paint layers have no actions.
+/// The paint layers have no actions.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub enum NoAction {}
+
+/// What a sculpt layer's action records do. Every field changes what they
+/// write, and `Record::digest` hashes them all as JSON.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum SculptAction {
+    /// ClayPolish over a region or the whole clay (`edit_clay polish`).
+    Polish(crate::sculpt::flow::Polish),
+}
 
 fn yes() -> bool {
     true
@@ -422,6 +431,26 @@ fn dabs_digest(h: &mut Hasher, dabs: &[crate::brush::resolve::Dab]) {
     }
 }
 
+/// What a resolved stroke does, hashed (a stroke record's digest; a
+/// Poly's paint records hash it too).
+pub(crate) fn stroke_digest(stroke: &crate::brush::resolve::Resolved) -> Hash128 {
+    let mut h = Hasher::new("stroke");
+    h.json(&(&stroke.params, &stroke.mask, stroke.instances, &stroke.paint));
+    dabs_digest(&mut h, &stroke.dabs);
+    h.bytes(&[stroke.paint_dabs.is_some() as u8]);
+    dabs_digest(&mut h, stroke.paint_dabs.as_deref().unwrap_or(&[]));
+    // What it read of the mask and polygroups and the group it paints
+    // change what it does; hashed only when present so older records keep
+    // their digests.
+    if let Some(f) = &stroke.frozen {
+        h.bytes(b"frozen").json(f);
+    }
+    if let Some(g) = stroke.group {
+        h.bytes(b"group").bytes(&g.to_le_bytes());
+    }
+    h.finish()
+}
+
 impl<G: Grid> Record<G> {
     /// An Opaque record with a grid.
     pub fn holds_grid(&self) -> bool {
@@ -433,23 +462,7 @@ impl<G: Grid> Record<G> {
     /// share a chain (and so a checkpoint) whatever their ids.
     pub fn digest(&self) -> Hash128 {
         *self.digest.0.get_or_init(|| match &self.op {
-            RecordOp::Stroke { stroke, .. } => {
-                let mut h = Hasher::new("stroke");
-                h.json(&(&stroke.params, &stroke.mask, stroke.instances, &stroke.paint));
-                dabs_digest(&mut h, &stroke.dabs);
-                h.bytes(&[stroke.paint_dabs.is_some() as u8]);
-                dabs_digest(&mut h, stroke.paint_dabs.as_deref().unwrap_or(&[]));
-                // What it read of the mask and polygroups and the group it
-                // paints change what it does; hashed only when present so
-                // older records keep their digests.
-                if let Some(f) = &stroke.frozen {
-                    h.bytes(b"frozen").json(f);
-                }
-                if let Some(g) = stroke.group {
-                    h.bytes(b"group").bytes(&g.to_le_bytes());
-                }
-                h.finish()
-            }
+            RecordOp::Stroke { stroke, .. } => stroke_digest(stroke),
             RecordOp::Opaque { delta, grid, .. } => Hasher::new("opaque").bytes(&[*delta as u8]).hash(G::hash(grid.as_ref())).finish(),
             RecordOp::Action { action, .. } => Hasher::new("action").json(action).finish(),
             RecordOp::Regions { regions, cell } => {
@@ -1168,14 +1181,22 @@ pub fn frozen_in_use(clay: &Clay) -> std::collections::HashSet<Hash128> {
 /// using a kept grid let it go first). Strokes that read neither stay
 /// as before (None).
 pub fn freeze(clay: &mut Clay, stroke: &mut Resolved) -> Result<(), String> {
-    let m = stroke.mask.as_ref();
+    stroke.frozen = freeze_with(clay, stroke.mask.as_ref())?;
+    Ok(())
+}
+
+/// What a record about to be committed reads of the persistent mask and
+/// polygroups through `m` (a stroke's mask; None for an action such as
+/// ClayPolish, which reads the mask and hidden groups as a stroke without
+/// one does), kept on the clay by hash.
+pub fn freeze_with(clay: &mut Clay, m: Option<&crate::brush::spec::StrokeMask>) -> Result<Option<FrozenRef>, String> {
     let mask = clay.sculpt_mask.clone().filter(|_| m.is_none_or(|m| m.channel()));
     let groups = clay.groups.clone().filter(|g| !g.hidden().is_empty() || m.is_some_and(|m| m.groups.is_some()));
-    stroke.frozen = (mask.is_some() || groups.is_some()).then(|| FrozenRef { mask: mask.as_ref().map(|g| SculptMask::hash(Some(g))), groups: groups.as_ref().map(|g| Groups::hash(Some(g))) });
-    if stroke.frozen.is_some() {
+    let frozen = (mask.is_some() || groups.is_some()).then(|| FrozenRef { mask: mask.as_ref().map(|g| SculptMask::hash(Some(g))), groups: groups.as_ref().map(|g| Groups::hash(Some(g))) });
+    if frozen.is_some() {
         keep_frozen(clay, mask, groups)?;
     }
-    Ok(())
+    Ok(frozen)
 }
 
 /// Keeps `mask` and `groups` in the clay's frozen store (by hash).
@@ -1393,7 +1414,7 @@ impl Tally {
 /// Volume the offsets add between two detail grids (coarse grid only):
 /// the change in a soft inside count over the changed points, using the
 /// blobs' field there.
-fn volume_delta(clay: &Clay, before: Option<&Detail>, after: Option<&Detail>) -> f32 {
+pub(crate) fn volume_delta(clay: &Clay, before: Option<&Detail>, after: Option<&Detail>) -> f32 {
     let voxel = after.or(before).map_or(1.0, Detail::voxel);
     let base = Clay { detail: None, paint: None, sculpt: None, ..clay.clone() };
     let field = Field::new(&base, voxel);
@@ -1472,18 +1493,52 @@ impl SculptInput {
         if diff.dabs == 0 {
             return Ok(Applied { grid: grid.cloned(), radius: stroke.dabs.first().map_or(0.0, |d| d.radius) });
         }
-        let Some(amount) = self.amount else {
-            return Ok(Applied { grid: Some(diff.detail), radius: diff.radius });
-        };
+        let radius = diff.radius;
+        Ok(Applied { grid: Some(self.fold(grid, diff)?), radius })
+    }
+
+    /// The written grid after the engine's grid became `diff`'s (a stroke's
+    /// or an action's): `grid` is the layer's own before.
+    pub fn fold(&self, grid: Option<&Detail>, diff: crate::sculpt::engine::Diff) -> Result<Detail, String> {
+        let Some(amount) = self.amount else { return Ok(diff.detail) };
         let before = self.grid.clone().unwrap_or_else(|| diff.detail.empty_like());
-        let after = Detail::fold_change(grid, &before, &diff.detail, amount)?;
-        Ok(Applied { grid: Some(after), radius: diff.radius })
+        Detail::fold_change(grid, &before, &diff.detail, amount)
     }
 }
 
 impl Grid for Detail {
     const LAYER: &'static str = "base";
-    type Action = NoAction;
+    type Action = SculptAction;
+
+    fn act(clay: &Clay, grid: Option<&Self>, action: &SculptAction) -> Result<Option<Self>, String> {
+        match action {
+            // On the composite of the layers it reads, folded into its own
+            // (as a stroke is: `SculptInput`).
+            SculptAction::Polish(p) => {
+                let input = SculptInput::of(clay, grid)?;
+                let (diff, _) = crate::sculpt::flow::polish(clay, input.grid.as_ref(), p)?;
+                input.fold(grid, diff).map(Some)
+            }
+        }
+    }
+
+    fn mirror_action(action: &SculptAction) -> SculptAction {
+        match action {
+            SculptAction::Polish(p) => SculptAction::Polish(p.mirrored_x()),
+        }
+    }
+
+    fn remap_action(action: &SculptAction, remap: &dyn Fn(Hash128) -> Hash128) -> SculptAction {
+        match action {
+            SculptAction::Polish(p) => SculptAction::Polish(crate::sculpt::flow::Polish { frozen: p.frozen.map(|f| FrozenRef { mask: f.mask.map(remap), groups: f.groups.map(remap) }), ..*p }),
+        }
+    }
+
+    fn action_reads(action: &SculptAction) -> Vec<Hash128> {
+        match action {
+            SculptAction::Polish(p) => p.frozen.iter().flat_map(|f| f.mask.into_iter().chain(f.groups)).collect(),
+        }
+    }
 
     fn sum(grid: Option<&Self>) -> u128 {
         let Some(d) = grid else { return 0 };

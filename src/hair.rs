@@ -21,6 +21,9 @@ use serde::{Deserialize, Serialize};
 use crate::material::Material;
 use crate::mesh::{Mesh, Textures, Vertex};
 
+pub mod fur;
+pub use fur::Fur;
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Guide {
     /// Root first, in the hair object's own space.
@@ -30,10 +33,89 @@ pub struct Guide {
     pub width: Option<f32>,
 }
 
+/// A hair's guides, shared copy-on-write: cloning a hair (an undo
+/// snapshot, the mesh cache's key) shares them, and the first change
+/// through `DerefMut` copies them (`Arc::make_mut`). Equal when shared
+/// without looking further. Saved as the plain list.
+#[derive(Clone, Default, Debug)]
+pub struct Guides(Arc<Vec<Guide>>);
+
+impl std::ops::Deref for Guides {
+    type Target = Vec<Guide>;
+    fn deref(&self) -> &Vec<Guide> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Guides {
+    fn deref_mut(&mut self) -> &mut Vec<Guide> {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
+impl PartialEq for Guides {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
+    }
+}
+
+impl From<Vec<Guide>> for Guides {
+    fn from(v: Vec<Guide>) -> Self {
+        Guides(Arc::new(v))
+    }
+}
+
+impl FromIterator<Guide> for Guides {
+    fn from_iter<I: IntoIterator<Item = Guide>>(iter: I) -> Self {
+        Guides(Arc::new(iter.into_iter().collect()))
+    }
+}
+
+impl<'a> IntoIterator for &'a Guides {
+    type Item = &'a Guide;
+    type IntoIter = std::slice::Iter<'a, Guide>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut Guides {
+    type Item = &'a mut Guide;
+    type IntoIter = std::slice::IterMut<'a, Guide>;
+    fn into_iter(self) -> Self::IntoIter {
+        Arc::make_mut(&mut self.0).iter_mut()
+    }
+}
+
+impl Serialize for Guides {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.0.as_slice().serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for Guides {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Vec::<Guide>::deserialize(d).map(Guides::from)
+    }
+}
+
+impl Guides {
+    /// Whether both hold the very same guides (no copy between them).
+    pub fn shares(&self, other: &Guides) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Bytes the guides take (points and per-guide overhead), for the
+    /// undo history's budget.
+    pub fn bytes(&self) -> u64 {
+        self.0.iter().map(|g| (g.points.len() * std::mem::size_of::<Vec3>() + std::mem::size_of::<Guide>()) as u64).sum()
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct Hair {
-    pub guides: Vec<Guide>,
+    pub guides: Guides,
     /// Card width at the root.
     pub width: f32,
     /// Width at the tip, as a part of the root width.
@@ -84,6 +166,25 @@ pub struct Hair {
     /// a part of the usual (about a sixth of the root spacing); peach fuzz
     /// lies almost flat.
     pub rise: f32,
+    /// How far `groom` keeps guide points, and film strands, outside the
+    /// head (the hair's own units). `grow` stores its lift here (scalp
+    /// hair `GROW_LIFT`, facial hair 0.0001); missing (a hair made
+    /// without grow, or saved before groom) it is 0, so old brows and
+    /// lashes stay where they were.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub lift: f32,
+    /// Fur over a clay's body (`grow: {fur: true}`): its strands grow in
+    /// each guide's cell on the surface, coloured from the clay, and its
+    /// cards lie on the surface (`hair/fur.rs`). None: scalp hair.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fur: Option<Fur>,
+}
+
+/// `grow`'s default lift for scalp hair.
+pub const GROW_LIFT: f32 = 0.0015;
+
+fn is_zero(v: &f32) -> bool {
+    *v == 0.0
 }
 
 /// One film-render hair, in the hair object's space.
@@ -122,13 +223,15 @@ pub fn facial_guide(root: Vec3, normal: Vec3, comb: Vec3, length: f32, lift: f32
 }
 
 pub const MAX_STRANDS: u32 = 200_000;
+/// Strands one parallel piece of `strands_kept_out` takes.
+const KEEP_OUT_CHUNK: usize = 256;
 /// Segments along a film strand.
 const STRAND_SEGMENTS: usize = 16;
 
 impl Default for Hair {
     fn default() -> Self {
         Hair {
-            guides: Vec::new(),
+            guides: Guides::default(),
             width: 0.03,
             taper: 0.35,
             cards: 3,
@@ -150,12 +253,17 @@ impl Default for Hair {
             melanin_variation: 0.25,
             interpolate: true,
             rise: 1.0,
+            lift: 0.0,
+            fur: None,
         }
     }
 }
 
-pub const MAX_GUIDES: usize = 512;
-pub const MAX_POINTS: usize = 64;
+/// Guides a hair keeps (Quality Stage 4c: groomed heads; the cards'
+/// and strands' scalp takes about 0.7 s to build at this many).
+pub const MAX_GUIDES: usize = 4096;
+/// Points a guide keeps.
+pub const MAX_POINTS: usize = 512;
 const TEXTURE: u32 = 512;
 /// Strand patterns side by side in the texture; each card uses one.
 const VARIANTS: u32 = 4;
@@ -166,11 +274,15 @@ impl Hair {
     pub fn sanitize(&mut self) {
         let fix = |v: f32, lo: f32, hi: f32, d: f32| if v.is_finite() { v.clamp(lo, hi) } else { d };
         let d = Hair::default();
-        self.guides.truncate(MAX_GUIDES);
-        for g in &mut self.guides {
-            g.points.truncate(MAX_POINTS);
-            g.points.retain(|p| p.is_finite());
-            g.width = g.width.map(|w| fix(w, 1e-4, 10.0, d.width));
+        // Only a hair that needs a fix copies its (shared) guides.
+        let width_ok = |w: Option<f32>| w.is_none_or(|w| w.is_finite() && (1e-4..=10.0).contains(&w));
+        if self.guides.len() > MAX_GUIDES || self.guides.iter().any(|g| g.points.len() > MAX_POINTS || !g.points.iter().all(|p| p.is_finite()) || !width_ok(g.width)) {
+            self.guides.truncate(MAX_GUIDES);
+            for g in &mut self.guides {
+                g.points.truncate(MAX_POINTS);
+                g.points.retain(|p| p.is_finite());
+                g.width = g.width.map(|w| fix(w, 1e-4, 10.0, d.width));
+            }
         }
         self.width = fix(self.width, 1e-4, 10.0, d.width);
         self.taper = fix(self.taper, 0.0, 1.0, d.taper);
@@ -191,6 +303,10 @@ impl Hair {
         self.length_variation = fix(self.length_variation, 0.0, 1.0, d.length_variation);
         self.melanin_variation = fix(self.melanin_variation, 0.0, 1.0, d.melanin_variation);
         self.rise = fix(self.rise, 0.0, 2.0, d.rise);
+        self.lift = fix(self.lift, 0.0, 0.1, d.lift);
+        if let Some(f) = &mut self.fur {
+            f.sanitize();
+        }
     }
 
     /// Area-distributed roots follow a blend of several guides. Each
@@ -198,8 +314,49 @@ impl Hair {
     /// just after the root), gathers into locks and smaller locks inside
     /// them toward the free end, and varies in length, width and pigment;
     /// a few stray away (flyaways). Brows, lashes and braids
-    /// (`interpolate: false`) keep to their guides.
+    /// (`interpolate: false`) keep to their guides. Nothing keeps them
+    /// out of a head: see `strands_kept_out`.
     pub fn strands(&self) -> Vec<Strand> {
+        self.strands_kept_out(None).0
+    }
+
+    /// `strands`, each kept out of `head` (the clay the hair sits on, in
+    /// the hair's space) the way groom keeps guides out
+    /// (`groom::keep_out`): from the root, every point within the
+    /// collider's lift of the surface is pushed out along the field's
+    /// gradient, and every segment with a sample inside (a chord between
+    /// two outside points can cut the scalp or cross an ear) turns about
+    /// the point before it, around the surface. Points away from the head
+    /// are left exactly as `strands` makes them, so a strand that never
+    /// comes near it is the same bit for bit, and the look is otherwise
+    /// unchanged. Each strand's push is a pure function of the strand
+    /// (the strands are made in order first), so the result does not
+    /// depend on the thread count. The work is bounded: one pass over the
+    /// points, each segment sampled at most `groom::SEGMENT_SAMPLES` times
+    /// and turned at most three times, each push bounded by the collider.
+    /// Returns the strands and how many of them moved.
+    pub fn strands_kept_out(&self, head: Option<&dyn crate::groom::Collider>) -> (Vec<Strand>, usize) {
+        if let Some(fur) = &self.fur {
+            let mut h = self.clone();
+            h.sanitize();
+            let (strands, counts) = h.fur_strands(h.fur.as_ref().unwrap_or(fur), head);
+            return (strands, counts.moved);
+        }
+        let mut out = self.free_strands();
+        let Some(head) = head else { return (out, 0) };
+        let mut moved = vec![false; out.len()];
+        let mut both: Vec<(&mut Strand, &mut bool)> = out.iter_mut().zip(moved.iter_mut()).collect();
+        crate::clay::par_chunks(&mut both, KEEP_OUT_CHUNK, |_, chunk| {
+            for (s, m) in chunk.iter_mut() {
+                **m = crate::groom::keep_out(&mut s.points, head);
+            }
+        });
+        drop(both);
+        let count = moved.iter().filter(|m| **m).count();
+        (out, count)
+    }
+
+    fn free_strands(&self) -> Vec<Strand> {
         let mut h = self.clone();
         h.sanitize();
         let guides = h.all_guides();
@@ -277,6 +434,18 @@ impl Hair {
     pub fn coverage(&self) -> serde_json::Value {
         let mut h = self.clone();
         h.sanitize();
+        if let Some(fur) = &h.fur {
+            let roots: Vec<Vec3> = h.guides.iter().filter_map(|g| g.points.first().copied()).collect();
+            let (mean, cv) = fur::spacing_stats(&roots);
+            let lengths: Vec<f32> = h.guides.iter().map(|g| g.points.windows(2).map(|w| w[0].distance(w[1])).sum::<f32>()).collect();
+            let mean_length = lengths.iter().sum::<f32>() / lengths.len().max(1) as f32;
+            let mut warnings = Vec::new();
+            if roots.is_empty() { warnings.push("no guides: no fur".to_string()); }
+            return serde_json::json!({ "fur": true, "guides": h.guides.len(), "strands": h.strands, "strand_width": h.strand_width,
+                "root_spacing": fur.spacing, "measured_spacing": mean, "spacing_cv": cv, "mean_length": mean_length,
+                "card_triangles": roots.len() * (h.guides.first().map_or(0, |g| g.points.len()).saturating_sub(1)) * 4,
+                "exclude": fur.exclude, "include": fur.include, "bare_spheres": fur.bare.len(), "avoid_spheres": fur.avoid.len(), "warnings": warnings });
+        }
         let guides = h.all_guides();
         let scalp = Scalp::new(&guides, h.center, STRAND_SEGMENTS);
         let mut warnings = Vec::new();
@@ -301,16 +470,39 @@ impl Hair {
             "root_spacing": scalp.spacing, "largest_root_gap": gap, "sparse_patches": sparse, "warnings": warnings})
     }
 
+    /// The hair's cards, kept out of nothing (`build_mesh_kept_out`).
     pub fn build_mesh(&self) -> Mesh {
+        self.build_mesh_kept_out(None).0
+    }
+
+    /// The hair's cards, each kept out of `head` (the clay the hair sits
+    /// on, in the hair's space) by the same code that keeps guides and
+    /// film strands out (`groom::keep_out`), so viewport, film and export
+    /// agree: first the card's middle line (shifting its whole width with
+    /// it), then each of its three rails (the two edges and the arch's
+    /// crest), so no card vertex is left inside and no rail segment cuts
+    /// through the head. Normals and UVs are the card's as built. Cards
+    /// the head does not reach are the same bit for bit, and without a
+    /// head the mesh is exactly the old one. Each card's push is a pure
+    /// function of the card (they are made in order first), so the
+    /// result does not depend on the thread count; the work is that of
+    /// `keep_out` on four lines of `SEGMENTS + 1` points per card.
+    /// Returns the mesh and how many cards moved.
+    pub fn build_mesh_kept_out(&self, head: Option<&dyn crate::groom::Collider>) -> (Mesh, usize) {
         let mut h = self.clone();
         h.sanitize();
+        if let Some(fur) = h.fur.clone() {
+            return h.fur_cards(&fur, head);
+        }
         let guides = h.all_guides();
         let material = Material::preset("hair").expect("hair preset");
         let mut mesh = Mesh { materials: vec![material.clone()], textures: Some(texture(&h)), ..Mesh::default() };
         if guides.is_empty() {
-            return mesh;
+            return (mesh, 0);
         }
         let scalp = Scalp::new(&guides, h.center, SEGMENTS);
+        // Each card's middle line, only when there is a head to keep out of.
+        let mut middles: Vec<Vec3> = Vec::new();
         let mut rng = Rng(h.seed.wrapping_mul(2654435761).max(1));
         let count = guides.len() as u32 * h.cards;
         for index in 0..count {
@@ -353,6 +545,9 @@ impl Hair {
                 let half = 0.5 * width * (1.0 - (1.0 - h.taper) * t);
                 let rise = (t / 0.12).min(1.0);
                 let at = p + normal * (lift + depth * rise * (2.0 - rise) * (1.0 - 0.3 * t));
+                if head.is_some() {
+                    middles.push(at);
+                }
                 // A shallow transverse arch gives the card volume and a
                 // continuous normal field, with UV U across / V along hair.
                 for (k, u) in [-1.0f32, 0.0, 1.0].into_iter().enumerate() {
@@ -375,8 +570,49 @@ impl Hair {
                 }
             }
         }
-        mesh
+        let Some(head) = head else { return (mesh, 0) };
+        let row = SEGMENTS + 1;
+        let mut moved = vec![false; count as usize];
+        let mut cards: Vec<((&mut [Vertex], &mut [Vec3]), &mut bool)> =
+            mesh.vertices.chunks_mut(3 * row).zip(middles.chunks_mut(row)).zip(moved.iter_mut()).collect();
+        crate::clay::par_chunks(&mut cards, KEEP_OUT_CHUNK / 8, |_, chunk| {
+            for ((vertices, middle), m) in chunk.iter_mut() {
+                **m = keep_card_out(vertices, middle, head);
+            }
+        });
+        drop(cards);
+        let count = moved.iter().filter(|m| **m).count();
+        (mesh, count)
     }
+}
+
+/// One card (`3 * (SEGMENTS + 1)` vertices, three per row across, and its
+/// middle line) kept out of `head`: the middle line by `groom::keep_out`,
+/// each row moved with it, then each rail by `keep_out` as well. A card
+/// the head does not reach is left exactly as it is. Whether it moved.
+fn keep_card_out(vertices: &mut [Vertex], middle: &mut [Vec3], head: &dyn crate::groom::Collider) -> bool {
+    let before = middle.to_vec();
+    let mut moved = crate::groom::keep_out(middle, head);
+    if moved {
+        for (k, (old, new)) in before.iter().zip(middle.iter()).enumerate() {
+            let shift = *new - *old;
+            if shift != Vec3::ZERO {
+                for v in &mut vertices[3 * k..3 * k + 3] {
+                    v.pos = (Vec3::from(v.pos) + shift).to_array();
+                }
+            }
+        }
+    }
+    for rail in 0..3 {
+        let mut points: Vec<Vec3> = vertices.iter().skip(rail).step_by(3).map(|v| Vec3::from(v.pos)).collect();
+        if crate::groom::keep_out(&mut points, head) {
+            moved = true;
+            for (v, p) in vertices.iter_mut().skip(rail).step_by(3).zip(points) {
+                v.pos = p.to_array();
+            }
+        }
+    }
+    moved
 }
 
 /// A spherical Delaunay patch keeps root sampling off the chords inside
@@ -392,6 +628,85 @@ struct Scalp {
     rise: f32,
 }
 
+/// Points in cubic cells, for neighbour queries.
+struct Cells {
+    size: f32,
+    cells: std::collections::HashMap<(i32, i32, i32), Vec<usize>>,
+}
+
+impl Cells {
+    fn new(size: f32, points: impl Iterator<Item = (usize, Vec3)>) -> Self {
+        let mut cells: std::collections::HashMap<(i32, i32, i32), Vec<usize>> = std::collections::HashMap::new();
+        for (i, p) in points {
+            cells.entry(cell_of(p, size)).or_default().push(i);
+        }
+        Cells { size, cells }
+    }
+
+    /// Every point that can be within `r` of `p` (some farther), in
+    /// index order.
+    fn within(&self, p: Vec3, r: f32) -> Vec<usize> {
+        let (lo, hi) = (cell_of(p - Vec3::splat(r), self.size), cell_of(p + Vec3::splat(r), self.size));
+        let mut out = Vec::new();
+        if (hi.0 - lo.0 + 1) as i64 * (hi.1 - lo.1 + 1) as i64 * (hi.2 - lo.2 + 1) as i64 > self.cells.len() as i64 {
+            out.extend(self.cells.values().flatten().copied());
+        } else {
+            for x in lo.0..=hi.0 {
+                for y in lo.1..=hi.1 {
+                    for z in lo.2..=hi.2 {
+                        if let Some(c) = self.cells.get(&(x, y, z)) {
+                            out.extend_from_slice(c);
+                        }
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Calls `f` on every point that can be within `r` of `p` (some
+    /// farther), until it returns false; whether it never did.
+    fn each(&self, p: Vec3, r: f32, mut f: impl FnMut(usize) -> bool) -> bool {
+        let (lo, hi) = (cell_of(p - Vec3::splat(r), self.size), cell_of(p + Vec3::splat(r), self.size));
+        if (hi.0 - lo.0 + 1) as i64 * (hi.1 - lo.1 + 1) as i64 * (hi.2 - lo.2 + 1) as i64 > self.cells.len() as i64 {
+            return self.cells.values().flatten().all(|&i| f(i));
+        }
+        for x in lo.0..=hi.0 {
+            for y in lo.1..=hi.1 {
+                for z in lo.2..=hi.2 {
+                    if let Some(c) = self.cells.get(&(x, y, z))
+                        && !c.iter().all(|&i| f(i))
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// The `k` points nearest `p` other than `me` (by distance, then
+    /// index), as a stable sort of every point by distance gives them.
+    fn nearest(&self, p: Vec3, points: &[Vec3], me: usize, k: usize) -> Vec<usize> {
+        let total: usize = self.cells.values().map(Vec::len).sum();
+        let mut r = self.size;
+        loop {
+            let mut found: Vec<(f32, usize)> = self.within(p, r).into_iter().filter(|&j| j != me).map(|j| (p.distance_squared(points[j]), j)).collect();
+            // Complete once k of them are surely nearer than anything
+            // outside the cells searched (or every point is in).
+            let sure = (r - self.size * 1e-3).max(0.0);
+            let enough = found.iter().filter(|(d, _)| *d <= sure * sure).count() >= k;
+            if enough || found.len() + 1 >= total {
+                found.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                found.truncate(k);
+                return found.into_iter().map(|(_, j)| j).collect();
+            }
+            r *= 2.0;
+        }
+    }
+}
+
 impl Scalp {
     fn new(guides: &[Guide], center: Option<Vec3>, segments: usize) -> Self {
         let paths: Vec<_> = guides.iter().map(|g| resample(&g.points, segments)).collect();
@@ -402,46 +717,82 @@ impl Scalp {
         });
         let roots: Vec<_> = paths.iter().map(|p| p[0]).collect();
         let dirs: Vec<_> = roots.iter().map(|p| (*p - center).normalize_or(Vec3::Y)).collect();
-        let active: Vec<_> = (0..roots.len()).filter(|&i| !(0..i).any(|j| roots[i].distance_squared(roots[j]) < 1e-10)).collect();
+        // A root within 1e-5 of an earlier one adds nothing.
+        let dup = Cells::new(1e-5, roots.iter().copied().enumerate());
+        let active: Vec<_> = (0..roots.len()).filter(|&i| !dup.within(roots[i], 1e-5).into_iter().any(|j| j < i && roots[i].distance_squared(roots[j]) < 1e-10)).collect();
+        // Directions from the centre, on the unit sphere, about two to a
+        // cell: the nearest guides and the empty-circle test look only at
+        // the cells that can hold an answer (the same answers, in the same
+        // order, as a scan of every guide; `scalp_build_is_pinned`).
+        let cell = (8.0 * std::f32::consts::PI / active.len().max(1) as f32).sqrt().clamp(0.01, 2.0);
+        let index = Cells::new(cell, active.iter().map(|&i| (i, dirs[i])));
+        // Each root's nearest neighbour and triangles, in parallel; then
+        // summed in root order, so the totals are the same bits as one
+        // pass would give.
+        struct Found {
+            spacing: Option<f32>,
+            triangles: Vec<([usize; 3], f32)>,
+        }
+        let mut found: Vec<(usize, Option<Found>)> = active.iter().map(|&i| (i, None)).collect();
+        crate::clay::par_chunks(&mut found, 64, |_, chunk| {
+            for (i, out) in chunk.iter_mut() {
+                let i = *i;
+                let near = index.nearest(dirs[i], &dirs, i, 12);
+                let mut f = Found { spacing: near.first().map(|&j| roots[i].distance(roots[j])), triangles: Vec::new() };
+                for (a, &j) in near.iter().enumerate().filter(|(_, j)| **j > i) {
+                    for &k in near.iter().skip(a + 1).filter(|&&k| k > i) {
+                        // Too big for the local spacing (checked first:
+                        // every test here only skips the triangle).
+                        let local = near.iter().take(3).map(|&l| roots[i].distance(roots[l])).fold(0.0f32, f32::max);
+                        if roots[j].distance(roots[k]).max(roots[i].distance(roots[j])).max(roots[i].distance(roots[k])) > local * 3.0 { continue; }
+                        let mut n = (dirs[j] - dirs[i]).cross(dirs[k] - dirs[i]);
+                        if n.length_squared() < 1e-12 { continue; }
+                        n = n.normalize();
+                        if n.dot(dirs[i]) < 0.0 { n = -n; }
+                        let plane = n.dot(dirs[i]);
+                        if plane < 0.35 { continue; }
+                        // Every direction in the cap past the plane (or on
+                        // its rim) is within this chord of n. Cocircular
+                        // roots form one polygon, not overlapping
+                        // triangles: triangulate that face from a stable
+                        // anchor.
+                        let reach = (2.0 - 2.0 * (plane - 1e-5)).max(0.0).sqrt() + 1e-3;
+                        let mut face = Vec::new();
+                        if !index.each(n, reach, |l| {
+                            // The same float tests as a scan of every root.
+                            if (n.dot(dirs[l]) - plane).abs() <= 1e-6 { face.push(l); }
+                            n.dot(dirs[l]) <= plane + 1e-6
+                        }) { continue; }
+                        face.sort_unstable();
+                        if face.len() > 3 {
+                            let anchor = *face.iter().min().unwrap();
+                            if i != anchor { continue; }
+                            let middle = face.iter().map(|&l| dirs[l]).sum::<Vec3>() / face.len() as f32;
+                            let x = (dirs[anchor] - middle).normalize();
+                            let y = n.cross(x);
+                            let angle = |l: usize| { let d = dirs[l] - middle; d.dot(y).atan2(d.dot(x)).rem_euclid(TAU) };
+                            face.sort_by(|&a, &b| angle(a).total_cmp(&angle(b)));
+                            let start = face.iter().position(|&l| l == anchor).unwrap();
+                            face.rotate_left(start);
+                            let a = face.iter().position(|&l| l == j).unwrap();
+                            let b = face.iter().position(|&l| l == k).unwrap();
+                            if a.abs_diff(b) != 1 || a == 0 || b == 0 { continue; }
+                        }
+                        f.triangles.push(([i, j, k], (roots[j] - roots[i]).cross(roots[k] - roots[i]).length() * 0.5));
+                    }
+                }
+                *out = Some(f);
+            }
+        });
         let mut triangles = Vec::new();
         let mut area = 0.0;
         let mut spacing = 0.0;
-        for &i in &active {
-            let mut near: Vec<_> = active.iter().copied().filter(|&j| j != i).collect();
-            near.sort_by(|&a, &b| dirs[i].distance_squared(dirs[a]).total_cmp(&dirs[i].distance_squared(dirs[b])));
-            near.truncate(12);
-            if let Some(&j) = near.first() { spacing += roots[i].distance(roots[j]); }
-            for (a, &j) in near.iter().enumerate().filter(|(_, j)| **j > i) {
-                for &k in near.iter().skip(a + 1).filter(|&&k| k > i) {
-                    let mut n = (dirs[j] - dirs[i]).cross(dirs[k] - dirs[i]);
-                    if n.length_squared() < 1e-12 { continue; }
-                    n = n.normalize();
-                    if n.dot(dirs[i]) < 0.0 { n = -n; }
-                    let plane = n.dot(dirs[i]);
-                    if plane < 0.35 || active.iter().any(|&l| n.dot(dirs[l]) > plane + 1e-6) { continue; }
-                    // Cocircular roots form one polygon, not overlapping
-                    // triangles. Triangulate that face from a stable anchor.
-                    let mut face: Vec<_> = active.iter().copied().filter(|&l| (n.dot(dirs[l]) - plane).abs() <= 1e-6).collect();
-                    if face.len() > 3 {
-                        let anchor = *face.iter().min().unwrap();
-                        if i != anchor { continue; }
-                        let middle = face.iter().map(|&l| dirs[l]).sum::<Vec3>() / face.len() as f32;
-                        let x = (dirs[anchor] - middle).normalize();
-                        let y = n.cross(x);
-                        let angle = |l: usize| { let d = dirs[l] - middle; d.dot(y).atan2(d.dot(x)).rem_euclid(TAU) };
-                        face.sort_by(|&a, &b| angle(a).total_cmp(&angle(b)));
-                        let start = face.iter().position(|&l| l == anchor).unwrap();
-                        face.rotate_left(start);
-                        let a = face.iter().position(|&l| l == j).unwrap();
-                        let b = face.iter().position(|&l| l == k).unwrap();
-                        if a.abs_diff(b) != 1 || a == 0 || b == 0 { continue; }
-                    }
-                    let local = near.iter().take(3).map(|&l| roots[i].distance(roots[l])).fold(0.0f32, f32::max);
-                    if roots[j].distance(roots[k]).max(roots[i].distance(roots[j])).max(roots[i].distance(roots[k])) > local * 3.0 { continue; }
-                    let size = (roots[j] - roots[i]).cross(roots[k] - roots[i]).length() * 0.5;
-                    area += size;
-                    triangles.push(([i, j, k], area));
-                }
+        for (_, f) in found {
+            let f = f.expect("every root is visited");
+            if let Some(d) = f.spacing { spacing += d; }
+            for (ids, size) in f.triangles {
+                area += size;
+                triangles.push((ids, area));
             }
         }
         let mut edges = std::collections::BTreeMap::new();
@@ -803,7 +1154,7 @@ mod tests {
 
     #[test]
     fn coverage_reports_thin_grooms_and_the_actual_card_budget() {
-        let hair = Hair { guides: vec![Guide { points: vec![Vec3::Y, Vec3::Y + Vec3::Z], width: None }], strands: 10, ..Hair::default() };
+        let hair = Hair { guides: vec![Guide { points: vec![Vec3::Y, Vec3::Y + Vec3::Z], width: None }].into(), strands: 10, ..Hair::default() };
         let report = hair.coverage();
         assert!(!report["warnings"].as_array().unwrap().is_empty());
         assert_eq!(report["card_triangles"].as_u64().unwrap(), (hair.build_mesh().indices.len() / 3) as u64);
@@ -815,7 +1166,7 @@ mod tests {
             guides: vec![
                 Guide { points: vec![Vec3::ZERO, Vec3::Z * 0.006], width: None },
                 Guide { points: vec![Vec3::X * 0.01, Vec3::X * 0.01 + Vec3::Z * 0.007], width: None },
-            ],
+            ].into(),
             interpolate: false, strands: 2, spread: 0.0, frizz: 0.0,
             width: 0.0002, cards: 1, strand_width: 0.00006, taper: 0.05,
             ..Hair::default()
@@ -844,7 +1195,7 @@ mod tests {
     #[test]
     fn narrow_grooms_fill_the_gap_with_soft_clumping() {
         let g = |x: f32| Guide { points: vec![Vec3::new(x, 1.0, 0.0), Vec3::new(x, 0.5, 0.0)], width: None };
-        let hair = Hair { guides: vec![g(0.0), g(0.1)], strands: 500, clump: 1.0, frizz: 0.0, ..Hair::default() };
+        let hair = Hair { guides: vec![g(0.0), g(0.1)].into(), strands: 500, clump: 1.0, frizz: 0.0, ..Hair::default() };
         let s = hair.strands();
         assert_eq!(s.len(), 500);
         for st in &s {
@@ -863,7 +1214,7 @@ mod tests {
     #[test]
     fn guides_grow_tapered_cards_with_a_masked_texture() {
         let hair = Hair {
-            guides: vec![Guide { points: vec![Vec3::new(0.05, 1.0, 0.0), Vec3::new(0.1, 0.8, 0.02), Vec3::new(0.12, 0.6, 0.0)], width: None }],
+            guides: vec![Guide { points: vec![Vec3::new(0.05, 1.0, 0.0), Vec3::new(0.1, 0.8, 0.02), Vec3::new(0.12, 0.6, 0.0)], width: None }].into(),
             mirror: true,
             center: Some(Vec3::new(0.0, 0.9, 0.0)),
             ..Hair::default()
@@ -947,7 +1298,216 @@ mod tests {
         let farthest = |h: &Hair| h.strands().iter().flat_map(|s| s.points.clone()).map(|p| p.length()).fold(0.0f32, f32::max);
         assert!(farthest(&wild) > farthest(&tidy) + 0.005, "{} {}", farthest(&wild), farthest(&tidy));
         // Brows and lashes ignore volume.
-        let lash = Hair { guides: vec![Guide { points: vec![Vec3::ZERO, Vec3::Z * 0.006], width: None }], interpolate: false, strands: 1, volume: 0.05, ..Hair::default() };
+        let lash = Hair { guides: vec![Guide { points: vec![Vec3::ZERO, Vec3::Z * 0.006], width: None }].into(), interpolate: false, strands: 1, volume: 0.05, ..Hair::default() };
         assert!(lash.strands()[0].points.iter().all(|p| p.x.abs() < 0.003 && p.y.abs() < 0.003));
+    }
+
+    /// A ball head of radius 0.1 that keeps things `lift` outside it.
+    struct Ball {
+        lift: f32,
+    }
+
+    impl crate::groom::Collider for Ball {
+        fn push(&self, p: Vec3) -> Option<Vec3> {
+            let want = 0.1 + self.lift;
+            (p.length() < want).then(|| p.normalize_or(Vec3::Y) * want)
+        }
+        fn normal(&self, p: Vec3) -> Option<Vec3> {
+            Some(p.normalize_or(Vec3::Y))
+        }
+        fn inside(&self, p: Vec3) -> bool {
+            p.length() < 0.1
+        }
+        fn step(&self) -> f32 {
+            0.002
+        }
+    }
+
+    /// 80 guides on the ball's upper half, `lift` out, each leaving the
+    /// scalp and then lying flat along it toward -Y (as a comb into the
+    /// head leaves them), every guide point outside the ball.
+    fn pressed(lift: f32) -> Hair {
+        let mut guides = Vec::new();
+        for i in 0..80 {
+            let y = 1.0 - (i as f32 + 0.5) / 80.0 * 0.9;
+            let a = i as f32 * 2.399_963;
+            let r = (1.0 - y * y).sqrt();
+            let mut p = Vec3::new(r * a.cos(), y, r * a.sin()) * (0.1 + lift);
+            let mut points = vec![p];
+            for _ in 0..16 {
+                let n = p.normalize();
+                let down = (Vec3::NEG_Y - n * n.dot(Vec3::NEG_Y)).normalize_or(n.any_orthonormal_vector());
+                p = (p + down * 0.015).normalize() * (0.1 + lift);
+                points.push(p);
+            }
+            guides.push(Guide { points, width: None });
+        }
+        Hair { guides: guides.into(), strands: 2000, center: Some(Vec3::ZERO), lift, ..Hair::default() }
+    }
+
+    /// Cards kept out of the head (Stage 4d follow-up): on guides pressed
+    /// flat onto a ball, the plain cards put vertices inside it and the
+    /// kept-out ones none; cards it does not reach, the indices, normals
+    /// and UVs are the plain build's bit for bit; no head is exactly
+    /// `build_mesh`; the same on 1 and 12 threads.
+    #[test]
+    fn cards_keep_out_of_the_head_and_leave_the_rest_alone() {
+        let hair = Hair { cards: 4, ..pressed(GROW_LIFT) };
+        let head = Ball { lift: GROW_LIFT };
+        let plain = hair.build_mesh();
+        let inside = |m: &Mesh| m.vertices.iter().filter(|v| Vec3::from(v.pos).length() < 0.1).count();
+        let (kept, moved) = hair.build_mesh_kept_out(Some(&head));
+        let cards = plain.vertices.len() / (3 * (SEGMENTS + 1));
+        eprintln!("pressed guides: {}/{} card vertices inside the ball; kept out: {}, {moved} of {cards} cards moved", inside(&plain), plain.vertices.len(), inside(&kept));
+        assert!(inside(&plain) > 0, "the fixture presses cards into the ball");
+        assert_eq!(inside(&kept), 0);
+        assert!(moved > 0 && moved <= cards);
+        assert_eq!((kept.indices.clone(), kept.edges.clone()), (plain.indices.clone(), plain.edges.clone()));
+        assert!(kept.vertices.iter().zip(&plain.vertices).all(|(a, b)| a.normal == b.normal && a.uv == b.uv && a.tangent == b.tangent));
+        let same = kept.vertices.chunks(3 * (SEGMENTS + 1)).zip(plain.vertices.chunks(3 * (SEGMENTS + 1))).filter(|(a, b)| a.iter().zip(b.iter()).all(|(x, y)| x.pos == y.pos)).count();
+        assert_eq!(same, cards - moved, "only the cards the head moved differ");
+        // Every rail segment is clear too (sampled finely).
+        let rails_inside = kept.vertices.chunks(3 * (SEGMENTS + 1)).flat_map(|c| (0..3).flat_map(move |r| (0..SEGMENTS).flat_map(move |k| {
+            let (a, b) = (Vec3::from(c[3 * k + r].pos), Vec3::from(c[3 * (k + 1) + r].pos));
+            (1..8).map(move |i| a.lerp(b, i as f32 / 8.0))
+        }))).filter(|p| p.length() < 0.1 - 1e-4).count();
+        assert_eq!(rails_inside, 0);
+        let (none, zero) = hair.build_mesh_kept_out(None);
+        assert_eq!(zero, 0);
+        assert!(none.vertices.iter().zip(&plain.vertices).all(|(a, b)| a.pos == b.pos) && none.indices == plain.indices);
+        let one = crate::clay::with_threads(1, || hair.build_mesh_kept_out(Some(&head)));
+        let many = crate::clay::with_threads(12, || hair.build_mesh_kept_out(Some(&head)));
+        assert_eq!(one.1, many.1);
+        assert!(one.0.vertices.iter().zip(&many.0.vertices).all(|(a, b)| a.pos == b.pos));
+        assert!(one.0.vertices.iter().zip(&kept.vertices).all(|(a, b)| a.pos == b.pos));
+    }
+
+    #[test]
+    fn strands_keep_out_of_the_head_and_leave_the_rest_alone() {
+        let hair = pressed(GROW_LIFT);
+        let head = Ball { lift: GROW_LIFT };
+        assert!(hair.guides.iter().flat_map(|g| &g.points).all(|p| p.length() >= 0.1 + GROW_LIFT - 1e-6));
+        let free = hair.strands();
+        let inside = |s: &[Strand]| inside_count(s, |p| p.length() < 0.1);
+        let before = inside(&free);
+        let (kept, moved) = hair.strands_kept_out(Some(&head));
+        eprintln!("pressed guides: {before}/{} strands enter the ball; kept out: {}, {moved} moved", free.len(), inside(&kept));
+        assert!(before > 0, "the fixture presses strands into the ball");
+        assert_eq!(inside(&kept), 0);
+        assert_eq!(kept.len(), free.len());
+        // Strands the head did not touch are the same bit for bit, and
+        // the moved ones keep their widths and colors.
+        let same = free.iter().zip(&kept).filter(|(a, b)| a.points == b.points).count();
+        assert_eq!(same, free.len() - moved);
+        assert!(free.iter().zip(&kept).all(|(a, b)| a.root_width == b.root_width && a.tip_width == b.tip_width && a.root_color == b.root_color && a.tip_color == b.tip_color));
+        // No head: exactly `strands`.
+        let (none, zero) = hair.strands_kept_out(None);
+        assert_eq!(zero, 0);
+        assert!(none.iter().zip(&free).all(|(a, b)| a.points == b.points));
+        // A head the hair does not reach changes nothing.
+        let far = Hair { guides: hair.guides.iter().map(|g| Guide { points: g.points.iter().map(|p| *p + Vec3::X).collect(), width: None }).collect(), center: Some(Vec3::X), ..hair.clone() };
+        let (away, n) = far.strands_kept_out(Some(&head));
+        assert_eq!(n, 0);
+        assert!(away.iter().zip(far.strands()).all(|(a, b)| a.points == b.points));
+        // The same on 1 and 12 threads.
+        let one = crate::clay::with_threads(1, || hair.strands_kept_out(Some(&head)));
+        let twelve = crate::clay::with_threads(12, || hair.strands_kept_out(Some(&head)));
+        assert_eq!(one.1, twelve.1);
+        assert!(one.0.iter().zip(&twelve.0).all(|(a, b)| a.points == b.points));
+        assert!(one.0.iter().zip(&kept).all(|(a, b)| a.points == b.points));
+    }
+
+    /// `n` guides on the upper part of a ball of radius 0.1 (x >= 0 only
+    /// when `half`), each hanging out and down.
+    fn ball_guides(n: usize, half: bool) -> Vec<Guide> {
+        (0..n).map(|i| {
+            let y = 1.0 - (i as f32 + 0.5) / n as f32 * 0.9;
+            let a = i as f32 * 2.399_963;
+            let r = (1.0 - y * y).sqrt();
+            let mut x = r * a.cos();
+            if half { x = x.abs() + 1e-3; }
+            let root = Vec3::new(x, y, r * a.sin()).normalize() * 0.1015;
+            let out = root.normalize();
+            Guide { points: (0..12).map(|k| root + out * (0.004 * k as f32) + Vec3::NEG_Y * (0.0004 * (k * k) as f32)).collect(), width: None }
+        }).collect()
+    }
+
+    /// Hashes of what `strands`, `build_mesh` and `coverage` make (bits).
+    fn look_hash(h: &Hair) -> (u64, u64, u64) {
+        use std::hash::Hasher;
+        let mut a = xxhash_rust::xxh3::Xxh3::new();
+        for s in h.strands() {
+            for p in &s.points { for v in p.to_array() { a.write_u32(v.to_bits()); } }
+            for v in [s.root_width, s.tip_width].into_iter().chain(s.root_color.to_array()).chain(s.tip_color.to_array()) { a.write_u32(v.to_bits()); }
+        }
+        let mut b = xxhash_rust::xxh3::Xxh3::new();
+        let m = h.build_mesh();
+        for v in &m.vertices {
+            for x in v.pos.iter().chain(&v.normal).chain(&v.uv).chain(&v.color) { b.write_u32(x.to_bits()); }
+        }
+        for i in &m.indices { b.write_u32(*i); }
+        (a.finish(), b.finish(), xxhash_rust::xxh3::xxh3_64(h.coverage().to_string().as_bytes()))
+    }
+
+    /// The strands, cards and coverage of fixed hairs, pinned before the
+    /// scalp build got a spatial index (Stage 4c review): the faster
+    /// build makes the same hair bit for bit.
+    #[test]
+    fn scalp_build_is_pinned() {
+        let lash = Hair { guides: vec![Guide { points: vec![Vec3::ZERO, Vec3::Z * 0.006, Vec3::new(0.0, 0.002, 0.01)], width: None }].into(), interpolate: false, strands: 40, ..Hair::default() };
+        let cases: Vec<(&str, Hair, (u64, u64, u64))> = vec![
+            ("patch", patch(Hair::default()), (0xbfbc4c5dc9d9f443, 0xf6037ea4a61b3edb, 0x1d7645eb8baacd1f)),
+            ("patch_locks", patch(Hair { volume: 0.02, clump: 0.8, clump_levels: 3, ..Hair::default() }), (0x1da4d874b85d107a, 0x8ed016013cfebd8b, 0x1d7645eb8baacd1f)),
+            ("ball_400", Hair { guides: ball_guides(400, false).into(), strands: 4000, ..Hair::default() }, (0xe9c553d7c751e2fd, 0x6df1c624d521b90a, 0x93bebc66086e9baa)),
+            ("ball_4096_mirror", Hair { guides: ball_guides(4096, true).into(), mirror: true, strands: 4000, cards: 1, ..Hair::default() }, (0x0d2aa66d4c628b79, 0x7d5bf65ab148d2b6, 0x9e8fad4d77ff1707)),
+            ("lash", lash, (0x1fc708eeeee43e7d, 0xd76aeebe12fdc8b9, 0x83249634c86b72b1)),
+        ];
+        for (name, h, want) in &cases {
+            let t = std::time::Instant::now();
+            let got = look_hash(h);
+            eprintln!("{name}: {:#x}, {:#x}, {:#x}, {:.0} ms for strands, cards and coverage", got.0, got.1, got.2, t.elapsed().as_secs_f64() * 1e3);
+            assert_eq!(got, *want, "{name}");
+        }
+    }
+
+    /// A hair saved without `lift` (before groom, or made without grow)
+    /// loads with lift 0, so old brows and lashes are not lifted; a stored
+    /// lift round-trips, and 0 is left out of the file (review finding 2).
+    #[test]
+    fn missing_lift_is_zero_and_a_stored_one_round_trips() {
+        let old: Hair = serde_json::from_str(r#"{"guides": [{"points": [[0, 0, 0], [0, 0, 0.007]]}], "interpolate": false}"#).unwrap();
+        assert_eq!(old.lift, 0.0);
+        assert_eq!(Hair::default().lift, 0.0);
+        assert!(!serde_json::to_string(&old).unwrap().contains("lift"));
+        let grown = Hair { lift: GROW_LIFT, ..old.clone() };
+        let text = serde_json::to_string(&grown).unwrap();
+        assert!(text.contains("\"lift\""), "{text}");
+        let back: Hair = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.lift, GROW_LIFT);
+        assert!(back == grown);
+    }
+
+    /// Scalp, cards and coverage at the guide bound, plain and mirrored
+    /// (`--ignored`; prints).
+    #[test]
+    #[ignore]
+    fn scalp_timing() {
+        for (n, mirror) in [(4096, false), (4096, true)] {
+            let h = Hair { guides: ball_guides(n, mirror).into(), mirror, ..Hair::default() };
+            let t = std::time::Instant::now();
+            let c = h.coverage();
+            let cov = t.elapsed().as_secs_f64() * 1e3;
+            let t = std::time::Instant::now();
+            let m = h.build_mesh();
+            let cards = t.elapsed().as_secs_f64() * 1e3;
+            let t = std::time::Instant::now();
+            let (kept, moved) = h.build_mesh_kept_out(Some(&Ball { lift: GROW_LIFT }));
+            let kept_ms = t.elapsed().as_secs_f64() * 1e3;
+            eprintln!("  cards kept out of the ball: {kept_ms:.0} ms ({moved} moved, {} vertices)", kept.vertices.len());
+            let t = std::time::Instant::now();
+            let s = h.strands();
+            let strands = t.elapsed().as_secs_f64() * 1e3;
+            eprintln!("{} guides: coverage {cov:.0} ms ({} patches), cards {cards:.0} ms ({} triangles), {} strands {strands:.0} ms", n * (1 + usize::from(mirror)), c["scalp_patches"], m.indices.len() / 3, s.len());
+        }
     }
 }

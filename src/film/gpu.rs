@@ -347,7 +347,7 @@ fn upload_meshes(gpu: &Gpu, meshes: &Meshes) -> Result<SceneBuffers, String> {
                 smart_layer(m, l, &mut maps, texels, floats);
             }
         }
-        [m.emission, m.transmission, m.ior, m.subsurface, m.scatter[0], m.scatter[1], m.scatter[2], m.skin_specular, m.pores, m.mottling, if m.name == "hair" { 1.0 } else { 0.0 }, if m.name == "flame" { 1.0 } else { 0.0 },
+        [m.emission, m.transmission, m.ior, m.subsurface, m.scatter_radius().x, m.scatter_radius().y, m.scatter_radius().z, m.skin_specular, m.pores, m.mottling, if m.name == "hair" { 1.0 } else { 0.0 }, if m.name == "flame" { 1.0 } else { 0.0 },
             d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], m.metallic, m.clearcoat, m.sheen, m.roughness]
     };
     // Vertices are in object space (each item has its own matrix): items
@@ -1240,7 +1240,7 @@ mod detail_tests {
         };
         let base = clay.build_mesh();
         let mut items = vec![item(&displaced, &base)];
-        let diced = super::super::dice::displace(&mut items, &[camera()], 48);
+        let diced = super::super::dice::displace(&mut items, &[camera()], 48, 48);
         assert!(diced > 1000, "{diced}");
         let flat = render(vec![item(&plain, &base)], Device::Cpu);
         let mesh = items[0].mesh.clone();

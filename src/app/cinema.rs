@@ -33,6 +33,10 @@ impl ClideApp {
         // Film shows the finest detail there is unless told otherwise. Fine
         // meshes still building are waited for in the job, not here.
         self.meshes.show_fine = args["fine"].as_bool().unwrap_or(true);
+        // Hair strands keep out of the clays they sit on, as drawn
+        // (unchecked ledgers settle first, §0.2 rule 1).
+        let heads: Vec<u64> = self.scene.objects.iter().filter(|o| o.shape == crate::scene::Shape::Hair).filter_map(|o| self.hair_head(o.id)).collect();
+        self.settle_clays(heads)?;
         self.meshes.sync_shown(&self.scene);
         let job = (|| {
             let mut job = self.prepare_film(args, started)?;
@@ -138,7 +142,7 @@ impl ClideApp {
             let mut summary = loaded.summary;
             summary["path"] = json!(path);
             let settings = crate::film::Settings { time_limit: settings.time_limit.saturating_sub(start.elapsed()), ..settings };
-            FilmJob { temporal: Vec::new(), look: std::sync::Arc::new(crate::film::Look::default()), fine_errors: Value::Null, fine: Vec::new(), fine_by: start, items: loaded.items, fibers: Vec::new(), shots, settings, save, summary: Some(summary), passes: None }.run(progress)
+            FilmJob { temporal: Vec::new(), look: std::sync::Arc::new(crate::film::Look::default()), fine_errors: Value::Null, fine: Vec::new(), fine_by: start, items: loaded.items, fibers: Vec::new(), hair_heads: Value::Null, shots, settings, save, summary: Some(summary), passes: None, polys: Vec::new(), subdiv: Default::default() }.run(progress)
         })))
     }
 
@@ -152,6 +156,13 @@ impl ClideApp {
         if views.len() > 4 {
             return Err("at most 4 views per call (film renders are slow)".into());
         }
+        // Bounded from the arguments before anything is built.
+        let subdiv = crate::film::subdiv::Options::parse(args)?;
+        // Reference image planes are left out unless asked for.
+        let show_references = match args.get("show_references").filter(|v| !v.is_null()) {
+            None => false,
+            Some(v) => v.as_bool().ok_or("show_references must be true or false")?,
+        };
         let size = args["size"].as_u64().unwrap_or(640).clamp(64, 1600) as usize;
         let total_limit = args["time_limit"].as_f64().unwrap_or(90.0).clamp(1.0, 600.0);
         // What is left after building meshes; the views share it evenly.
@@ -201,7 +212,7 @@ impl ClideApp {
         let mut owners = Vec::new();
         let mut items: Vec<crate::film::Item> = draws
             .iter()
-            .filter(|d| d.object.shape.is_mesh() && d.object.shape != crate::scene::Shape::Fire)
+            .filter(|d| d.object.shape.is_mesh() && d.object.shape != crate::scene::Shape::Fire && (show_references || !d.object.is_reference()))
             .filter_map(|d| {
                 let mesh = self.meshes.get(d.object)?.clone();
                 owners.push(Some(d.object));
@@ -230,11 +241,20 @@ impl ClideApp {
         let look = std::sync::Arc::new(look);
         // Hair objects render as strands, not cards.
         let mut fibers = Vec::new();
+        let mut hair_heads = Vec::new();
         for o in self.scene.objects.iter().filter(|o| o.shape == crate::scene::Shape::Hair) {
-            let (Some(&(world, true)), Some(hair)) = (eval.get(&o.id), o.hair.as_ref()) else { continue };
+            let (Some(&(world, true)), Some(_)) = (eval.get(&o.id), o.hair.as_ref()) else { continue };
             let scale = world.to_scale_rotation_translation().0.abs().max_element();
             let tint = Vec3::from(o.color).powf(2.2);
-            for s in hair.strands() {
+            let kept = self.hair_strands(o.id, None);
+            if let Some(head) = kept.head {
+                let head = self.scene.get(head).map_or_else(|| head.to_string(), |h| h.name.clone());
+                hair_heads.push(match &kept.error {
+                    None => json!({ "hair": o.name, "head": head, "strands_moved": kept.moved }),
+                    Some(e) => json!({ "hair": o.name, "head": head, "error": e }),
+                });
+            }
+            for s in kept.strands {
                 fibers.push(crate::film::Fiber {
                     points: s.points.iter().map(|p| world.transform_point3(*p)).collect(),
                     root_width: s.root_width * scale,
@@ -245,6 +265,23 @@ impl ClideApp {
             }
         }
         let (items, owners): (Vec<crate::film::Item>, Vec<_>) = items.into_iter().zip(owners).filter(|(i, _)| i.mesh.textures.as_ref().is_none_or(|t| !t.alpha)).unzip();
+        // Poly items render subdivided (with every stored level, not only
+        // the shown one); copies of one object share its Poly.
+        let mut polys: Vec<crate::film::subdiv::Source> = Vec::new();
+        let mut shared: Vec<(u64, std::sync::Arc<crate::poly::Poly>)> = Vec::new();
+        for (i, o) in owners.iter().enumerate() {
+            let Some(o) = o else { continue };
+            let (crate::scene::Shape::Poly, Some(p)) = (o.shape, o.poly.as_ref()) else { continue };
+            let poly = match shared.iter().find(|s| s.0 == o.id) {
+                Some(s) => s.1.clone(),
+                None => {
+                    let a = std::sync::Arc::new(p.clone());
+                    shared.push((o.id, a.clone()));
+                    a
+                }
+            };
+            polys.push(crate::film::subdiv::Source { item: i, name: o.name.clone(), poly });
+        }
         let mut fine: Vec<FineWait> = Vec::new();
         for (i, o) in owners.iter().enumerate() {
             let Some(o) = o else { continue };
@@ -261,7 +298,7 @@ impl ClideApp {
         let save = save_png_path(args)?;
         let fine_wait = args["fine_wait"].as_f64().unwrap_or((total_limit * 0.5).min(30.0)).clamp(0.0, 600.0);
         let fine_by = started + Duration::from_secs_f64(fine_wait);
-        Ok(FilmJob { temporal: Vec::new(), look, fine_errors: self.fine_errors_json(), fine, fine_by, items, fibers, shots, settings, save, summary: None, passes: None })
+        Ok(FilmJob { temporal: Vec::new(), look, fine_errors: self.fine_errors_json(), fine, fine_by, items, fibers, hair_heads: json!(hair_heads), shots, settings, save, summary: None, passes: None, polys, subdiv })
     }
 }
 
@@ -310,12 +347,18 @@ struct FilmJob {
     fine_by: std::time::Instant,
     items: Vec<crate::film::Item>,
     fibers: Vec<crate::film::Fiber>,
+    /// Per hair: the clay its strands were kept out of and how many moved,
+    /// or why they could not be (reply `hair_kept_out`).
+    hair_heads: Value,
     shots: Vec<(String, crate::film::Camera)>,
     settings: crate::film::Settings,
     save: Option<std::path::PathBuf>,
     summary: Option<Value>,
     /// Render passes to write too (still pictures only).
     passes: Option<PassRequest>,
+    /// Poly items, subdivided and displaced for the cameras (Stage 4a).
+    polys: Vec<crate::film::subdiv::Source>,
+    subdiv: crate::film::subdiv::Options,
 }
 
 /// A fine mesh still building when the render was asked for, and the
@@ -388,11 +431,20 @@ impl FilmJob {
         // Displacing materials become real geometry, diced for these cameras.
         let mut items = std::mem::take(&mut self.items);
         let cams: Vec<crate::film::Camera> = self.shots.iter().map(|s| s.1).collect();
+        // Polys: their subdivision surface and displacement, diced for
+        // these cameras (each shutter slice for its own, below).
+        let mut subdivision = Vec::new();
+        let mut subdivided = 0isize;
+        if self.temporal.is_empty() && !self.polys.is_empty() && self.subdiv.max_level > 0 {
+            progress.stage("subdividing polygon objects", 0.0);
+            (subdivided, subdivision) = crate::film::subdiv::subdivide(&mut items, &self.polys, &cams, self.settings.width, self.settings.height, &self.subdiv, progress)?;
+        }
+        let mut triangles = (triangles as isize + subdivided).max(0) as usize;
         if items.iter().any(|i| i.material.detail_displace > 0.0 || i.mesh.materials.iter().any(|m| m.detail_displace > 0.0)) {
             progress.stage("dicing displaced surfaces", 0.0);
         }
-        let diced = if self.temporal.is_empty() { crate::film::dice::displace(&mut items, &cams, self.settings.height) } else { 0 };
-        let triangles = triangles + diced;
+        let mut diced = if self.temporal.is_empty() { crate::film::dice::displace(&mut items, &cams, self.settings.width, self.settings.height) } else { 0 };
+        triangles += diced;
         progress.stage("building the ray tree", 0.0);
         // One ray tree for every view; its time counts against the limit.
         progress.check()?;
@@ -420,7 +472,15 @@ impl FilmJob {
                 progress.check()?;
                 progress.stage(&format!("shutter sample {}/{}",i+1,n), i as f32/n as f32);
                 let cams: Vec<_> = slice.shots.iter().map(|s| s.1).collect();
-                crate::film::dice::displace(&mut slice.items, &cams, slice.settings.height);
+                let (_, reports) = if slice.subdiv.max_level > 0 { crate::film::subdiv::subdivide(&mut slice.items, &slice.polys, &cams, slice.settings.width, slice.settings.height, &slice.subdiv, progress)? } else { (0, Vec::new()) };
+                let slice_diced = crate::film::dice::displace(&mut slice.items, &cams, slice.settings.width, slice.settings.height);
+                // The reply counts what the first slice traces (each slice
+                // dices for its own pose and cameras, about the same).
+                if i == 0 {
+                    subdivision = reports;
+                    triangles = slice.items.iter().map(|i| i.mesh.indices.len() / 3).sum::<usize>();
+                    diced = slice_diced;
+                }
                 let meshes = crate::film::Meshes::new(slice.items);
                 slice.settings.time_limit = self.settings.time_limit.saturating_sub(start.elapsed())/(n-i) as u32;
                 let images = crate::film::render_views_with_look(&meshes,&slice.fibers,&cams,slice.settings,slice.look,progress);
@@ -476,7 +536,9 @@ impl FilmJob {
             "triangles": triangles,
             "seconds": (start.elapsed().as_secs_f32() * 10.0).round() / 10.0,
             "displaced_triangles": diced,
+            "subdivision": subdivision,
             "hair_strands": self.fibers.len(),
+            "hair_kept_out": self.hair_heads,
             "lights": lights,
             "fine_mesh_errors": self.fine_errors,
             "saved": saved,
@@ -485,6 +547,11 @@ impl FilmJob {
         summary.as_object_mut().expect("summary is an object").extend(render.as_object().unwrap().clone());
         if let Some(reply) = pass_reply {
             summary.as_object_mut().expect("summary is an object").extend(reply.as_object().expect("an object").clone());
+        }
+        let mut warning = warning;
+        if let Some(e) = self.hair_heads.as_array().and_then(|l| l.iter().find(|h| h.get("error").is_some())) {
+            let w = format!("hair {} was not kept out of {} ({}): its strands may enter it", e["hair"].as_str().unwrap_or("?"), e["head"].as_str().unwrap_or("?"), e["error"].as_str().unwrap_or("?"));
+            warning = Some(match warning { Some(x) => format!("{x}; {w}"), None => w });
         }
         if let Some(w) = warning {
             match summary["warnings"].as_array_mut() {
@@ -738,7 +805,7 @@ mod shutter_tests {
             let material=crate::material::Material{emission:8.0,..Default::default()};
             vec![Item{mesh:Arc::new(crate::mesh::Mesh::build(crate::scene::Shape::Sphere)),world:Mat4::from_scale_rotation_translation(Vec3::splat(0.4),glam::Quat::IDENTITY,Vec3::X*x),tint:[1.0,0.4,0.2],surface:material.surface(),material}]
         };
-        let job=|x:f32| FilmJob{temporal:Vec::new(),look:look.clone(),fine_errors:Value::Null,fine:Vec::new(),fine_by:std::time::Instant::now(),items:make(x),fibers:Vec::new(),shots:vec![("motion".into(),cam)],settings,save:None,summary:None,passes:None};
+        let job=|x:f32| FilmJob{temporal:Vec::new(),look:look.clone(),fine_errors:Value::Null,fine:Vec::new(),fine_by:std::time::Instant::now(),items:make(x),fibers:Vec::new(),hair_heads:Value::Null,shots:vec![("motion".into(),cam)],settings,save:None,summary:None,passes:None,polys:Vec::new(),subdiv:Default::default()};
         let mut expected=vec![Vec3::ZERO;32*24];
         let mut ldr=vec![[0.0f32;3];32*24];
         for x in [-0.45,0.45] {
@@ -775,7 +842,7 @@ mod shutter_tests {
             wait(1, "ready", vec![0, 2], FineTicket::done(Ok((fine.clone(), None)))),
             wait(2, "late", vec![1], FineTicket::default()),
             wait(3, "failed", vec![3], FineTicket::done(Err("too fine".into()))),
-        ], fine_by: now, items: vec![item(), item(), item(), item()], fibers: Vec::new(), shots: Vec::new(), settings, save: None, summary: None, passes: None };
+        ], fine_by: now, items: vec![item(), item(), item(), item()], fibers: Vec::new(), hair_heads: Value::Null, shots: Vec::new(), settings, save: None, summary: None, passes: None, polys: Vec::new(), subdiv: Default::default() };
         job.take_fine(&Default::default()).unwrap();
         let shown: Vec<bool> = job.items.iter().map(|i| Arc::ptr_eq(&i.mesh, &fine)).collect();
         assert_eq!(shown, [true, false, true, false]);

@@ -74,6 +74,11 @@ pub(super) struct Jobs {
     pub defer: Option<Answer>,
     /// Calls that are done and wait for background mesh builds, in order.
     pub deferred: VecDeque<(Ticket, Answer)>,
+    /// Set with `defer` by a tool that answers sooner when the build is
+    /// slow (`edit_clay wait_s`): how long to wait, and that answer.
+    pub defer_early: Option<(Duration, Answer)>,
+    /// Those answers for calls in `deferred`, by ticket, with when.
+    pub early: BTreeMap<u64, (Instant, Answer)>,
     /// Calls not run yet: they wait in line while meshes build.
     pub queue: VecDeque<(ToolCall, Ticket)>,
     /// `job_status` calls waiting for a job: (job, give up at, reply).
@@ -191,13 +196,38 @@ impl ClideApp {
         Ok(Vec::new())
     }
 
-    /// Sends the deferred answers once the meshes are built.
+    /// `defer_reply`, but if the builds take longer than `wait`, answers
+    /// then with `early` instead (which must not wait for meshes).
+    pub(super) fn defer_reply_within(&mut self, wait: Duration, answer: impl FnOnce(&mut ClideApp) -> ToolResult + 'static, early: impl FnOnce(&mut ClideApp) -> ToolResult + 'static) -> ToolResult {
+        self.jobs.defer_early = Some((wait, Box::new(early)));
+        self.defer_reply(answer)
+    }
+
+    /// Sends the deferred answers once the meshes are built, and early
+    /// answers whose time is up while they build. An early answer may go
+    /// out before an earlier call's: each call has its own reply channel,
+    /// and over MCP its own HTTP request whose response carries its
+    /// JSON-RPC id (a batch is answered in order inside one request), so
+    /// replies pair with their calls whatever order they are sent in. The
+    /// calls themselves still ran in order.
     pub(super) fn answer_deferred(&mut self, ctx: &egui::Context) {
         if self.meshes.busy() {
+            let now = Instant::now();
+            // Only to a call still waiting: past REPLY_AFTER it was told its
+            // job id, and `job_status` gets the full answer once built.
+            let due: Vec<u64> = self.jobs.deferred.iter().filter(|(t, _)| t.reply.is_some() && self.jobs.early.get(&t.id).is_some_and(|(at, _)| now >= *at)).map(|(t, _)| t.id).collect();
+            for id in due {
+                let i = self.jobs.deferred.iter().position(|(t, _)| t.id == id).expect("listed");
+                let (ticket, _) = self.jobs.deferred.remove(i).expect("listed");
+                let (_, early) = self.jobs.early.remove(&id).expect("listed");
+                let result = early(self);
+                self.jobs.answer(ticket, result);
+            }
             ctx.request_repaint_after(Duration::from_millis(100));
             return;
         }
         while let Some((ticket, answer)) = self.jobs.deferred.pop_front() {
+            self.jobs.early.remove(&ticket.id);
             let result = answer(self);
             self.jobs.answer(ticket, result);
         }
@@ -224,6 +254,18 @@ impl ClideApp {
                 self.agent_step(&tool, label, jumps, source);
             }
             self.status = format!("Done: {}", job.ticket.label);
+            // A finisher may answer once meshes are built, as a tool can
+            // (`defer_reply`; edit_clay's polish waits for its mesh).
+            if let Some(answer) = self.jobs.defer.take() {
+                let mut ticket = job.ticket;
+                if let Some((wait, early)) = self.jobs.defer_early.take() {
+                    self.jobs.early.insert(ticket.id, (Instant::now() + wait, early));
+                }
+                ticket.label = format!("{} (answer waits for meshes)", ticket.label);
+                self.jobs.deferred.push_back((ticket, answer));
+                continue;
+            }
+            self.jobs.defer_early = None;
             self.jobs.answer(job.ticket, result);
         }
         self.jobs.reply_late();
@@ -247,7 +289,7 @@ impl ClideApp {
             let pending:Vec<_>=pending.into_iter().skip(offset).take(limit).collect();
             let finished_count=self.jobs.finished.len();
             let finished: Vec<Value> = self.jobs.finished.iter().skip(offset).take(limit).map(|(id, (label, r, _))| json!({ "job": id, "did": label, "ok": r.is_ok(), "status": if r.is_ok(){"finished"}else{"failed"} })).collect();
-            return Some(Ok(super::tools::text(json!({ "pending": pending, "finished": finished, "pending_count":pending_count, "finished_count":finished_count, "offset":offset, "next_offset":offset.checked_add(limit).filter(|n|*n<pending_count.max(finished_count)), "ui_activity": self.ui_activity_json(false) }))));
+            return Some(Ok(super::tools::text(json!({ "pending": pending, "finished": finished, "pending_count":pending_count, "finished_count":finished_count, "offset":offset, "next_offset":offset.checked_add(limit).filter(|n|*n<pending_count.max(finished_count)), "builds": self.builds_json(), "ui_activity": self.ui_activity_json(false) }))));
         };
         if args["cancel"].as_bool().unwrap_or(false) {
             return Some(self.cancel_job(id));
@@ -263,6 +305,12 @@ impl ClideApp {
         // Answer when the job does, or with its status when the wait ends.
         self.jobs.watchers.push((id, Instant::now() + Duration::from_secs_f64(wait), reply.clone()));
         None
+    }
+
+    /// Mesh builds running in the background (`job_status` without id):
+    /// object, what, seconds so far and the fraction done.
+    pub(super) fn builds_json(&self) -> Vec<Value> {
+        self.meshes.building().into_iter().map(|b| json!({ "object": b.object, "what": b.what, "seconds": (b.seconds * 10.0).round() / 10.0, "fraction": (b.fraction * 1000.0).round() / 1000.0 })).collect()
     }
 
     fn cancel_job(&mut self, id: u64) -> ToolResult {
@@ -289,12 +337,13 @@ impl ClideApp {
 
     /// The "Working on" panel: one bar per running job and mesh build.
     pub(super) fn jobs_panel(&mut self, ui: &mut egui::Ui) {
-        for (what, seconds) in self.meshes.building() {
+        for b in self.meshes.building() {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(&what).color(super::theme::TEXT));
+                ui.label(egui::RichText::new(&b.what).color(super::theme::TEXT));
                 let waiting = self.jobs.deferred.len() + self.jobs.queue.len();
-                let text = if waiting > 0 { format!("{seconds:.0}s  ·  {waiting} agent call(s) waiting") } else { format!("{seconds:.0}s") };
-                ui.add(egui::ProgressBar::new(0.0).animate(true).desired_width(ui.available_width().min(420.0)).text(text));
+                let (percent, seconds) = (b.fraction * 100.0, b.seconds);
+                let text = if waiting > 0 { format!("{percent:.0}%  ·  {seconds:.0}s  ·  {waiting} agent call(s) waiting") } else { format!("{percent:.0}%  ·  {seconds:.0}s") };
+                ui.add(egui::ProgressBar::new(b.fraction).animate(true).desired_width(ui.available_width().min(420.0)).text(text));
             });
         }
         for job in &self.jobs.running {

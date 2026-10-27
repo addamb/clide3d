@@ -8,6 +8,7 @@
 //! pixel-to-world mapping so the agent can turn image features into
 //! coordinates.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use glam::{Mat4, Vec3};
@@ -23,13 +24,161 @@ use crate::render::{self, Instance, ViewportCallback};
 const REF_MAX: u32 = 1024;
 /// Comparison images are at most this on the long side.
 const COMPARE_MAX: usize = 512;
-pub(crate) const BACKGROUND: [u8; 3] = [96, 100, 106];
+pub(crate) const BACKGROUND: [u8; 3] = crate::refplane::BACKGROUND;
+
+/// The view a reference image shows (D13): one image per slot.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(super) enum Slot {
+    Front,
+    Back,
+    Left,
+    Right,
+    Top,
+    ThreeQuarter,
+}
+
+pub(super) const SLOT_NAMES: &str = "front, back, left, right (or side), top, three_quarter";
+
+impl Slot {
+    pub(super) fn parse(s: &str) -> Option<Slot> {
+        Some(match s {
+            "front" => Slot::Front,
+            "back" => Slot::Back,
+            "left" => Slot::Left,
+            "right" | "side" => Slot::Right,
+            "top" => Slot::Top,
+            "three_quarter" => Slot::ThreeQuarter,
+            _ => return None,
+        })
+    }
+
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Slot::Front => "front",
+            Slot::Back => "back",
+            Slot::Left => "left",
+            Slot::Right => "right",
+            Slot::Top => "top",
+            Slot::ThreeQuarter => "three_quarter",
+        }
+    }
+
+    /// Toward the camera of the view named like the slot.
+    pub(super) fn camera_dir(self) -> Vec3 {
+        let (yaw, pitch, _) = named_view(self.name()).expect("every slot names a view");
+        direction(yaw, pitch)
+    }
+
+    /// The viewport pane that shows the slot's image as an overlay by
+    /// default (none for views no pane looks from).
+    fn pane(self) -> Option<ViewKind> {
+        match self {
+            Slot::Front => Some(ViewKind::Front),
+            Slot::Left | Slot::Right => Some(ViewKind::Side),
+            Slot::Top => Some(ViewKind::Top),
+            Slot::Back | Slot::ThreeQuarter => None,
+        }
+    }
+}
+
+/// The loaded reference images, by slot.
+#[derive(Default)]
+pub(super) struct References {
+    slots: std::collections::BTreeMap<Slot, Reference>,
+    /// Slots a plane's view took over when undo or redo brought the plane
+    /// back (a single image, or a sheet's view loaded without planes):
+    /// they come back when the plane goes again, so redo restores them.
+    stash: std::collections::BTreeMap<Slot, Reference>,
+}
+
+impl References {
+    pub(super) fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    pub(super) fn get(&self, slot: Slot) -> Option<&Reference> {
+        self.slots.get(&slot)
+    }
+
+    /// The loaded slots, in order.
+    pub(super) fn loaded(&self) -> Vec<Slot> {
+        self.slots.keys().copied().collect()
+    }
+
+    /// Puts `r` in its slot (replacing what was there): a handler's load,
+    /// which also forgets what the slot held before a plane took it.
+    pub(super) fn insert(&mut self, r: Reference) {
+        self.stash.remove(&r.slot);
+        self.slots.insert(r.slot, r);
+    }
+
+    /// Puts a plane's view in its slot; a slot not from a plane that it
+    /// takes over is kept aside until the plane goes (`drop_planes`).
+    pub(super) fn insert_from_plane(&mut self, r: Reference) {
+        if let Some(old) = self.slots.insert(r.slot, r)
+            && !old.from_plane()
+        {
+            self.stash.insert(old.slot, old);
+        }
+    }
+
+    /// Removes the slots that came from the scene's reference planes; a
+    /// slot one had taken over comes back.
+    pub(super) fn drop_planes(&mut self) {
+        let gone: Vec<Slot> = self.slots.iter().filter(|(_, r)| r.from_plane()).map(|(s, _)| *s).collect();
+        for s in gone {
+            self.slots.remove(&s);
+            if let Some(r) = self.stash.remove(&s) {
+                self.slots.insert(s, r);
+            }
+        }
+    }
+
+    /// Removes a slot (`set_reference clear`), and what a plane took over in it.
+    fn remove(&mut self, slot: Slot) -> Option<Reference> {
+        self.stash.remove(&slot);
+        self.slots.remove(&slot)
+    }
+
+    fn clear(&mut self) {
+        self.stash.clear();
+        self.slots.clear();
+    }
+
+    fn names(&self) -> Vec<&'static str> {
+        self.slots.keys().map(|s| s.name()).collect()
+    }
+
+    /// The reference a view compares against: the view's `slot`, else the
+    /// slot named like the view, else the only one loaded (one image is
+    /// compared from any view, as before slots).
+    pub(super) fn slot_for(&self, view: &Value) -> Result<Slot, String> {
+        if self.slots.is_empty() {
+            return Err("no reference image; call set_reference first".into());
+        }
+        if let Some(s) = view.get("slot").filter(|s| !s.is_null()) {
+            let name = s.as_str().ok_or("a view's slot must be a slot name")?;
+            let slot = Slot::parse(name).ok_or(format!("unknown slot {name}; use {SLOT_NAMES}"))?;
+            return self.slots.contains_key(&slot).then_some(slot).ok_or(format!("no reference in slot {name}; loaded: {}", self.names().join(", ")));
+        }
+        let name = view.as_str().or_else(|| view.get("view").and_then(Value::as_str));
+        if let Some(slot) = name.and_then(Slot::parse).filter(|s| self.slots.contains_key(s)) {
+            return Ok(slot);
+        }
+        match self.loaded().as_slice() {
+            [only] => Ok(*only),
+            _ => Err(format!("no reference for view {}; loaded: {} (name one, or pass {{view, slot}})", name.unwrap_or("given"), self.names().join(", "))),
+        }
+    }
+}
 
 pub(super) struct Reference {
     pub image: egui::ColorImage,
     pub texture: Option<egui::TextureHandle>,
-    /// The viewport pane that shows it as an overlay.
-    pub view: ViewKind,
+    /// The view it shows.
+    pub slot: Slot,
+    /// The viewport pane that shows it as an overlay (None: no pane).
+    pub view: Option<ViewKind>,
     pub opacity: f32,
     pub show: bool,
     /// Which pixels belong to the subject (not the background).
@@ -37,12 +186,53 @@ pub(super) struct Reference {
     /// Subject bounds in pixels: min x, min y, max x, max y (inclusive).
     bbox: [usize; 4],
     path: PathBuf,
+    /// A turnaround sheet's view (Stage 5a): the shared scale and ground
+    /// line it is lined up by (`align`). None for a single image, which
+    /// keeps the per-view fit.
+    pub sheet: Option<SheetFit>,
+}
+
+/// How a sheet's view lines up (`app/sheet.rs`): one scale for every view
+/// of the sheet, and the view's ground line at a world height.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct SheetFit {
+    /// Reference pixels per world unit.
+    pub px_per_unit: f32,
+    /// The reference row edge of the ground line.
+    pub ground_row: f32,
+    /// The world height of the ground line.
+    pub ground_y: f32,
+    /// The reference plane showing it, if any.
+    pub plane: Option<u64>,
+}
+
+impl Reference {
+    /// A sheet's view whose slot follows a reference plane in the scene.
+    pub(super) fn from_plane(&self) -> bool {
+        self.sheet.as_ref().is_some_and(|f| f.plane.is_some())
+    }
+
+    pub(super) fn new(image: egui::ColorImage, slot: Slot, mask: Vec<bool>, fallback_box: [usize; 4], path: PathBuf, sheet: Option<SheetFit>) -> Reference {
+        let bbox = mask_bbox(&mask, image.size[0]).unwrap_or(fallback_box);
+        Reference { image, texture: None, slot, view: slot.pane(), opacity: 0.5, show: true, mask, bbox, path, sheet }
+    }
+
+    /// Subject bounds in pixels: min x, min y, max x, max y (inclusive).
+    pub(super) fn bbox(&self) -> [usize; 4] {
+        self.bbox
+    }
+
+    /// Which pixels belong to the subject (row by row, the image's width).
+    pub(super) fn mask(&self) -> &[bool] {
+        &self.mask
+    }
 }
 
 /// A camera for one off-screen render.
 /// The camera and mapping that line the model up with the reference.
 struct Align {
     view_name: String,
+    slot: Slot,
     /// Toward the camera.
     dir: Vec3,
     right: Vec3,
@@ -59,7 +249,8 @@ struct Align {
     shot: Shot,
     ref_mask: Vec<bool>,
     bbox: [f32; 4],
-    match_width: bool,
+    /// The subject's height on the panel (pixels).
+    subject_px: f32,
     plane_center: Vec3,
 }
 
@@ -139,6 +330,16 @@ pub(super) struct Extras {
     /// viewport's).
     pub lighting: Option<std::sync::Arc<crate::view_light::ViewLighting>>,
     pub ao: Option<crate::render::Ao>,
+    /// A quality shade for this render only (`render_views shade`).
+    pub shade: crate::quality::Shade,
+    /// Draw just these objects (None: everything).
+    pub only: Option<std::sync::Arc<HashSet<u64>>>,
+    /// Draw the reference image planes (`render_views`; never in masks or
+    /// with `only`).
+    pub references: bool,
+    /// Draw the proportion guides through this framed (centre, radius)
+    /// after the render (`render_views guides`; never in masks).
+    pub guides: Option<(Vec3, f32)>,
 }
 
 /// Direction from the target to the camera, yaw/pitch in degrees.
@@ -167,7 +368,7 @@ fn named_view(name: &str) -> Option<(f32, f32, bool)> {
     })
 }
 
-pub(super) const VIEW_NAMES: &str = "front, back, right (camera on +X, Maya's side view), left, top, bottom, three_quarter, three_quarter_back, iso";
+pub(super) const VIEW_NAMES: &str = "front, back, right (camera on +X, Maya's side view), left, top, bottom, three_quarter, three_quarter_back, iso, or {dir: [x, y, z]}";
 
 /// Parses `"front"` or `{"yaw": 30, "pitch": 10, "ortho": false, "fov": 20}`;
 /// `{"view": "iso", "yaw": 135}` turns a named view. Returns (name,
@@ -184,12 +385,23 @@ fn parse_view(v: &Value) -> Result<(String, Vec3, bool, f32), String> {
             let (y, p, o) = named(s)?;
             (s.to_string(), y, p, o)
         }
+        Value::Object(_) if v.get("dir").is_some_and(|d| !d.is_null()) => {
+            let d: [f32; 3] = serde_json::from_value(v["dir"].clone()).map_err(|_| "dir must be [x, y, z] (from the model toward the camera)")?;
+            let dir = Vec3::from(d);
+            if !dir.is_finite() || dir.length_squared() < 1e-12 {
+                return Err("dir must be a finite, nonzero [x, y, z]".into());
+            }
+            let ortho = v.get("ortho").and_then(Value::as_bool).unwrap_or(true);
+            let fov = v.get("fov").and_then(Value::as_f64).map_or(FOV, |f| (f as f32).clamp(1.0, 150.0));
+            let n = dir.normalize();
+            return Ok((format!("dir [{:.3}, {:.3}, {:.3}]", n.x, n.y, n.z), n, ortho, fov));
+        }
         Value::Object(_) => {
             let yaw = v["yaw"].as_f64().unwrap_or(0.0) as f32;
             let pitch = v["pitch"].as_f64().unwrap_or(0.0) as f32;
             (format!("yaw {yaw} pitch {pitch}"), yaw, pitch, false)
         }
-        _ => return Err("a view is a name, {yaw, pitch}, or {view: name}; either object may add center and radius".into()),
+        _ => return Err("a view is a name, {yaw, pitch}, {dir: [x, y, z]} or {view: name}; each object may add center and radius".into()),
     };
     if v.get("view").is_some() {
         yaw = v["yaw"].as_f64().map_or(yaw, |y| y as f32);
@@ -212,15 +424,13 @@ fn up_for(dir: Vec3) -> Vec3 {
 impl ClideApp {
     /// World bounds of everything visible, as (center, radius).
     pub(super) fn scene_sphere(&self) -> (Vec3, f32) {
-        match self.world_bounds(&self.scene.children(None)) {
+        // Planes are left out at any depth (`world_bounds_of_roots`); objects
+        // parented under a plane still count.
+        let roots = self.scene.children(None);
+        match self.world_bounds_of_roots(&roots) {
             Some((lo, hi)) => ((lo + hi) * 0.5, ((hi - lo).length() * 0.5).max(0.05)),
             None => (Vec3::ZERO, 1.0),
         }
-    }
-
-    /// A callback that draws every visible mesh. `mask` draws flat white.
-    fn scene_callback(&self, view_proj: Mat4, eye: Vec3, mask: bool, grid: bool) -> ViewportCallback {
-        scene_callback_of(&self.scene, &self.meshes, view_proj, eye, mask, grid)
     }
 
     fn render_shot(&self, shot: &Shot, w: usize, h: usize, mask: bool, grid: bool) -> Result<egui::ColorImage, String> {
@@ -228,8 +438,44 @@ impl ClideApp {
     }
 
     pub(super) fn render_shot_extras(&self, shot: &Shot, w: usize, h: usize, mask: bool, grid: bool, ex: Extras) -> Result<egui::ColorImage, String> {
+        let shaded = if mask { Default::default() } else { self.shaded_meshes(ex.shade) };
+        self.render_shaded(shot, w, h, mask, grid, ex, &shaded)
+    }
+
+    /// A beauty render with some objects drawn with their own colored
+    /// meshes (`quality_report images`).
+    pub(super) fn render_with(&self, shot: &Shot, w: usize, h: usize, shaded: &std::collections::HashMap<u64, std::sync::Arc<crate::mesh::Mesh>>) -> Result<egui::ColorImage, String> {
+        self.render_shaded(shot, w, h, false, false, Extras::default(), shaded)
+    }
+
+    /// Front and right views of object `id` drawn with `mesh` and its
+    /// wireframe, framed on it (the `retopo` reply's image).
+    pub(super) fn wire_sheet(&self, id: u64, mesh: std::sync::Arc<crate::mesh::Mesh>) -> Result<Vec<Value>, String> {
+        let world = self.scene.world_matrix(id);
+        if mesh.vertices.is_empty() {
+            return Err("the mesh is empty".into());
+        }
+        let (lo, hi) = mesh.bounds();
+        let corners = (0..8).map(|i| world.transform_point3(Vec3::new([lo.x, hi.x][i & 1], [lo.y, hi.y][i >> 1 & 1], [lo.z, hi.z][i >> 2])));
+        let (a, b) = corners.fold((Vec3::MAX, Vec3::MIN), |(a, b), p| (a.min(p), b.max(p)));
+        let (center, radius) = ((a + b) * 0.5, ((b - a).length() * 0.5).max(0.01));
+        let only: std::sync::Arc<HashSet<u64>> = std::sync::Arc::new([id].into_iter().collect());
+        let shaded = std::collections::HashMap::from([(id, mesh)]);
+        let mut tiles = Vec::new();
+        for view in ["front", "right"] {
+            let shot = Shot::framing(&json!(view), center, radius)?;
+            let ex = Extras { shade: crate::quality::Shade::Wire, only: Some(only.clone()), ..Extras::default() };
+            tiles.push(self.render_shaded(&shot, 384, 384, false, false, ex, &shaded)?);
+        }
+        super::tools::encode_png(&contact_sheet(&tiles, 2))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_shaded(&self, shot: &Shot, w: usize, h: usize, mask: bool, grid: bool, ex: Extras, shaded: &std::collections::HashMap<u64, std::sync::Arc<crate::mesh::Mesh>>) -> Result<egui::ColorImage, String> {
         let view_proj = shot.view_proj(w, h);
-        let mut cb = self.scene_callback(view_proj, shot.eye, mask, grid);
+        // Off-screen renders draw their own shade (`ex.shade`), never the
+        // viewport's.
+        let mut cb = scene_callback_with(&self.scene, &self.meshes, view_proj, shot.eye, mask, grid, shaded, ex.shade == crate::quality::Shade::Wire && !mask, ex.only.as_deref(), false, ex.references && !mask && ex.only.is_none());
         cb.shadows = self.shadows;
         cb.post = self.view_look;
         cb.lighting = ex.lighting.clone().unwrap_or_else(|| self.view_lighting.clone());
@@ -259,20 +505,95 @@ impl ClideApp {
         if ex.bones {
             self.draw_bones(&mut img, view_proj);
         }
+        if let Some((center, radius)) = ex.guides.filter(|_| !mask) {
+            self.draw_guides_on(&mut img, view_proj, shot.target - shot.eye, center, radius);
+        }
         Ok(img)
     }
 
-    /// `set_reference` tool.
+    /// Each clay's drawn mesh colored by a quality shade, measured on its
+    /// field (none for shades that keep the colors).
+    fn shaded_meshes(&self, shade: crate::quality::Shade) -> std::collections::HashMap<u64, std::sync::Arc<crate::mesh::Mesh>> {
+        let mut out = std::collections::HashMap::new();
+        if !shade.colors() {
+            return out;
+        }
+        #[cfg(test)]
+        self.shade_measures.set(self.shade_measures.get() + 1);
+        for o in self.scene.objects.iter().filter(|o| o.shape == crate::scene::Shape::Clay) {
+            let (Some(clay), Some(unposed), Some(drawn)) = (o.clay.as_ref(), self.meshes.unposed(o.id), self.meshes.get(o)) else { continue };
+            let Some(colors) = crate::quality::shade_colors(shade, clay, unposed, crate::quality::DEFAULT_SAMPLES) else { continue };
+            let mut m = (**drawn).clone();
+            for (v, c) in m.vertices.iter_mut().zip(colors) {
+                v.color = c;
+            }
+            out.insert(o.id, std::sync::Arc::new(m));
+        }
+        out
+    }
+
+    /// `set_reference` tool: one image per view slot (D13). `view` names
+    /// the slot (default front); the panes it used to name still work
+    /// (side is the right slot, persp the front slot shown on the
+    /// perspective pane). `overlay` picks the pane that shows it.
     pub(super) fn set_reference(&mut self, args: &Value) -> ToolResult {
+        let out = self.set_reference_now(args);
+        // Slots and planes were changed together.
+        if out.is_ok() {
+            self.planes_synced();
+        }
+        out
+    }
+
+    fn set_reference_now(&mut self, args: &Value) -> ToolResult {
+        if args.get("sheet").is_some_and(|v| !v.is_null()) {
+            return self.at_rest(|app| app.set_reference_sheet(args));
+        }
+        for k in ["planes", "plane_opacity"] {
+            if args.get(k).is_some_and(|v| !v.is_null()) {
+                return Err(format!("{k} goes with sheet (a turnaround sheet's image planes)"));
+            }
+        }
+        let (slot, legacy_pane) = match args["view"].as_str() {
+            None if args.get("view").is_some_and(|v| !v.is_null()) => return Err(format!("view must be a slot name: {SLOT_NAMES}")),
+            None => (None, None),
+            Some("persp") => (Some(Slot::Front), Some(Some(ViewKind::Persp))),
+            Some(v) => (Some(Slot::parse(v).ok_or(format!("unknown view {v}; the slots are {SLOT_NAMES}"))?), None),
+        };
+        let pane = match args.get("overlay").filter(|v| !v.is_null()) {
+            None => legacy_pane,
+            Some(Value::String(p)) if p == "none" => Some(None),
+            Some(Value::String(p)) => Some(Some(ViewKind::from_name(p).ok_or(format!("unknown overlay pane {p}; use persp, top, front, side or none"))?)),
+            Some(_) => return Err("overlay must be persp, top, front, side or none".into()),
+        };
         if args["clear"].as_bool().unwrap_or(false) {
-            self.reference = None;
-            return Ok(text("Reference cleared."));
+            match slot {
+                Some(s) => {
+                    // A plane of the slot without its slot still clears.
+                    let plane = self.scene.objects.iter().any(|o| o.reference.as_ref().is_some_and(|r| r.slot == s.name()));
+                    if self.references.remove(s).is_none() && !plane {
+                        return Err(format!("no reference in slot {}; loaded: {}", s.name(), self.references.names().join(", ")));
+                    }
+                }
+                None => self.references.clear(),
+            }
+            // A sheet's planes of the cleared slots go too (one undo step).
+            let planes: Vec<u64> = self.scene.objects.iter().filter(|o| o.reference.as_ref().is_some_and(|r| slot.is_none_or(|s| r.slot == s.name()))).map(|o| o.id).collect();
+            for id in planes {
+                self.scene.remove_reference_plane(id);
+            }
+            let what = slot.map_or("References cleared.".to_string(), |s| format!("Reference {} cleared.", s.name()));
+            return Ok(text(json!({ "cleared": what, "slots": self.references.names() })));
         }
         if args.get("path").is_none_or(Value::is_null) {
-            let r = self.reference.as_mut().ok_or("no reference loaded; pass path")?;
-            apply_display(r, args)?;
-            return Ok(text(json!({ "view": r.view.name(), "opacity": r.opacity, "show": r.show })));
+            let only = self.references.loaded().first().copied().filter(|_| self.references.slots.len() == 1);
+            let s = slot.or(only).or(Some(Slot::Front)).filter(|s| self.references.slots.contains_key(s)).ok_or_else(|| if self.references.is_empty() { "no reference loaded; pass path".to_string() } else { format!("no reference in that slot; loaded: {}", self.references.names().join(", ")) })?;
+            let r = self.references.slots.get_mut(&s).expect("checked");
+            apply_display(r, args, pane);
+            let r = &self.references.slots[&s];
+            return Ok(text(json!({ "view": s.name(), "overlay": r.view.map(ViewKind::name), "opacity": r.opacity, "show": r.show, "slots": self.references.names() })));
         }
+        let slot = slot.unwrap_or(Slot::Front);
         let path = image_path(args["path"].as_str().ok_or("path must be a string")?)?;
         let image = load_image(&path).map_err(|_| format!("{} is not a readable PNG or JPEG image", path.display()))?;
         let threshold = args["threshold"].as_f64().unwrap_or(40.0).clamp(1.0, 255.0) as u8;
@@ -281,20 +602,27 @@ impl ClideApp {
             "could not find a subject in the image; use a plain background or a PNG with transparency, or change threshold",
         )?;
         let coverage = mask.iter().filter(|m| **m).count() as f32 / mask.len() as f32;
-        let mut r = Reference { image, texture: None, view: ViewKind::Front, opacity: 0.5, show: true, mask, bbox, path };
-        apply_display(&mut r, args)?;
-        let info = json!({
+        let mut r = Reference { image, texture: None, slot, view: slot.pane(), opacity: 0.5, show: true, mask, bbox, path, sheet: None };
+        apply_display(&mut r, args, pane);
+        // A single image replaces a sheet's view in its slot, plane and all.
+        let planes: Vec<u64> = self.scene.objects.iter().filter(|o| o.reference.as_ref().is_some_and(|p| p.slot == slot.name())).map(|o| o.id).collect();
+        for id in planes {
+            self.scene.remove_reference_plane(id);
+        }
+        let preview = mask_image(&r.mask, r.image.size);
+        let mut info = json!({
             "path": r.path,
+            "view": slot.name(),
             "size": r.image.size,
             "subject_bbox_px": r.bbox,
             "subject_fraction": round(coverage),
             "mask_from": mode,
             "palette": palette(&r.image, &r.mask),
-            "overlay_view": r.view.name(),
+            "overlay_view": r.view.map(ViewKind::name),
             "note": "The image below is the subject mask (white = subject). If it is wrong, call again with another threshold.",
         });
-        let preview = mask_image(&r.mask, r.image.size);
-        self.reference = Some(r);
+        self.references.insert(r);
+        info["slots"] = json!(self.references.names());
         let mut out = text(info);
         out.extend(super::tools::encode_png(&super::tools::downscale(&preview, 384))?);
         Ok(out)
@@ -320,7 +648,7 @@ impl ClideApp {
         out
     }
 
-    fn render_views_now(&mut self, args: &Value) -> ToolResult {
+    pub(super) fn render_views_now(&mut self, args: &Value) -> ToolResult {
         let views: Vec<Value> = match args.get("views") {
             Some(Value::Array(v)) if !v.is_empty() => v.clone(),
             None | Some(Value::Null) => ["front", "right", "back", "three_quarter"].map(Value::from).to_vec(),
@@ -331,12 +659,26 @@ impl ClideApp {
         }
         let size = args["size"].as_u64().unwrap_or(384).clamp(64, 1024) as usize;
         let grid = args["grid"].as_bool().unwrap_or(false);
-        let with_ref = args["include_reference"].as_bool().unwrap_or(true) && self.reference.is_some();
+        // Without `shade`, the viewport's (`set_display shade`), wire too;
+        // either way this call measures and draws it itself.
+        let shade = match args.get("shade").filter(|v| !v.is_null()) {
+            None => self.meshes.shade,
+            Some(v) => crate::quality::Shade::parse(v.as_str().ok_or("shade must be beauty, curvature, lumpiness, normals or wire")?)?,
+        };
+        let with_ref = args["include_reference"].as_bool().unwrap_or(true);
         let extras = Extras {
             bones: args["show_bones"].as_bool().unwrap_or(false),
             weights: self.weight_target(&args["weights"])?,
             lighting: args.get("lighting").filter(|v| !v.is_null()).map(|v| self.parse_lighting(v)).transpose()?,
             ao: args.get("ambient_occlusion").filter(|v| !v.is_null()).map(|v| super::tools::parse_ao(v, self.ao)).transpose()?,
+            shade,
+            only: None,
+            references: with_ref,
+            guides: None,
+        };
+        let guides = match args.get("guides").filter(|v| !v.is_null()) {
+            None => false,
+            Some(v) => v.as_bool().ok_or("guides must be true or false")?,
         };
 
         let (mut center, mut radius) = self.scene_sphere();
@@ -350,14 +692,18 @@ impl ClideApp {
         }
         let mut tiles = Vec::new();
         let mut names = Vec::new();
-        if with_ref {
-            let r = self.reference.as_ref().expect("checked");
+        // The loaded references first (one per slot).
+        for r in self.references.slots.values().filter(|_| with_ref) {
             tiles.push(fit(&r.image, size, size));
-            names.push("reference".to_string());
+            names.push(if self.references.slots.len() == 1 { "reference".to_string() } else { format!("reference {}", r.slot.name()) });
         }
+        // The shade's colors once for every tile.
+        let shaded = self.shaded_meshes(shade);
         for v in &views {
             let shot = Shot::framing(v, center, radius)?;
-            tiles.push(self.render_shot_extras(&shot, size, size, false, grid, extras.clone())?);
+            // Guides through the point the tile frames.
+            let ex = Extras { guides: guides.then_some((shot.target, radius)), ..extras.clone() };
+            tiles.push(self.render_shaded(&shot, size, size, false, grid, ex, &shaded)?);
             names.push(shot.name);
         }
         let cols = (tiles.len() as f32).sqrt().ceil() as usize;
@@ -367,6 +713,8 @@ impl ClideApp {
             "layout": format!("{cols} per row, left to right, top to bottom"),
             "framed_center": [center.x, center.y, center.z],
             "framed_radius": radius,
+            "shade": shade.name(),
+            "guides": guides,
             "frame": self.meshes.frame,
             "fine_mesh_errors": self.fine_errors_json(),
             "device": raster_device(&self.render_state),
@@ -375,13 +723,13 @@ impl ClideApp {
         Ok(out)
     }
 
-    /// Lines the model up with the reference from one view: an orthographic
-    /// camera where the model's height (or width) on screen matches the
-    /// subject's in the image, centered on it.
-    fn align(&self, args: &Value) -> Result<Align, String> {
-        let r = self.reference.as_ref().ok_or("no reference image; call set_reference first")?;
-        let view = args.get("view").cloned().filter(|v| !v.is_null()).unwrap_or_else(|| Value::from("front"));
-        let (view_name, dir, _, _) = parse_view(&view)?;
+    /// Lines the model up with the reference in `slot` from `view`: an
+    /// orthographic camera where the model's height (or width) on screen
+    /// matches the subject's in the image, centered on it. `only`: line up
+    /// (and later draw) just these objects.
+    fn align(&self, view: &Value, slot: Slot, match_width: bool, only: Option<&HashSet<u64>>) -> Result<Align, String> {
+        let r = self.references.get(slot).ok_or("no reference image; call set_reference first")?;
+        let (view_name, dir, _, _) = parse_view(view)?;
         let up = up_for(dir);
         let right = up.cross(dir).normalize();
         let up = dir.cross(right);
@@ -389,7 +737,7 @@ impl ClideApp {
         // Model extent on screen axes.
         let eval = self.scene.evaluate();
         let (mut lo, mut hi) = (glam::Vec2::splat(f32::MAX), glam::Vec2::splat(f32::MIN));
-        for o in self.scene.objects.iter().filter(|o| o.shape.is_mesh()) {
+        for o in self.scene.objects.iter().filter(|o| o.shape.is_mesh() && !o.is_reference() && only.is_none_or(|ids| ids.contains(&o.id))) {
             let Some(&(world, true)) = eval.get(&o.id) else { continue };
             let Some(mesh) = self.meshes.get(o) else { continue };
             for v in &mesh.vertices {
@@ -409,16 +757,29 @@ impl ClideApp {
         let (w, h) = (((rw as f32 * k) as usize).max(16), ((rh as f32 * k) as usize).max(16));
         let ref_mask = resize_mask(&r.mask, r.image.size, [w, h]);
         let bbox = r.bbox.map(|v| v as f32 * k);
-        let [bx0, by0, bx1, by1] = bbox;
-        let (bw_px, bh_px) = ((bx1 - bx0 + 1.0).max(1.0), (by1 - by0 + 1.0).max(1.0));
+        // The subject's edges on the panel: its first pixels' left and top
+        // edges and its last pixels' right and bottom edges (pixel i spans
+        // i..i + 1; the box's middle was half a pixel off before Stage 2).
+        let [ex0, ey0, ex1, ey1] = [r.bbox[0] as f32 * k, r.bbox[1] as f32 * k, (r.bbox[2] + 1) as f32 * k, (r.bbox[3] + 1) as f32 * k];
+        let (bw_px, bh_px) = ((ex1 - ex0).max(1.0), (ey1 - ey0).max(1.0));
 
-        // Pixels per world unit: match heights (or widths for a lying-down subject).
-        let match_width = args["match"].as_str() == Some("width");
-        let s = if match_width { bw_px / (hi.x - lo.x).max(1e-6) } else { bh_px / (hi.y - lo.y) };
+        // Pixels per world unit: match heights (or widths for a lying-down
+        // subject). A sheet's view instead keeps the sheet's one scale and
+        // stands the model on its ground line (one fit for every view, so
+        // proportions and size show).
         let mid = (lo + hi) * 0.5;
-        let (pxm, pym) = ((bx0 + bx1) * 0.5, (by0 + by1) * 0.5);
+        let (pxm, pym) = ((ex0 + ex1) * 0.5, (ey0 + ey1) * 0.5);
+        let (s, vc) = match &r.sheet {
+            Some(f) => {
+                let s = f.px_per_unit * k;
+                (s, f.ground_y + (f.ground_row * k - h as f32 * 0.5) / s)
+            }
+            None => {
+                let s = if match_width { bw_px / (hi.x - lo.x).max(1e-6) } else { bh_px / (hi.y - lo.y) };
+                (s, mid.y + (pym - h as f32 * 0.5) / s)
+            }
+        };
         let uc = mid.x - (pxm - w as f32 * 0.5) / s;
-        let vc = mid.y + (pym - h as f32 * 0.5) / s;
         let (center, radius) = self.scene_sphere();
         let plane_center = right * uc + up * vc + dir * center.dot(dir);
         let shot = Shot {
@@ -429,61 +790,186 @@ impl ClideApp {
             fov: FOV,
             name: view_name.clone(),
         };
-        Ok(Align { view_name, dir, right, up, s, uc, vc, w, h, k, shot, ref_mask, bbox, match_width, plane_center })
+        Ok(Align { view_name, slot, dir, right, up, s, uc, vc, w, h, k, shot, ref_mask, bbox, subject_px: bh_px, plane_center })
     }
 
-    /// `compare_reference` tool.
-    pub(super) fn compare_reference(&mut self, args: &Value) -> ToolResult {
-        let Align { view_name, right, up, s, w, h, shot, ref_mask, bbox, match_width, plane_center, .. } = self.align(args)?;
-        let r = self.reference.as_ref().expect("align checked");
-        let [bx0, by0, bx1, by1] = bbox;
-        let mask_img = self.render_shot(&shot, w, h, true, false)?;
-        let beauty = self.render_shot(&shot, w, h, false, false)?;
-        let model: Vec<bool> = mask_img.pixels.iter().map(|p| p.r() > 127).collect();
+    /// A render of just `only` (everything with None).
+    fn render_only(&self, shot: &Shot, w: usize, h: usize, mask: bool, only: Option<&HashSet<u64>>) -> Result<egui::ColorImage, String> {
+        let ex = Extras { only: only.map(|o| std::sync::Arc::new(o.clone())), ..Default::default() };
+        self.render_shot_extras(shot, w, h, mask, false, ex)
+    }
 
-        let (mut both, mut only_ref, mut only_model) = (0usize, 0usize, 0usize);
-        let mut diff = Vec::with_capacity(w * h);
-        for (&a, &b) in ref_mask.iter().zip(&model) {
-            diff.push(match (a, b) {
-                (true, true) => {
-                    both += 1;
-                    egui::Color32::from_gray(200)
-                }
-                (true, false) => {
-                    only_ref += 1;
-                    egui::Color32::from_rgb(235, 60, 60)
-                }
-                (false, true) => {
-                    only_model += 1;
-                    egui::Color32::from_rgb(60, 130, 245)
-                }
-                _ => egui::Color32::from_gray(28),
-            });
-        }
-        let union = (both + only_ref + only_model).max(1) as f32;
-        let diff_img = egui::ColorImage::new([w, h], diff);
-        let regions = region_report(&ref_mask, &model, w, [bx0, by0, bx1, by1]);
-
-        let origin = plane_center + right * (-(w as f32) * 0.5 / s) + up * (h as f32 * 0.5 / s);
-        let round3 = |v: Vec3| [round(v.x), round(v.y), round(v.z)];
-        let reference_tile = fit(&r.image, w, h);
-        let mut out = text(json!({
-            "view": view_name,
-            "overlap_iou": round(both as f32 / union),
-            "missing_fraction": round(only_ref as f32 / union),
-            "extra_fraction": round(only_model as f32 / union),
-            "regions": regions,
-            "image": "Three panels: reference | model from the same camera | overlap (gray = both, red = in reference but missing from the model, blue = model but not in reference).",
-            "pixel_to_world": {
-                "panel_size": [w, h],
-                "origin": round3(origin),
-                "per_px_right": round3(right / s),
-                "per_px_down": round3(-up / s),
-                "note": "world = origin + x * per_px_right + y * per_px_down for pixel (x, y) of one panel, on the plane through the model's center.",
+    /// The views a `compare_reference` call compares, each with the slot
+    /// it compares against: `views` (at most `MAX_VIEWS`), else `view`,
+    /// else every loaded slot from its own view.
+    pub(super) fn compared_views(&self, args: &Value) -> Result<Vec<(Value, Slot)>, String> {
+        let list: Vec<Value> = match args.get("views").filter(|v| !v.is_null()) {
+            Some(Value::Array(v)) if v.is_empty() => return Err("views must not be empty".into()),
+            Some(Value::Array(v)) if v.len() > MAX_VIEWS => return Err(format!("at most {MAX_VIEWS} views per call (got {})", v.len())),
+            Some(Value::Array(v)) => v.clone(),
+            Some(_) => return Err("views must be a list of views".into()),
+            None => match args.get("view").filter(|v| !v.is_null()) {
+                Some(v) => vec![v.clone()],
+                None if self.references.is_empty() => return Err("no reference image; call set_reference first".into()),
+                None => self.references.loaded().iter().map(|s| Value::from(s.name())).collect(),
             },
-            "aligned_by": if match_width { "width" } else { "height" },
-        }));
-        out.extend(super::tools::encode_png(&contact_sheet(&[reference_tile, beauty, diff_img], 3))?);
+        };
+        list.into_iter().map(|v| self.references.slot_for(&v).map(|s| (v, s))).collect()
+    }
+
+    /// Compares one view: the silhouettes' overlap and contour distance,
+    /// whole or as a close-up (`closeup_args`), drawing `only` (everything
+    /// with None).
+    pub(super) fn compare_view(&self, view: &Value, slot: Slot, match_width: bool, closeup: Option<(Vec3, f32, usize)>, features: bool, only: Option<&HashSet<u64>>) -> Result<Compared, String> {
+        let a = self.align(view, slot, match_width, only)?;
+        let r = self.references.get(slot).expect("align checked");
+        let subject_px = a.subject_px;
+        let round3 = |v: Vec3| [round(v.x), round(v.y), round(v.z)];
+        let Some((center, radius, size)) = closeup else {
+            let [bx0, by0, bx1, by1] = a.bbox;
+            let mask_img = self.render_only(&a.shot, a.w, a.h, true, only)?;
+            let beauty = self.render_only(&a.shot, a.w, a.h, false, only)?;
+            let model: Vec<bool> = mask_img.pixels.iter().map(|p| p.r() > 127).collect();
+            let (iou, missing, extra, diff_img, _) = overlap(&a.ref_mask, &model, a.w, a.h);
+            let regions = region_report(&a.ref_mask, &model, a.w, [bx0, by0, bx1, by1]);
+            let origin = a.plane_center + a.right * (-(a.w as f32) * 0.5 / a.s) + a.up * (a.h as f32 * 0.5 / a.s);
+            let contour = super::outline::contour(&a.ref_mask, &model, a.w, a.h);
+            return Ok(Compared {
+                view: a.view_name.clone(),
+                slot,
+                iou,
+                missing,
+                extra,
+                regions,
+                contour: contour.map(|c| Distances { mean: c.mean / a.s, p95: c.p95 / a.s, mean_pct: 100.0 * c.mean / subject_px, p95_pct: 100.0 * c.p95 / subject_px }),
+                panels: vec![fit(&r.image, a.w, a.h), beauty, diff_img],
+                features: None,
+                pixel_to_world: json!({
+                    "panel_size": [a.w, a.h],
+                    "origin": round3(origin),
+                    "per_px_right": round3(a.right / a.s),
+                    "per_px_down": round3(-a.up / a.s),
+                    "note": "world = origin + x * per_px_right + y * per_px_down for pixel (x, y) of one panel, on the plane through the model's center.",
+                }),
+                closeup: None,
+                aligned_by: if r.sheet.is_some() { "sheet" } else if match_width { "width" } else { "height" },
+            });
+        };
+        // A close-up: the square of half-size `radius` around `center`,
+        // lined up as for the whole model. The model is rendered again
+        // there at `size` pixels, and the reference is cut from its own
+        // pixels there (not from the smaller panel).
+        let (x, y, _) = a.project(center);
+        let half = radius * a.s;
+        let (w, h) = (a.w as f32, a.h as f32);
+        if x + half <= 0.0 || y + half <= 0.0 || x - half >= w || y - half >= h {
+            return Err(format!("center is outside the lined-up view (at panel pixel [{:.0}, {:.0}] of {} x {}); pick a point on the model", x, y, a.w, a.h));
+        }
+        let ref_px = 2.0 * half / a.k;
+        if ref_px < MIN_CROP_REF_PX {
+            return Err(format!("the crop would be {ref_px:.1} reference pixels across, under {MIN_CROP_REF_PX}: too few to compare; use radius >= {:.4}", MIN_CROP_REF_PX * a.k / (2.0 * a.s)));
+        }
+        let crop_px = [(x - half).max(0.0), (y - half).max(0.0), (x + half).min(w), (y + half).min(h)];
+        // The camera: the whole-model one moved to the point, framing the square.
+        let (u0, v0) = (center.dot(a.right), center.dot(a.up));
+        let target = a.right * u0 + a.up * v0 + a.dir * a.plane_center.dot(a.dir);
+        let shot = Shot { eye: target + (a.shot.eye - a.shot.target), target, up: a.up, ortho: Some(radius), fov: FOV, name: a.view_name.clone() };
+        let mask_img = self.render_only(&shot, size, size, true, only)?;
+        let beauty = self.render_only(&shot, size, size, false, only)?;
+        let model: Vec<bool> = mask_img.pixels.iter().map(|p| p.r() > 127).collect();
+        // Crop pixel (i, j) -> world screen axes -> reference pixel.
+        let per = 2.0 * radius / size as f32;
+        let (reference_tile, ref_mask) = crop_reference(r, size, |i, j| {
+            let (u, v) = (u0 - radius + (i as f32 + 0.5) * per, v0 + radius - (j as f32 + 0.5) * per);
+            (((u - a.uc) * a.s + w * 0.5) / a.k, ((a.vc - v) * a.s + h * 0.5) / a.k)
+        });
+        let (iou, missing, extra, diff_img, both) = overlap(&ref_mask, &model, size, size);
+        let regions = region_report(&ref_mask, &model, size, [0.0, 0.0, size as f32 - 1.0, size as f32 - 1.0]);
+        let origin = target - a.right * radius + a.up * radius;
+        let subject = subject_px / a.s;
+        let contour = super::outline::contour(&ref_mask, &model, size, size);
+        let mut panels = vec![reference_tile, beauty, diff_img];
+        // Feature lines inside both outlines: the reference's drawn lines
+        // against the model's creases, curvature edges and contours.
+        let features = features.then(|| {
+            let crop = super::features::Crop { right: a.right, up: a.up, dir: a.dir, u0, v0, radius, size };
+            let model_lines = self.model_lines(&crop, only);
+            let reference_lines = super::features::reference_lines(&panels[0], &ref_mask);
+            panels.push(super::features::lines_panel(&reference_lines, &model_lines.lines, &model_lines.mask, size));
+            FeatureScore { lines: super::outline::features(&reference_lines, &model_lines.lines, size, size), per, radius }
+        });
+        Ok(Compared {
+            view: a.view_name.clone(),
+            slot,
+            iou,
+            missing,
+            extra,
+            regions,
+            contour: contour.map(|c| Distances { mean: c.mean * per, p95: c.p95 * per, mean_pct: 100.0 * c.mean * per / subject, p95_pct: 100.0 * c.p95 * per / subject }),
+            panels,
+            features,
+            pixel_to_world: json!({
+                "panel_size": [size, size],
+                "origin": round3(origin),
+                "per_px_right": round3(a.right * per),
+                "per_px_down": round3(-a.up * per),
+                "note": "world = origin + x * per_px_right + y * per_px_down for pixel (x, y) of one crop panel, on the plane through the model's center.",
+            }),
+            closeup: Some(json!({
+                "center": round3(center),
+                "radius": round(radius),
+                "size": size,
+                "crop_px": crop_px.map(|v| (v as f64 * 10.0).round() / 10.0),
+                "reference_px_per_unit": round(a.s / a.k),
+                "interior": interior(both, size),
+                "note": "crop_px is the square on the whole-model panel (as compare_reference without center draws it); the IoU, regions and pixel_to_world are the crop's.",
+            })),
+            aligned_by: if r.sheet.is_some() { "sheet" } else if match_width { "width" } else { "height" },
+        })
+    }
+
+    /// `compare_reference` tool: one view (`view`) answers flat, as before
+    /// slots; `views` (or several loaded slots) answer per view with the
+    /// mean IoU and the worst view.
+    pub(super) fn compare_reference(&mut self, args: &Value) -> ToolResult {
+        let closeup = closeup_args(args)?;
+        let contour = args["contour"].as_bool().unwrap_or(true);
+        let match_width = args["match"].as_str() == Some("width");
+        let features = match args["features"].as_bool() {
+            Some(true) if closeup.is_none() => return Err("features compares a close-up's interior lines: pass center and radius".into()),
+            Some(f) => f,
+            None => closeup.is_some(),
+        };
+        let picks = self.compared_views(args)?;
+        let compared: Vec<Compared> = picks.iter().map(|(v, s)| self.compare_view(v, *s, match_width, closeup, features, None)).collect::<Result<_, _>>()?;
+        let lines_note = if features { " | lines (red: the reference's, cyan: the model's, white: both, inside both outlines)" } else { "" };
+        let panels_note = if closeup.is_some() { "crop panels" } else { "panels" };
+        if args.get("views").is_none_or(Value::is_null) && compared.len() == 1 {
+            let c = compared.into_iter().next().expect("one");
+            let mut reply = c.json(contour);
+            if contour {
+                reply["contour_note"] = json!(CONTOUR_NOTE);
+            }
+            reply["image"] = json!(format!("{panels_note}: reference | model from the same camera | overlap (gray = both, red = in reference but missing from the model, blue = model but not in reference){lines_note}."));
+            let mut out = text(reply);
+            out.extend(super::tools::encode_png(&contact_sheet(&c.panels, c.panels.len()))?);
+            return Ok(out);
+        }
+        let worst = compared.iter().min_by(|a, b| a.iou.total_cmp(&b.iou)).expect("at least one view");
+        let mean = compared.iter().map(|c| c.iou).sum::<f32>() / compared.len() as f32;
+        let mut reply = json!({
+            "views": compared.iter().map(|c| c.json(contour)).collect::<Vec<_>>(),
+            "mean_iou": round(mean),
+            "worst_view": worst.view,
+            "image": format!("One row per view, in order, of {panels_note}: reference | model from the same camera | overlap (gray = both, red = in reference but missing from the model, blue = model but not in reference){lines_note}."),
+        });
+        if contour {
+            reply["contour_note"] = json!(CONTOUR_NOTE);
+        }
+        // Rows of three; past three views each panel is shown at half size.
+        let tiles: Vec<egui::ColorImage> = compared.iter().flat_map(|c| c.panels.iter().map(|p| if compared.len() > 3 { super::tools::downscale(p, p.size[0].div_ceil(2)) } else { p.clone() })).collect();
+        let mut out = text(reply);
+        out.extend(super::tools::encode_png(&contact_sheet(&tiles, compared[0].panels.len()))?);
         Ok(out)
     }
 
@@ -507,14 +993,16 @@ impl ClideApp {
     }
 
     fn project_reference_now(&mut self, id: u64, args: &Value) -> ToolResult {
-        let a = self.align(args)?;
+        let view = args.get("view").cloned().filter(|v| !v.is_null()).unwrap_or_else(|| Value::from("front"));
+        let slot = self.references.slot_for(&view)?;
+        let a = self.align(&view, slot, args["match"].as_str() == Some("width"), None)?;
         let strength = args["strength"].as_f64().unwrap_or(1.0).clamp(0.0, 1.0) as f32;
         let min_facing = args["min_facing"].as_f64().unwrap_or(0.3).clamp(0.0, 0.95) as f32;
 
         // Depth buffer of everything visible, so hidden surfaces get no paint.
         let eval = self.scene.evaluate();
         let mut zbuf = vec![f32::MIN; a.w * a.h];
-        for o in self.scene.objects.iter().filter(|o| o.shape.is_mesh()) {
+        for o in self.scene.objects.iter().filter(|o| o.shape.is_mesh() && !o.is_reference()) {
             let Some(&(world, true)) = eval.get(&o.id) else { continue };
             let Some(mesh) = self.meshes.get(o) else { continue };
             let pts: Vec<(f32, f32, f32)> = mesh.vertices.iter().map(|v| a.project(world.transform_point3(Vec3::from(v.pos)))).collect();
@@ -529,7 +1017,7 @@ impl ClideApp {
         let mesh = self.meshes.get(o).ok_or("clay has no mesh yet")?.clone();
         let cell = o.clay.as_ref().and_then(|c| c.cell_size()).unwrap_or(0.02);
         let eps = cell * 3.0 * world.to_scale_rotation_translation().0.max_element();
-        let r = self.reference.as_ref().expect("align checked");
+        let r = self.references.get(a.slot).expect("align checked");
         let [rw, rh] = r.image.size;
         let mut samples = Vec::new();
         for v in &mesh.vertices {
@@ -568,7 +1056,7 @@ impl ClideApp {
         self.meshes.sync(&self.scene);
 
         let beauty = self.render_shot(&a.shot, a.w, a.h, false, false)?;
-        let r = self.reference.as_ref().expect("align checked");
+        let r = self.references.get(a.slot).expect("align checked");
         let mut out = text(json!({
             "view": a.view_name,
             "painted_vertices": painted,
@@ -580,18 +1068,186 @@ impl ClideApp {
         Ok(out)
     }
 
-    /// Paints the reference over a pane, fitted and centered, if it belongs there.
+    /// Paints the references that belong on a pane over it, fitted and centered.
     pub(super) fn paint_reference(&mut self, ui: &egui::Ui, kind: ViewKind, rect: egui::Rect) {
-        let Some(r) = self.reference.as_mut().filter(|r| r.show && r.view == kind) else { return };
-        let tex = r
-            .texture
-            .get_or_insert_with(|| ui.ctx().load_texture("reference", r.image.clone(), egui::TextureOptions::LINEAR));
-        let [iw, ih] = r.image.size;
-        let scale = (rect.width() / iw as f32).min(rect.height() / ih as f32);
-        let area = egui::Rect::from_center_size(rect.center(), egui::vec2(iw as f32, ih as f32) * scale);
-        let tint = egui::Color32::from_white_alpha((r.opacity.clamp(0.0, 1.0) * 255.0) as u8);
-        ui.painter_at(rect).image(tex.id(), area, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), tint);
+        for r in self.references.slots.values_mut().filter(|r| r.show && r.view == Some(kind)) {
+            let tex = r.texture.get_or_insert_with(|| ui.ctx().load_texture(format!("reference {}", r.slot.name()), r.image.clone(), egui::TextureOptions::LINEAR));
+            let [iw, ih] = r.image.size;
+            let scale = (rect.width() / iw as f32).min(rect.height() / ih as f32);
+            let area = egui::Rect::from_center_size(rect.center(), egui::vec2(iw as f32, ih as f32) * scale);
+            let tint = egui::Color32::from_white_alpha((r.opacity.clamp(0.0, 1.0) * 255.0) as u8);
+            ui.painter_at(rect).image(tex.id(), area, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), tint);
+        }
     }
+}
+
+/// A close-up crop must cover at least this many reference pixels across.
+const MIN_CROP_REF_PX: f32 = 8.0;
+const CONTOUR_NOTE: &str = "contour: outline to outline, both ways: the mean and the larger 95th percentile, in world units and % of the subject's height in the reference";
+
+/// Most views one `compare_reference` (or `quality_report`) compares.
+pub(super) const MAX_VIEWS: usize = 12;
+
+/// A contour distance in world units and in percent of the subject's
+/// height in the reference.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Distances {
+    pub mean: f32,
+    pub p95: f32,
+    pub mean_pct: f32,
+    pub p95_pct: f32,
+}
+
+/// One view of `compare_reference`.
+pub(super) struct Compared {
+    pub view: String,
+    pub slot: Slot,
+    pub iou: f32,
+    pub missing: f32,
+    pub extra: f32,
+    pub regions: Vec<Value>,
+    pub contour: Option<Distances>,
+    /// reference | model | overlap (| lines, with features).
+    pub panels: Vec<egui::ColorImage>,
+    /// A close-up's feature lines compared.
+    pub features: Option<FeatureScore>,
+    pub pixel_to_world: Value,
+    pub closeup: Option<Value>,
+    pub aligned_by: &'static str,
+}
+
+/// A close-up's feature lines compared, with the crop's scale.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct FeatureScore {
+    /// None when the reference crop has no line.
+    pub lines: Option<super::outline::Features>,
+    /// World units per pixel, and the crop's half-size.
+    pub per: f32,
+    pub radius: f32,
+}
+
+impl FeatureScore {
+    /// The chamfer in % of the crop's radius.
+    pub(super) fn pct(&self) -> Option<f32> {
+        self.lines.map(|f| 100.0 * f.chamfer * self.per / self.radius)
+    }
+
+    fn json(&self) -> Value {
+        match self.lines {
+            Some(f) => json!({ "chamfer": round(f.chamfer * self.per), "chamfer_pct": self.pct().map(round), "recall": round(f.recall), "precision": round(f.precision), "reference_line_px": f.reference_px, "model_line_px": f.model_px }),
+            None => json!({ "skipped": "no lines to compare in the reference crop" }),
+        }
+    }
+}
+
+impl Compared {
+    /// The view's reply (with its contour distance when `contour`).
+    pub(super) fn json(&self, contour: bool) -> Value {
+        let mut v = json!({
+            "view": self.view,
+            "slot": self.slot.name(),
+            "overlap_iou": round(self.iou),
+            "missing_fraction": round(self.missing),
+            "extra_fraction": round(self.extra),
+            "regions": self.regions,
+            "pixel_to_world": self.pixel_to_world,
+            "aligned_by": self.aligned_by,
+        });
+        if contour {
+            v["contour"] = self.contour.map_or(Value::Null, |c| json!({ "mean": round(c.mean), "p95": round(c.p95), "mean_pct": round(c.mean_pct), "p95_pct": round(c.p95_pct) }));
+        }
+        if let Some(c) = &self.closeup {
+            v["closeup"] = c.clone();
+        }
+        if let Some(f) = &self.features {
+            v["features"] = f.json();
+        }
+        v
+    }
+}
+
+/// `compare_reference`'s close-up arguments, checked before anything is
+/// rendered: Some((center, radius, size)) with `center`.
+pub(super) fn closeup_args(args: &Value) -> Result<Option<(Vec3, f32, usize)>, String> {
+    let center = args.get("center").filter(|c| !c.is_null());
+    let radius = args.get("radius").filter(|r| !r.is_null());
+    let size = args.get("size").filter(|s| !s.is_null());
+    let Some(center) = center else {
+        return match (radius, size) {
+            (None, None) => Ok(None),
+            _ => Err("radius and size are for a close-up: pass center too".into()),
+        };
+    };
+    let center = Vec3::from(serde_json::from_value::<[f32; 3]>(center.clone()).map_err(|_| "center must be [x, y, z]")?);
+    let radius = radius.ok_or("a close-up needs radius (half the crop's size in world units) with center")?;
+    let radius = radius.as_f64().filter(|r| (0.001..=1000.0).contains(r)).ok_or("radius must be from 0.001 to 1000 world units")? as f32;
+    let size = match size {
+        None => 512,
+        Some(v) => v.as_u64().filter(|s| (64..=1024).contains(s)).ok_or("size must be a whole number of pixels from 64 to 1024")? as usize,
+    };
+    if !center.is_finite() {
+        return Err("center must be finite".into());
+    }
+    Ok(Some((center, radius, size)))
+}
+
+/// A close-up is interior when at least 98% of its pixels are inside
+/// both outlines: the silhouette says little there.
+fn interior(both: usize, size: usize) -> bool {
+    both as f32 >= 0.98 * (size * size) as f32
+}
+
+/// Silhouette overlap of two masks: (IoU, missing and extra shares of the
+/// union, the overlap picture, pixels in both).
+fn overlap(reference: &[bool], model: &[bool], w: usize, h: usize) -> (f32, f32, f32, egui::ColorImage, usize) {
+    let (mut both, mut only_ref, mut only_model) = (0usize, 0usize, 0usize);
+    let mut diff = Vec::with_capacity(w * h);
+    for (&a, &b) in reference.iter().zip(model) {
+        diff.push(match (a, b) {
+            (true, true) => {
+                both += 1;
+                egui::Color32::from_gray(200)
+            }
+            (true, false) => {
+                only_ref += 1;
+                egui::Color32::from_rgb(235, 60, 60)
+            }
+            (false, true) => {
+                only_model += 1;
+                egui::Color32::from_rgb(60, 130, 245)
+            }
+            _ => egui::Color32::from_gray(28),
+        });
+    }
+    let union = (both + only_ref + only_model).max(1) as f32;
+    (both as f32 / union, only_ref as f32 / union, only_model as f32 / union, egui::ColorImage::new([w, h], diff), both)
+}
+
+/// A `size` x `size` crop of the reference: `at(i, j)` is the reference
+/// pixel position (fractional) under crop pixel (i, j). Colors are
+/// bilinear over the background color (transparent pixels and outside the
+/// image are background); the mask is the nearest reference pixel's.
+fn crop_reference(r: &Reference, size: usize, at: impl Fn(usize, usize) -> (f32, f32)) -> (egui::ColorImage, Vec<bool>) {
+    let [rw, rh] = r.image.size;
+    let bg = Vec3::from(BACKGROUND.map(|c| c as f32 / 255.0));
+    let mut pixels = Vec::with_capacity(size * size);
+    let mut mask = Vec::with_capacity(size * size);
+    for j in 0..size {
+        for i in 0..size {
+            let (fx, fy) = at(i, j);
+            if !(fx >= 0.0 && fy >= 0.0 && fx < rw as f32 && fy < rh as f32) {
+                pixels.push(egui::Color32::from_rgb(BACKGROUND[0], BACKGROUND[1], BACKGROUND[2]));
+                mask.push(false);
+                continue;
+            }
+            let (ix, iy) = ((fx as usize).min(rw - 1), (fy as usize).min(rh - 1));
+            let alpha = r.image.pixels[iy * rw + ix].a() as f32 / 255.0;
+            let c = bg.lerp(bilinear(&r.image, fx, fy), alpha) * 255.0;
+            pixels.push(egui::Color32::from_rgb(c.x.round() as u8, c.y.round() as u8, c.z.round() as u8));
+            mask.push(r.mask[iy * rw + ix]);
+        }
+    }
+    (egui::ColorImage::new([size, size], pixels), mask)
 }
 
 fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
@@ -693,9 +1349,10 @@ fn palette(img: &egui::ColorImage, mask: &[bool]) -> Vec<Value> {
     out.into_iter().filter(|(s, _)| *s >= 0.01).map(|(_, v)| v).collect()
 }
 
-fn apply_display(r: &mut Reference, args: &Value) -> Result<(), String> {
-    if let Some(v) = args["view"].as_str() {
-        r.view = ViewKind::from_name(v).ok_or(format!("unknown overlay view {v}; use persp, top, front, side"))?;
+/// A reference's overlay settings from a call (`pane` already checked).
+fn apply_display(r: &mut Reference, args: &Value, pane: Option<Option<ViewKind>>) {
+    if let Some(p) = pane {
+        r.view = p;
     }
     if let Some(o) = args["opacity"].as_f64() {
         r.opacity = o.clamp(0.0, 1.0) as f32;
@@ -703,7 +1360,6 @@ fn apply_display(r: &mut Reference, args: &Value) -> Result<(), String> {
     if let Some(s) = args["show"].as_bool() {
         r.show = s;
     }
-    Ok(())
 }
 
 fn text(v: impl Into<Value>) -> Vec<Value> {
@@ -720,7 +1376,7 @@ fn round(x: f32) -> f64 {
 }
 
 /// Reference images: absolute path to an existing .png/.jpg/.jpeg file.
-fn image_path(p: &str) -> Result<PathBuf, String> {
+pub(super) fn image_path(p: &str) -> Result<PathBuf, String> {
     let path = PathBuf::from(p);
     if !path.is_absolute() {
         return Err("path must be absolute".into());
@@ -754,7 +1410,7 @@ fn load_image(path: &Path) -> Result<egui::ColorImage, String> {
 
 /// Subject pixels: from transparency when the image has it, else everything
 /// that differs from the border color by more than `threshold`.
-fn subject_mask(img: &egui::ColorImage, threshold: u8) -> (Vec<bool>, &'static str) {
+pub(super) fn subject_mask(img: &egui::ColorImage, threshold: u8) -> (Vec<bool>, &'static str) {
     let clear = img.pixels.iter().filter(|p| p.a() < 128).count();
     if clear > img.pixels.len() / 100 {
         return (img.pixels.iter().map(|p| p.a() >= 128).collect(), "transparency");
@@ -841,20 +1497,45 @@ fn fit(img: &egui::ColorImage, w: usize, h: usize) -> egui::ColorImage {
 /// A callback that draws every visible mesh of a scene (any thread: an
 /// off-screen job renders a snapshot). `mask` draws flat white.
 pub(crate) fn scene_callback_of(scene: &crate::scene::Scene, meshes: &MeshLib, view_proj: Mat4, eye: Vec3, mask: bool, grid: bool) -> ViewportCallback {
+    // Animations and checks draw the scene as made: no reference planes.
+    scene_callback_with(scene, meshes, view_proj, eye, mask, grid, &Default::default(), false, None, true, false)
+}
+
+/// `scene_callback_of`, with some objects drawn with their own `shaded`
+/// meshes (white, so the mesh's colors show), with `wire` every mesh's
+/// edges over the fills, with `only` just those objects, and clay in the
+/// viewport's quality shade (`MeshLib::shade`) only with `viewport_shade`
+/// (`render_views` colors its own); reference image planes only with
+/// `references`.
+#[allow(clippy::too_many_arguments)]
+fn scene_callback_with(scene: &crate::scene::Scene, meshes: &MeshLib, view_proj: Mat4, eye: Vec3, mask: bool, grid: bool, shaded: &std::collections::HashMap<u64, std::sync::Arc<crate::mesh::Mesh>>, wire: bool, only: Option<&HashSet<u64>>, viewport_shade: bool, references: bool) -> ViewportCallback {
     let eval = scene.evaluate();
     let mut fills = Vec::new();
-    for d in crate::envkit::scatter::draws(scene, &eval).iter().filter(|d| d.object.shape.is_mesh()) {
-        push_fills(&mut fills, meshes, d.object, Instance::new(d.world, if mask { [1.0; 3] } else { d.object.color }).with_material(&scene.material_of(d.object)));
+    let mut wires = Vec::new();
+    for d in crate::envkit::scatter::draws(scene, &eval).iter().filter(|d| d.object.shape.is_mesh() && (references || !d.object.is_reference()) && only.is_none_or(|ids| ids.contains(&d.object.id))) {
+        let instance = Instance::new(d.world, if mask { [1.0; 3] } else { d.object.color }).with_material(&scene.material_of(d.object));
+        let own = (!d.scattered && shaded.contains_key(&d.object.id)).then_some(crate::mesh::MeshKey::Own(d.object.id));
+        match own {
+            Some(key) => fills.push((key, instance.with_color([1.0; 3]))),
+            None => push_fills_with(&mut fills, meshes, d.object, instance, viewport_shade),
+        }
+        if wire && !d.scattered {
+            wires.push((own.unwrap_or_else(|| meshes.key_of(d.object)), Instance::new(d.world, super::theme::WIRE_DEFAULT)));
+        }
     }
     fills.sort_by_key(|(k, _)| *k);
+    wires.sort_by_key(|(k, _)| *k);
+    let mut dynamic = meshes.own_meshes_with(viewport_shade);
+    dynamic.retain(|(k, _)| !matches!(k, crate::mesh::MeshKey::Own(id) if shaded.contains_key(id)));
+    dynamic.extend(shaded.iter().map(|(id, m)| (crate::mesh::MeshKey::Own(*id), m.clone())));
     ViewportCallback {
         slot: 0,
         view_proj,
         grid_model: Mat4::IDENTITY,
         cam_pos: eye,
         fills,
-        wires: Vec::new(),
-        dynamic: meshes.own_meshes(),
+        wires,
+        dynamic,
         show_grid: grid && !mask,
         flat: mask,
         lights: if mask { Vec::new() } else { crate::envkit::light::view_lights(scene, &eval, eye) },
@@ -876,6 +1557,19 @@ pub(crate) fn scene_callback_of(scene: &crate::scene::Scene, meshes: &MeshLib, v
 /// An object's fills: its mesh, or each of its chunks while it is drawn
 /// in chunks (a sculpt session; with the mask and group overlay).
 pub(crate) fn push_fills(fills: &mut Vec<(crate::mesh::MeshKey, Instance)>, meshes: &MeshLib, o: &crate::scene::Object, instance: Instance) {
+    push_fills_with(fills, meshes, o, instance, true)
+}
+
+/// `push_fills`, with clay in the viewport's quality shade only with
+/// `viewport_shade`.
+fn push_fills_with(fills: &mut Vec<(crate::mesh::MeshKey, Instance)>, meshes: &MeshLib, o: &crate::scene::Object, instance: Instance, viewport_shade: bool) {
+    // A quality shade colors the whole mesh (`MeshLib::shade`), drawn
+    // white so its colors show; chunks would not carry them. While its
+    // colors are measured, or strokes come in, it draws as without one.
+    if viewport_shade && o.shape == crate::scene::Shape::Clay && meshes.shaded_now(o.id) {
+        fills.push((meshes.key_of(o), instance.with_color([1.0; 3])));
+        return;
+    }
     match meshes.chunk_keys(o) {
         Some(keys) => fills.extend(keys.into_iter().map(|k| (k, instance.with_overlay(meshes.overlay)))),
         None => fills.push((meshes.key_of(o), instance)),
@@ -984,6 +1678,96 @@ mod tests {
         assert_eq!(mode, "background color");
         assert_eq!(mask_bbox(&mask, w), Some([5, 2, 8, 5]));
         assert_eq!(resize_mask(&mask, [w, h], [10, 5]).iter().filter(|m| **m).count(), 4);
+    }
+
+    /// A close-up compares just the square around a point, lined up as
+    /// for the whole model: the reference is a big disc with a dark small
+    /// disc (an "eye") on its upper right rim, the model a sphere with a
+    /// small sphere in the same place.
+    #[test]
+    fn closeup_compare_crops_both_panels() {
+        use super::super::recorder::tests::{frame, mcp, ok, settle};
+        let Some(rs) = crate::render::test_support::headless() else {
+            eprintln!("skipped: no GPU adapter for the editor's render state");
+            return;
+        };
+        let (mut app, tx) = ClideApp::headless(rs);
+        let ctx = egui::Context::default();
+        let (app, ctx, tx) = (&mut app, &ctx, &tx);
+        frame(app, ctx, Vec::new());
+        // 400 pixels per unit; the big disc (radius 0.5) at pixel (256, 280),
+        // the eye (radius 0.1) at world (0.35, 0.35).
+        let (px, cx, cy) = (400.0f32, 256.0f32, 280.0f32);
+        let eye = (cx + 0.35 * px, cy - 0.35 * px);
+        let img = image::RgbaImage::from_fn(512, 512, |x, y| {
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            if (fx - eye.0).powi(2) + (fy - eye.1).powi(2) <= (0.1 * px).powi(2) {
+                image::Rgba([40, 30, 30, 255])
+            } else if (fx - cx).powi(2) + (fy - cy).powi(2) <= (0.5 * px).powi(2) {
+                image::Rgba([170, 140, 120, 255])
+            } else {
+                image::Rgba([255, 255, 255, 255])
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("clide3d_closeup_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("eye.png");
+        img.save(&path).unwrap();
+        ok(app, ctx, tx, "create_object", json!({ "shape": "Clay", "name": "Head", "resolution": 160, "blobs": [{ "type": "sphere", "center": [0, 0, 0], "radius": 0.5, "blend": 0 }, { "type": "sphere", "center": [0.35, 0.35, 0], "radius": 0.1, "blend": 0 }] }));
+        settle(app, ctx);
+        ok(app, ctx, tx, "set_reference", json!({ "path": path }));
+        let time = |app: &mut ClideApp, args: Value| {
+            let start = std::time::Instant::now();
+            let out = app.compare_reference(&args).unwrap();
+            (start.elapsed().as_secs_f64(), serde_json::from_str::<Value>(out[0]["text"].as_str().unwrap()).unwrap())
+        };
+        let (whole_s, whole) = time(app, json!({ "view": "front" }));
+        // Without center the reply is the whole-model compare, as before.
+        let keys: Vec<&String> = whole.as_object().unwrap().keys().collect();
+        // (Stage 2 added the slot and the contour distance.)
+        assert_eq!(keys, ["aligned_by", "contour", "contour_note", "extra_fraction", "image", "missing_fraction", "overlap_iou", "pixel_to_world", "regions", "slot", "view"], "{whole}");
+        let (close_s, close) = time(app, json!({ "view": "front", "center": [0.35, 0.35, 0.0], "radius": 0.15 }));
+        eprintln!("whole {whole_s:.3} s IoU {}, close-up {close_s:.3} s: {close}", whole["overlap_iou"]);
+        let c = &close["closeup"];
+        let crop: Vec<f64> = c["crop_px"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+        let mid = ((crop[0] + crop[2]) * 0.5, (crop[1] + crop[3]) * 0.5);
+        // The panel is the reference's own size here (k = 1).
+        assert!((mid.0 - eye.0 as f64).abs() <= 1.0 && (mid.1 - eye.1 as f64).abs() <= 1.0, "crop centred at {mid:?}, eye at {eye:?}");
+        assert!((crop[2] - crop[0] - 0.3 * px as f64).abs() < 3.0, "{crop:?}");
+        assert!((c["reference_px_per_unit"].as_f64().unwrap() - px as f64).abs() < 4.0, "{c}");
+        assert_eq!(close["pixel_to_world"]["panel_size"], json!([512, 512]));
+        assert_eq!(c["interior"], false);
+        let iou = close["overlap_iou"].as_f64().unwrap();
+        assert!(iou >= 0.9, "close-up IoU {iou}");
+        // Same camera, other point: the crop follows; a crop of a few
+        // reference pixels, out-of-range sizes and half a close-up are refused.
+        let (_, inner) = time(app, json!({ "view": "front", "center": [0.0, 0.0, 0.0], "radius": 0.1, "size": 128 }));
+        assert_eq!((inner["closeup"]["interior"].clone(), inner["pixel_to_world"]["panel_size"].clone()), (json!(true), json!([128, 128])), "{inner}");
+        for bad in [json!({ "center": [0.35, 0.35, 0], "radius": 0.005 }), json!({ "center": [0.35, 0.35, 0], "radius": 0.15, "size": 2000 }), json!({ "radius": 0.15 }), json!({ "center": [0.35, 0.35, 0] }), json!({ "center": [9, 9, 0], "radius": 0.1 })] {
+            let (v, err) = mcp(app, ctx, tx, "compare_reference", bad.clone());
+            assert!(err, "{bad}: {v}");
+        }
+        if std::env::var("CLIDE_PERF").is_ok() {
+            assert!(close_s <= 1.5 * whole_s, "close-up {close_s} s, whole {whole_s} s");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A close-up is interior only inside both outlines: one where the
+    /// reference has a part the model lacks (no pixel in neither mask) is
+    /// where the silhouette matters, so it is not interior.
+    #[test]
+    fn interior_means_inside_both_outlines() {
+        let size = 40;
+        let reference = vec![true; size * size];
+        let lacking: Vec<bool> = (0..size * size).map(|i| i / size >= 10).collect();
+        let (.., both) = overlap(&reference, &lacking, size, size);
+        assert!(!interior(both, size), "a missing part is not interior");
+        let (.., both) = overlap(&reference, &reference, size, size);
+        assert!(interior(both, size));
+        let empty = vec![false; size * size];
+        let (.., both) = overlap(&empty, &empty, size, size);
+        assert!(!interior(both, size), "outside both is not interior");
     }
 
     #[test]

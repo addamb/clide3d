@@ -57,7 +57,7 @@ fn render(items: &[Item], views: &[(String, Camera, usize)]) -> Vec<f32> {
     for (name, cam, size) in views {
         let t = Instant::now();
         let mut items: Vec<Item> = items.iter().map(|i| Item { mesh: i.mesh.clone(), world: i.world, tint: i.tint, surface: i.surface, material: i.material.clone() }).collect();
-        let diced = crate::film::dice::displace(&mut items, &[*cam], *size);
+        let diced = crate::film::dice::displace(&mut items, &[*cam], *size, *size);
         let meshes = crate::film::Meshes::new(items);
         let s = Settings { width: *size, height: *size, samples: samples(), bounces: 4, time_limit: Duration::from_secs(900), floor: true, exposure: 1.0, denoise: true };
         let img = crate::film::render_views_with_look(&meshes, &[], &[*cam], s, look(), &Default::default()).pop().unwrap();
@@ -203,7 +203,7 @@ fn bake_timing() {
         runs.push((4096, true));
     }
     for (texture, exact) in runs {
-        let src = crate::bake::Source { clay: &clay, rest: &rest, skin: None, parts: &[], library: &library, fallback: &fallback, fine: cached.as_ref() };
+        let src = crate::bake::Source { clay: &clay, rest: &rest, skin: None, parts: &[], library: &library, fallback: &fallback, fine: cached.as_ref(), low: None };
         let settings = crate::bake::Settings { triangles: 60_000, texture, exact, ..Default::default() };
         let t = Instant::now();
         let (mesh, _) = crate::bake::bake(&src, settings, &Default::default()).unwrap();

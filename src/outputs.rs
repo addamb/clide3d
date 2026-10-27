@@ -70,7 +70,6 @@ fn encode_png(width: usize, height: usize, channels: usize, depth: png::BitDepth
 }
 
 /// A 16-bit PNG's (width, height, channels, samples), as `png16` wrote it.
-#[cfg(test)]
 pub fn read_png16(bytes: &[u8]) -> Result<(usize, usize, usize, Vec<u16>), String> {
     let mut reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().map_err(|e| e.to_string())?;
     let mut buf = vec![0; reader.output_buffer_size().ok_or("PNG too large")?];
@@ -83,6 +82,22 @@ pub fn read_png16(bytes: &[u8]) -> Result<(usize, usize, usize, Vec<u16>), Strin
     Ok((info.width as usize, info.height as usize, channels, data))
 }
 
+/// `read_png16` of an image that must be `width` x `height` with
+/// `channels` 16-bit samples: its header is checked before any pixel is
+/// decoded or allocated.
+pub fn read_png16_sized(bytes: &[u8], width: usize, height: usize, channels: usize) -> Result<Vec<u16>, String> {
+    let reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().map_err(|e| e.to_string())?;
+    let info = reader.info();
+    if (info.width as usize, info.height as usize) != (width, height) || info.bit_depth != png::BitDepth::Sixteen || info.color_type.samples() != channels {
+        return Err(format!("the image is {} x {} with {} {:?}-bit samples, not {width} x {height} with {channels} 16-bit samples", info.width, info.height, info.color_type.samples(), info.bit_depth));
+    }
+    let (w, h, c, data) = read_png16(bytes)?;
+    if (w, h, c) != (width, height, channels) || data.len() != width * height * channels {
+        return Err("the image's pixels do not match its header".into());
+    }
+    Ok(data)
+}
+
 /// Writes a float EXR (zip compressed) with these named channels, each
 /// `width * height` values row by row from the top.
 pub fn write_exr(path: &Path, width: usize, height: usize, channels: Vec<(&str, Vec<f32>)>) -> Result<(), String> {
@@ -92,11 +107,12 @@ pub fn write_exr(path: &Path, width: usize, height: usize, channels: Vec<(&str, 
     }
     let list: Vec<AnyChannel<FlatSamples>> = channels.into_iter().map(|(name, v)| AnyChannel::new(name, FlatSamples::F32(v))).collect();
     let layer = Layer::new((width, height), LayerAttributes::named("clide3d"), Encoding::SMALL_LOSSLESS, AnyChannels::sort(list.into()));
-    Image::from_layer(layer).write().non_parallel().to_file(path).map_err(|e| format!("could not write {}: {e}", path.display()))
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    Image::from_layer(layer).write().non_parallel().to_buffered(&mut bytes).map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    write_over(path, "Exr", |h| Kind::Exr.is(h), &bytes.into_inner())
 }
 
 /// An EXR's (width, height, channels by name), as `write_exr` wrote it.
-#[cfg(test)]
 pub fn read_exr(path: &Path) -> Result<(usize, usize, Vec<(String, Vec<f32>)>), String> {
     use exr::prelude::*;
     let image = read_first_flat_layer_from_file(path).map_err(|e| e.to_string())?;
@@ -121,7 +137,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    fn is(self, head: &[u8]) -> bool {
+    pub fn is(self, head: &[u8]) -> bool {
         match self {
             Kind::Png => head.starts_with(b"\x89PNG"),
             Kind::Exr => head.starts_with(&[0x76, 0x2f, 0x31, 0x01]),
@@ -137,7 +153,7 @@ impl Kind {
     }
 }
 
-/// Whether the start of a file (`head`, its first bytes) is a `kind` file.
+/// Whether the start of a file (its first bytes) is a `kind` file.
 fn is_kind(path: &Path, kind: Kind) -> bool {
     use std::io::Read;
     let mut head = [0u8; 12];
@@ -148,17 +164,99 @@ fn is_kind(path: &Path, kind: Kind) -> bool {
 /// Refuses to write `path` when something other than a `kind` file is
 /// already there (an agent's typo must not overwrite a document). An
 /// empty file holds nothing to lose (an encode cut short can leave one),
-/// so it may be overwritten.
+/// so it may be overwritten. See `overwritable`.
 pub fn writable(path: &Path, kind: Kind) -> Result<(), String> {
-    if path.is_dir() {
+    overwritable(path, &format!("{kind:?}"), |head| kind.is(head))
+}
+
+/// The overwrite rule every writer of agent-named paths keeps, failing
+/// closed: nothing there may be written; an empty regular file may; a
+/// regular file whose first bytes can be read and `is` accepts may.
+/// Anything else is refused: a folder, a symbolic link (it would write
+/// through to wherever it points), a device or pipe, a file that cannot
+/// be read, or one of another kind.
+pub fn overwritable(path: &Path, what: &str, is: impl Fn(&[u8]) -> bool) -> Result<(), String> {
+    overwritable_by(path, what, 64, is)
+}
+
+/// `overwritable`, with `is` reading up to `head` first bytes (a format
+/// whose maker is named past its first bytes, as a .glb's JSON).
+pub fn overwritable_by(path: &Path, what: &str, head: usize, is: impl Fn(&[u8]) -> bool) -> Result<(), String> {
+    use std::io::Read;
+    let head_len = head.clamp(1, 1 << 16);
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("{}: {e}; refusing to write there", path.display())),
+    };
+    if meta.is_dir() {
         return Err(format!("{} is a folder", path.display()));
     }
-    if !path.exists() || std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() == 0) || is_kind(path, kind) {
+    if !meta.file_type().is_file() {
+        return Err(format!("{} is not a regular file (a link or a device); refusing to write there", path.display()));
+    }
+    if meta.len() == 0 {
+        return Ok(());
+    }
+    let mut head = Vec::with_capacity(head_len);
+    let n = std::fs::File::open(path).and_then(|f| f.take(head_len as u64).read_to_end(&mut head)).map_err(|e| format!("{} cannot be read ({e}); refusing to overwrite it", path.display()))?;
+    if is(&head[..n]) {
         Ok(())
     } else {
-        Err(format!("{} exists and is not a {kind:?} file; refusing to overwrite it (delete it, or give another path)", path.display()))
+        Err(format!("{} exists and is not a {what} file; refusing to overwrite it (delete it, or give another path)", path.display()))
     }
 }
+
+/// Writes `bytes` to `path` under `overwritable`'s rule, checked again
+/// at the moment of writing (a call is checked when it comes in, and a
+/// job may write minutes later): the file is opened without following a
+/// symbolic link (one put there meanwhile is refused, not written
+/// through), the opened file must be a regular file, and it is cut to
+/// nothing only then.
+pub fn write_over(path: &Path, what: &str, is: impl Fn(&[u8]) -> bool, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    overwritable_by(path, what, 1 << 16, is)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(|e| format!("could not write {}: {e} (refusing to write through a link)", path.display()))?;
+    if !file.metadata().is_ok_and(|m| m.file_type().is_file()) {
+        return Err(format!("{} is not a regular file; refusing to write there", path.display()));
+    }
+    file.set_len(0).and_then(|_| file.write_all(bytes)).map_err(|e| format!("could not write {}: {e}", path.display()))
+}
+
+/// Opens `path` for reading without following a link at it (`O_NOFOLLOW`
+/// where the platform has it), and only when what it opened is a regular
+/// file.
+pub fn open_regular(path: &Path) -> Result<std::fs::File, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(NOFOLLOW);
+    }
+    let file = options.open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !file.metadata().map_err(|e| format!("{}: {e}", path.display()))?.is_file() {
+        return Err(format!("{}: not a regular file", path.display()));
+    }
+    Ok(file)
+}
+
+/// `O_NOFOLLOW` (no new crate for one constant).
+#[cfg(target_os = "macos")]
+const NOFOLLOW: i32 = 0x0100;
+#[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
+const NOFOLLOW: i32 = 0o100000;
+#[cfg(all(target_os = "linux", not(any(target_arch = "aarch64", target_arch = "arm"))))]
+const NOFOLLOW: i32 = 0o400000;
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+const NOFOLLOW: i32 = 0;
 
 /// An absolute folder argument (not made yet: `make_folder` makes it when
 /// the job writes, so a call refused later leaves no folder behind).
@@ -421,12 +519,12 @@ mod tests {
         }
         let clay: crate::clay::Clay = serde_json::from_value(serde_json::json!({ "blobs": blobs, "resolution": 192 })).unwrap();
         let rest = clay.build_mesh();
-        let src = Source { clay: &clay, rest: &rest, skin: None, parts: &[], library: &[], fallback: "", fine: None };
+        let src = Source { clay: &clay, rest: &rest, skin: None, parts: &[], library: &[], fallback: "", fine: None, low: None };
         let t = Instant::now();
         let (mesh, _) = crate::bake::bake(&src, Settings { triangles: 30_000, texture: 2048, ..Default::default() }, &Default::default()).unwrap();
         let bake = t.elapsed().as_secs_f32();
         let t = Instant::now();
-        let disp = crate::bake::displacement(&src, &mesh, Maps { displacement: true, vector: true, size: 2048 }, &Default::default()).unwrap();
+        let disp = crate::bake::displacement(&src, &mesh, Maps { displacement: true, vector: true, size: 2048, object: false }, &Default::default()).unwrap();
         let maps = t.elapsed().as_secs_f32();
         let t = Instant::now();
         let codes = crate::bake::Displacement::encode16(disp.height.clone().unwrap().into_iter(), disp.scale());

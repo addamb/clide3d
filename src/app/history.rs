@@ -178,12 +178,27 @@ impl History {
     }
 }
 
-/// Grid bytes `before` holds that `after` does not share: sculpt bricks
+/// Bytes `before` holds that `after` does not share: hair guides, sculpt bricks
 /// whose Arcs differ (by key), whole paint and mask grids that differ,
 /// ledger records that differ. Only references the two scenes hold count,
 /// so caches holding the same Arcs elsewhere change nothing.
 pub fn unique_bytes(before: &Scene, after: &Scene) -> u64 {
     let mut total = 0u64;
+    // Hair guides, shared copy-on-write: a hair whose guides `after` does
+    // not share counts them all.
+    for o in &before.objects {
+        if let Some(h) = &o.hair
+            && !after.get(o.id).and_then(|x| x.hair.as_ref()).is_some_and(|a| a.guides.shares(&h.guides))
+        {
+            total += h.guides.bytes();
+        }
+    }
+    // Polygon cages, by chunk.
+    for o in &before.objects {
+        if let Some(p) = &o.poly {
+            total += p.unshared_bytes(after.get(o.id).and_then(|x| x.poly.as_ref())) as u64;
+        }
+    }
     for o in &before.objects {
         let Some(b) = &o.clay else { continue };
         let a = after.get(o.id).and_then(|x| x.clay.as_ref());
@@ -271,7 +286,7 @@ pub fn call_label(tool: &str, args: &Value, scene: &Scene, source: &str) -> Stri
         _ => None,
     });
     let mut what = tool.to_string();
-    if tool == "sculpt" || tool == "paint" {
+    if tool == "sculpt" || tool == "paint" || tool == "groom" {
         let brushes: Vec<String> = args["strokes"].as_array().into_iter().flatten().map(|s| s["brush"].as_str().unwrap_or(if tool == "paint" { "paint" } else { "stroke" }).to_string()).collect();
         let mut groups: Vec<(String, usize)> = Vec::new();
         for b in brushes {
@@ -392,6 +407,39 @@ mod tests {
         assert_eq!(h.list()["steps"][h.list()["steps"].as_array().unwrap().len() - 1]["bytes"], 10 * 2048);
         assert!(h.bytes() <= 3 * 2048 * 10, "{}", h.bytes());
         assert_eq!((h.dropped, h.current()), (3, 6));
+    }
+
+    /// Hair guides are shared between snapshots until changed, and a
+    /// changed hair counts toward the byte cap (Stage 4c review finding
+    /// 1): a 4,096 x 512 hair is about 25 MB a snapshot, so the cap
+    /// drops old steps instead of growing without bound.
+    #[test]
+    fn hair_guides_are_shared_and_count_toward_the_byte_cap() {
+        let mut scene = scene_with(1);
+        let id = scene.objects[0].id;
+        let guide = crate::hair::Guide { points: vec![glam::Vec3::ZERO; crate::hair::MAX_POINTS], width: None };
+        scene.get_mut(id).unwrap().hair = Some(crate::hair::Hair { guides: vec![guide; crate::hair::MAX_GUIDES].into(), ..Default::default() });
+        // A copy shares the guides: nothing unique, no deep copy.
+        let copy = scene.clone();
+        assert!(copy.get(id).unwrap().hair.as_ref().unwrap().guides.shares(&scene.get(id).unwrap().hair.as_ref().unwrap().guides));
+        assert_eq!(unique_bytes(&copy, &scene), 0);
+        // One changed point: the snapshot holds the whole old list.
+        let mut after = scene.clone();
+        after.get_mut(id).unwrap().hair.as_mut().unwrap().guides[7].points[3].x = 0.001;
+        let bytes = unique_bytes(&scene, &after);
+        eprintln!("a 4,096 x 512 hair snapshot: {:.1} MB", bytes as f64 / 1e6);
+        assert!(bytes >= 25_000_000, "{bytes}");
+        assert!(!scene.get(id).unwrap().hair.as_ref().unwrap().guides.shares(&after.get(id).unwrap().hair.as_ref().unwrap().guides));
+        // The cap: 20 groom steps keep at most max_bytes.
+        let mut h = History { max_bytes: 3 * bytes, ..History::default() };
+        let mut scene = scene;
+        for k in 0..20 {
+            let before = scene.clone();
+            scene.get_mut(id).unwrap().hair.as_mut().unwrap().guides[0].points[1].y = k as f32;
+            h.push(before, &scene, StepInfo::new("groom", "agent", vec![]));
+        }
+        assert!(h.bytes() <= 3 * bytes, "{}", h.bytes());
+        assert!(h.dropped >= 17, "{}", h.dropped);
     }
 
     #[test]

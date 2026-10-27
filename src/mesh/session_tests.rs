@@ -200,3 +200,78 @@ fn a_failed_chunk_build_is_not_tried_again_until_the_clay_changes() {
     lib.sync_joined(&scene);
     assert!(lib.chunked(id));
 }
+
+/// D-e: the viewport's quality shade is measured off the window's thread,
+/// only while it is on, and not while strokes come in (chunks show them;
+/// the colors follow once the strokes pause).
+#[test]
+fn viewport_shades_measure_in_the_background_after_strokes() {
+    let mut c = crate::harness::figure(48, false);
+    c.set_detail_cell(0.01).unwrap();
+    let (mut scene, id) = scene_with(c);
+    let mut lib = MeshLib::new();
+    let t0 = Instant::now();
+    lib.session_now = Some(t0);
+    lib.sync_joined(&scene);
+    // Off: a stroke measures nothing.
+    stroke(clay_mut(&mut scene, id), json!({"brush": "inflate", "points": [[0.0, 1.25, 0.18]], "radius": 0.04}));
+    lib.sync_joined(&scene);
+    assert_eq!(lib.shade_jobs, 0);
+    assert!(!lib.shading());
+    // On: one job, then the colors are drawn.
+    lib.shade = crate::quality::Shade::Curvature;
+    lib.sync_joined(&scene);
+    assert_eq!(lib.shade_jobs, 1);
+    while lib.shading() {
+        lib.sync_joined(&scene);
+    }
+    assert!(lib.shaded_now(id));
+    let o = scene.get(id).unwrap().clone();
+    let truth = crate::quality::shade_colors(crate::quality::Shade::Curvature, o.clay.as_ref().unwrap(), lib.unposed(id).unwrap(), crate::mesh::SHADE_SAMPLES).unwrap();
+    assert!(lib.display(&o).unwrap().vertices.iter().zip(&truth).all(|(v, c)| v.color == *c));
+    // A sculpt tool's strokes: no measure while they come in, and the
+    // clay draws without the stale colors.
+    lib.set_sculpt_tool(&[id]);
+    stroke(clay_mut(&mut scene, id), json!({"brush": "standard", "points": [[0.05, 1.3, 0.17]], "radius": 0.03, "strength": 0.5}));
+    lib.sync_joined(&scene);
+    assert!(lib.chunked(id) && lib.sculpting_now(id));
+    assert_eq!(lib.shade_jobs, 1, "no measure while strokes come in");
+    assert!(lib.shading() && !lib.shaded_now(id));
+    let own = lib.own_meshes().into_iter().find(|(k, _)| *k == MeshKey::Own(id)).unwrap().1;
+    assert!(Arc::ptr_eq(&own, lib.get(&o).unwrap()), "drawn plain meanwhile");
+    // Once they pause, the colors are measured again for the new mesh.
+    lib.session_now = Some(t0 + PAUSE + Duration::from_millis(1));
+    lib.sync_joined(&scene);
+    assert_eq!(lib.shade_jobs, 2);
+    while lib.shading() {
+        lib.sync_joined(&scene);
+    }
+    assert!(lib.shaded_now(id));
+}
+
+/// D-e: a burst of mesh changes measures one shade at a time per clay,
+/// not one per change.
+#[test]
+fn viewport_shade_jobs_run_one_at_a_time() {
+    let c = crate::harness::figure(48, false);
+    let (mut scene, id) = scene_with(c);
+    let mut lib = MeshLib::new();
+    lib.shade = crate::quality::Shade::Lumpiness;
+    // The first measure is held while three edits come in (each builds
+    // a new mesh).
+    lib.hold_shades.store(true, std::sync::atomic::Ordering::Release);
+    lib.sync_joined(&scene);
+    assert_eq!(lib.shade_jobs, 1);
+    for k in 0..3 {
+        clay_mut(&mut scene, id).blobs[0].color = [0.2 + 0.1 * k as f32, 0.5, 0.5];
+        lib.sync_joined(&scene);
+    }
+    assert_eq!(lib.shade_jobs, 1, "the newer meshes wait for the running measure");
+    assert!(lib.shading() && !lib.shaded_now(id));
+    lib.hold_shades.store(false, std::sync::atomic::Ordering::Release);
+    while lib.shading() {
+        lib.sync_joined(&scene);
+    }
+    assert!(lib.shaded_now(id));
+    assert_eq!(lib.shade_jobs, 2, "the stale one, then the last mesh's");
+}

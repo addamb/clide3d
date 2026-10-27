@@ -774,6 +774,13 @@ fn shade(in: MeshOut) -> vec4<f32> {
     let tex_color = textureSample(t_color, t_sampler, in.uv.xy);
     let tex_normal = textureSample(t_normal, t_sampler, in.uv.xy).xyz * 2.0 - 1.0;
     let tex_orm = textureSample(t_orm, t_sampler, in.uv.xy);
+    // Reference image planes (tangent w = 2, `refplane.rs`): one-sided,
+    // seen only from the side that faces their view's camera, and unlit,
+    // so the image shows as drawn.
+    if (in.tangent.w > 1.5) {
+        if (dot(normalize(in.normal), v) < 0.0) { discard; }
+        return vec4(albedo * tex_color.rgb, 1.0);
+    }
     if (in.tangent.w != 0.0) {
         // Cut-out textures (hair cards) are clear where alpha is low;
         // opaque bakes have alpha 1 everywhere.
@@ -1031,12 +1038,13 @@ fn vs_shadow(
     @location(0) pos: vec3<f32>,
     @location(2) m0: vec4<f32>, @location(3) m1: vec4<f32>,
     @location(4) m2: vec4<f32>, @location(5) m3: vec4<f32>,
-    @location(6) extra: vec4<f32>, @location(11) vsurface: vec4<f32>, @location(15) vlight: vec2<f32>,
+    @location(6) extra: vec4<f32>, @location(11) vsurface: vec4<f32>, @location(14) tangent: vec4<f32>, @location(15) vlight: vec2<f32>,
 ) -> ShadowOut {
     var out: ShadowOut;
     out.clip = g.light_vp * (mat4x4<f32>(m0, m1, m2, m3) * vec4(pos, 1.0));
     let light = select(vlight, extra.xy, vsurface.x < 0.0);
-    out.casts = select(1.0, 0.0, light.y > 0.3 || light.x > 1.5);
+    // Reference image planes (tangent w = 2) cast no shadow.
+    out.casts = select(1.0, 0.0, light.y > 0.3 || light.x > 1.5 || tangent.w > 1.5);
     return out;
 }
 
@@ -1166,7 +1174,9 @@ fn vs_sculpt_prepass(
 @fragment
 fn fs_prepass(in: PrepassOut) -> @location(0) vec4<f32> {
     let tex = textureSample(t_color, t_sampler, in.uv);
-    if (in.flags.x > 0.3 || (in.flags.y != 0.0 && tex.a < 0.5)) { discard; }
+    // Glass, cut-out holes and reference image planes (tangent w = 2)
+    // occlude nothing.
+    if (in.flags.x > 0.3 || in.flags.y > 1.5 || (in.flags.y != 0.0 && tex.a < 0.5)) { discard; }
     var n = normalize(in.normal);
     if (dot(n, g.cam_pos.xyz - in.world_pos) < 0.0) { n = -n; }
     return vec4(n, 1.0);

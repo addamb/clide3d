@@ -29,19 +29,24 @@ fn read_only(name: &str, args: &Value) -> bool {
 const READ_ONLY_ANYTIME: [&str; 3] = ["screenshot", "job_status", "check_export"];
 
 /// Tools that run as background jobs (see `jobs.rs`).
-const JOB_TOOLS: [&str; 17] = ["render_film", "check_export", "bake", "export_glb", "export_fbx", "sculpt", "cloth", "fire", "face_detail", "render_animation", "stroke_edit", "sculpt_diff", "mask", "group", "import_mesh", "to_clay", "export_print"];
+const JOB_TOOLS: [&str; 19] = ["export_poly", "render_film", "check_export", "bake", "export_glb", "export_fbx", "sculpt", "cloth", "fire", "face_detail", "render_animation", "stroke_edit", "sculpt_diff", "mask", "group", "import_mesh", "to_clay", "export_print", "retopo"];
 /// Job tools that edit the scene: later edits wait in line behind them.
-const EDIT_JOBS: [&str; 9] = ["sculpt", "cloth", "fire", "face_detail", "stroke_edit", "mask", "group", "import_mesh", "to_clay"];
+const EDIT_JOBS: [&str; 10] = ["sculpt", "cloth", "fire", "face_detail", "stroke_edit", "mask", "group", "import_mesh", "to_clay", "retopo"];
 
 /// Whether a call runs as a background job (`JOB_TOOLS`, and kitbash's
 /// InsertMesh, which may weld and decimate a large mesh).
 fn job_call(name: &str, args: &Value) -> bool {
-    JOB_TOOLS.contains(&name) || (name == "kitbash" && crate::kitbash::tool::is_insert(args))
+    JOB_TOOLS.contains(&name) || (name == "kitbash" && crate::kitbash::tool::is_insert(args)) || polish_call(name, args) || (name == "quality_report" && super::report::is_job(args)) || (name == "poly" && super::poly::is_job(args))
+}
+
+/// `edit_clay` with a polish: ClayPolish runs on a job thread.
+fn polish_call(name: &str, args: &Value) -> bool {
+    name == "edit_clay" && args.get("polish").is_some_and(|v| !v.is_null())
 }
 
 /// Whether a job call edits the scene (`EDIT_JOBS`, and InsertMesh).
 fn edit_job_call(name: &str, args: &Value) -> bool {
-    EDIT_JOBS.contains(&name) || (name == "kitbash" && crate::kitbash::tool::is_insert(args))
+    EDIT_JOBS.contains(&name) || (name == "kitbash" && crate::kitbash::tool::is_insert(args)) || polish_call(name, args) || (name == "poly" && super::poly::is_edit_job(args))
 }
 
 /// Agent screenshots are scaled down to at most this width to stay small.
@@ -77,6 +82,20 @@ impl ClideApp {
             // Sources are read where they stand at rest.
             "to_clay" => self.at_rest(|app| app.to_clay(args)),
             "export_print" => self.at_rest(|app| app.export_print(args)),
+            "export_poly" => self.at_rest(|app| app.export_poly(args)),
+            // On a Poly (`process_mcp`): strokes resolve at rest.
+            "paint" => self.at_rest(|app| {
+                let id = app.resolve(&args["target"])?;
+                app.poly_paint(id, args)
+            }),
+            // Over 40,000 samples (`job_call`); smaller reports run at once.
+            "quality_report" => self.at_rest(|app| app.quality_report(args, true)),
+            // info, from_clay, rebuild and to_clay (`job_call`), read at rest.
+            "poly" => self.at_rest(|app| app.poly_job(args)),
+            // Guides and density regions are read in the rest pose.
+            "retopo" => self.at_rest(|app| app.retopo_tool(args)),
+            // With a polish (`job_call`); edit_clay otherwise runs at once.
+            "edit_clay" => self.edit_clay_job(args),
             // InsertMesh (`job_call`): placed at rest, as other kitbash calls.
             "kitbash" => self.at_rest(|app| app.insert_mesh(args)),
             "export_glb" | "export_fbx" => {
@@ -142,8 +161,10 @@ impl ClideApp {
                 }
                 continue;
             }
-            // Long work runs in the background with a progress bar.
-            if job_call(&call.name, &call.args) {
+            // Long work runs in the background with a progress bar; paint
+            // on a Poly too (it may lay millions of texels).
+            let poly_paint = call.name == "paint" && self.resolve(&call.args["target"]).ok().and_then(|id| self.scene.get(id)).is_some_and(|o| o.shape == Shape::Poly);
+            if job_call(&call.name, &call.args) || poly_paint {
                 self.scene.frame = self.meshes.frame;
                 self.call_source = source;
                 let started = self.start_job_tool(&call.name, &call.args);
@@ -151,7 +172,7 @@ impl ClideApp {
                 match started {
                     Ok(Started::Job(job_label, work)) => {
                         self.spawn_job(job_label, ticket, work);
-                        if edit_job_call(&call.name, &call.args)
+                        if (edit_job_call(&call.name, &call.args) || poly_paint)
                             && let Some(job) = self.jobs.running.last_mut()
                         {
                             job.edits = true;
@@ -172,9 +193,13 @@ impl ClideApp {
             if let Some(answer) = self.jobs.defer.take() {
                 let mut ticket = ticket;
                 ticket.label = format!("{} (answer waits for meshes)", call.name);
+                if let Some((wait, early)) = self.jobs.defer_early.take() {
+                    self.jobs.early.insert(ticket.id, (std::time::Instant::now() + wait, early));
+                }
                 self.jobs.deferred.push_back((ticket, answer));
                 continue;
             }
+            self.jobs.defer_early = None;
             // The agent may have given up waiting; that is fine.
             self.jobs.answer(ticket, result);
         }
@@ -224,6 +249,7 @@ impl ClideApp {
                 if shape == Shape::Fire { return Err("use the fire tool to simulate a Fire object".into()); }
                 if shape == Shape::Cloth { return Err("use the cloth tool with parent and pattern to create a garment".into()); }
                 if shape == Shape::Mesh { return Err("use import_mesh {path, as: mesh} to make a Mesh object".into()); }
+                if shape == Shape::Poly { return Err("use poly {action: from_clay, source} to make a Poly object".into()); }
                 let id = self.scene.add(shape);
                 let keep = self.selection.clone();
                 self.select_only(id);
@@ -276,7 +302,7 @@ impl ClideApp {
                     .iter()
                     .enumerate()
                    .map(|(i, b)| {
-                        let mut v = if crate::replies::verbose(args) {serde_json::to_value(b).unwrap_or_default()} else {json!({"name":b.name,"material":b.material,"bone":b.bone,"op":b.op})};
+                        let mut v = if crate::replies::verbose(args) {blob_json(b).unwrap_or_default()} else {json!({"name":b.name,"material":b.material,"bone":b.bone,"op":b.op})};
                         v["index"] = json!(i);
                         v
                     })
@@ -299,10 +325,19 @@ impl ClideApp {
             "animate" => self.animate(args),
             "playback" => self.playback(args),
             "render_views" => self.render_views(args),
-            "compare_reference" => {
-                self.meshes.sync(&self.scene);
-                self.compare_reference(args)
-            }
+            "quality_report" => match self.at_rest(|app| app.quality_report(args, false))? {
+                Started::Now(out) => out,
+                Started::Job(..) => Err("quality_report ran as a job outside the job line".into()),
+            },
+            // At rest, as quality_report: the references are of the model
+            // as built, and close-ups read the field where the drawn mesh
+            // lies (a posed mesh is off it). It reads the composed field's
+            // meshes: unchecked ledgers settle first.
+            "compare_reference" => self.at_rest(|app| {
+                app.settle_all_clays()?;
+                app.meshes.sync(&app.scene);
+                app.compare_reference(args)
+            }),
             "update_object" => {
                 let id = self.resolve(&args["target"])?;
                 self.apply_props(id, args)?;
@@ -329,6 +364,12 @@ impl ClideApp {
             "set_human" => self.set_human(args),
             "human_controls" => self.human_controls(args),
             "face_hair" => self.face_hair(args),
+            // Measured on the model at rest.
+            "guides" => self.at_rest(|app| app.guides_tool(args)),
+            // Its guides are measured on the model at rest.
+            "create_character" => self.at_rest(|app| app.create_character(args)),
+            // Strokes and the head are read where they stand at rest.
+            "groom" => self.at_rest(|app| app.groom_tool(args)),
             "delete_object" => {
                 let id = self.resolve(&args["target"])?;
                 let mut deleted = self.scene.descendants(id);
@@ -520,6 +561,9 @@ impl ClideApp {
                 if let Some(b) = args["bones"].as_bool() {
                     self.show_bones = b;
                 }
+                if let Some(v) = args.get("guides").filter(|v| !v.is_null()) {
+                    self.show_guides = v.as_bool().ok_or("guides must be true or false")?;
+                }
                 if let Some(b) = args["baked"].as_bool() {
                     self.meshes.show_baked = b;
                 }
@@ -531,8 +575,15 @@ impl ClideApp {
                 }
                 // Checked before anything changes, like the rest below.
                 let overlay = args["overlay"].as_str().map(crate::overlay::Overlay::parse).transpose()?;
+                let shade = match args.get("shade").filter(|v| !v.is_null()) {
+                    None => None,
+                    Some(v) => Some(crate::quality::Shade::parse(v.as_str().ok_or("shade must be beauty, curvature, lumpiness, normals or wire")?)?),
+                };
                 if let Some(o) = overlay {
                     self.meshes.overlay = o;
+                }
+                if let Some(s) = shade {
+                    self.meshes.shade = s;
                 }
                 match args["layout"].as_str() {
                     Some("four") => self.four_view = true,
@@ -572,8 +623,10 @@ impl ClideApp {
                     "shading": if self.matcap.is_some() { "Matcap".to_string() } else { format!("{:?}", self.shading) },
                     "matcap": self.matcap.as_ref().map(|m| m.name.clone()),
                     "overlay": self.meshes.overlay.name(),
+                    "shade": self.meshes.shade.name(),
                     "grid": self.show_grid,
                     "bones": self.show_bones,
+                    "guides": self.show_guides,
                     "brush_cursor": self.show_brush_cursor,
                     "layout": if self.four_view { "four" } else { "single" },
                     "view": self.single_view.name(),
@@ -596,6 +649,7 @@ impl ClideApp {
             "history" => self.history_tool(args),
             "sculpt_layer" => self.at_rest(|app| app.sculpt_layer(args)),
             "detail_level" => self.at_rest(|app| app.detail_level(args)),
+            "poly" => self.poly_tool(args),
             "morph" => self.at_rest(|app| app.morph_tool(args)),
             "stroke_log" => self.stroke_log(args),
             "probe_clay" => self.at_rest(|app| app.probe_clay(args)),
@@ -714,15 +768,93 @@ impl ClideApp {
     }
 
     /// `edit_clay`: replace, then remove, then update, then add blobs.
+    /// With `polish` it is a job (`edit_clay_job`).
     fn edit_clay(&mut self, args: &Value) -> ToolResult {
+        let (id, clay, notes, wait) = self.edit_clay_blobs(args)?;
+        self.scene.get_mut(id).expect("resolved").clay = Some(clay);
+        self.answer_clay_edit(id, notes, Value::Null, wait)
+    }
+
+    /// `edit_clay` with `polish`: the blob steps here, ClayPolish on a job
+    /// thread (about 1.4 s at 1M points and the default amount), then the
+    /// clay installs if it is as the call found it (edits wait in line
+    /// behind the job) and the reply waits for the mesh as `edit_clay`'s
+    /// does (`wait_s`).
+    fn edit_clay_job(&mut self, args: &Value) -> Result<Started, String> {
+        use crate::clay::Detail;
+        let (id, mut clay, notes, wait) = self.edit_clay_blobs(args)?;
+        let before = self.scene.get(id).and_then(|o| o.clay.clone());
+        let v = args["polish"].clone();
+        let (layer, mut p) = self.parse_polish(id, &v, &clay)?;
+        let meta = crate::ledger::Meta::by(self.call_source, "edit_clay", Some("polish".into()));
+        let cache = self.replay_cache.clone();
+        let name = self.scene.get(id).map(|o| o.name.clone()).unwrap_or_default();
+        Ok(Started::Job(
+            format!("Polish {name}"),
+            Box::new(move |progress| {
+                progress.check()?;
+                // The persistent mask and hidden groups it reads, kept by hash.
+                p.frozen = crate::ledger::freeze_with(&mut clay, None)?;
+                let c = {
+                    let view = crate::layers::view_for::<Detail>(&clay, &layer)?;
+                    let input = crate::ledger::SculptInput::of(&view, view.detail.as_ref())?;
+                    p.cell = crate::sculpt::flow::lattice(&view, input.grid.as_ref());
+                    crate::ledger::commit_action::<Detail>(&view, &crate::ledger::ledger(&view), &meta, json!({ "polish": v }), crate::ledger::SculptAction::Polish(p), Some(&cache))?
+                };
+                let polished = json!({ "layer": layer, "record_id": c.record.id, "seq": c.ledger.len(), "ledger_head": c.ledger.head(), "passes": p.passes, "cell": round(p.cell), "changed_points": c.record.stats.changed_points, "bricks": c.record.stats.bricks_touched, "bbox": c.record.stats.bbox, "max_disp": c.record.stats.max_disp });
+                crate::layers::install::<Detail>(&mut clay, &layer, c.ledger, c.grid);
+                crate::layers::check_budget(&clay)?;
+                progress.check()?;
+                Ok(Box::new(move |app: &mut ClideApp| {
+                    let o = app.scene.get_mut(id).ok_or("the object was deleted while polishing")?;
+                    if o.clay != before {
+                        return Err("the clay changed while it was polishing; nothing was applied, send the call again".into());
+                    }
+                    o.clay = Some(clay);
+                    app.answer_clay_edit(id, notes, polished, wait)
+                }) as super::jobs::Finish)
+            }),
+        ))
+    }
+
+    /// `edit_clay`'s reply: the clay's summary once its mesh is built, or
+    /// after `wait` seconds without the mesh (the build goes on: job_status
+    /// lists it, and calls that read meshes wait for it).
+    fn answer_clay_edit(&mut self, id: u64, notes: Vec<String>, polished: Value, wait: f64) -> ToolResult {
+        let noted = move |mut v: Value, notes: Vec<String>, polished: Value| {
+            if !notes.is_empty() {
+                v["notes"] = json!(notes);
+            }
+            if !polished.is_null() {
+                v["polish"] = polished;
+            }
+            v
+        };
+        let (early, early_polish) = (notes.clone(), polished.clone());
+        self.defer_reply_within(std::time::Duration::from_secs_f64(wait), move |app| Ok(text(noted(app.clay_summary(id), notes, polished))), move |app| Ok(text(noted(app.clay_pending(id), early, early_polish))))
+    }
+
+    /// `edit_clay`'s blob steps on a settled copy of the clay: the object,
+    /// the edited clay, notes for the reply and the reply's wait.
+    fn edit_clay_blobs(&mut self, args: &Value) -> Result<(u64, Clay, Vec<String>, f64), String> {
         let id = self.resolve(&args["target"])?;
         let obj = self.scene.get(id).ok_or("object vanished")?;
         if obj.shape != Shape::Clay {
             return Err(format!("{} is not a clay object", obj.name));
         }
+        // How long the reply waits for the rebuilt mesh (D11).
+        let wait = match args.get("wait_s").filter(|v| !v.is_null()) {
+            None => 20.0,
+            Some(v) => v.as_f64().filter(|w| (0.0..=600.0).contains(w)).ok_or("wait_s must be 0-600 seconds")?,
+        };
         let mut clay = obj.clay.clone().unwrap_or_default();
         // Unchecked ledgers replay against the blobs they were made on.
         crate::ledger::settle_clay(&mut clay, Some(&self.replay_cache))?;
+        // Lids filled from Eye objects ({type: "lid", eye: NAME}): a new
+        // list against the clay as it is.
+        let (resolved, mut lid_notes) = self.resolve_lid_eyes(id, &clay, args, &["replace"])?;
+        let args = &resolved;
+        let obj = self.scene.get(id).ok_or("object vanished")?;
         if let Some(v) = args.get("shell") {
             clay.shell = if v.is_null() { None } else {
                 let t = v.as_f64().ok_or("shell must be a positive thickness or null")? as f32;
@@ -748,6 +880,29 @@ impl ClideApp {
         if args.get("replace").is_some_and(|v| !v.is_null()) {
             clay.blobs = parse_blobs(&args["replace"])?;
         }
+        let mut notes: Vec<String> = std::mem::take(&mut lid_notes);
+        // `split`: mirrored blobs written out as their two sides (the copy
+        // just before each, `.L`/`.R` swapped in its name and bone), so
+        // each side can be edited, posed or updated in this same call.
+        if let Some(v) = args.get("split").filter(|v| !v.is_null()) {
+            let keys = v.as_array().ok_or("split takes a list of mirrored blob names or indices")?;
+            if keys.len() > MAX_BLOBS {
+                return Err(format!("split takes at most {MAX_BLOBS} blobs"));
+            }
+            let rig = obj.rig.clone();
+            let mut names = Vec::new();
+            for key in keys {
+                let i = clay.find(key).ok_or_else(|| format!("no blob {key} to split"))?;
+                let (a, b) = crate::pose::split_mirrored(&mut clay, i, rig.as_ref())?;
+                names.push(format!("{a} and {b}"));
+            }
+            notes.push(format!("split into their two sides: {}", names.join(", ")));
+        }
+        // Lids in update and add, against the clay after the split (so a
+        // split side takes its own eye).
+        let (resolved, more) = self.resolve_lid_eyes(id, &clay, args, &["update", "add"])?;
+        let args = &resolved;
+        notes.extend(more);
         // Remove by position from the back so earlier indices stay valid.
         let mut gone: Vec<usize> = Vec::new();
         for key in args["remove"].as_array().into_iter().flatten() {
@@ -761,12 +916,27 @@ impl ClideApp {
         for patch in args["update"].as_array().into_iter().flatten() {
             let key = patch.get("blob").ok_or("each update needs blob: index or name")?;
             let i = clay.find(key).ok_or_else(|| format!("no blob {key}"))?;
-            let mut v = serde_json::to_value(&clay.blobs[i]).map_err(|e| e.to_string())?;
+            let mut v = blob_json(&clay.blobs[i])?;
+            let kind = v["type"].clone();
             for (k, val) in patch.as_object().into_iter().flatten().filter(|(k, _)| k.as_str() != "blob") {
                 v[k] = val.clone();
             }
+            // A blob turned into a sweep, or a new source, is a new sweep; an
+            // existing one keeps its field (written out by `blob_json`)
+            // unless the patch names one ({field: "segments"} upgrades a
+            // legacy sweep).
+            if v["type"] != kind {
+                crate::clay::tube::fill_field(&mut v);
+            } else if patch.get("source").is_some() {
+                crate::clay::tube::fill_field(&mut v["source"]);
+            }
             clay.blobs[i] = serde_json::from_value(v).map_err(|e| format!("update of blob {key}: {e}"))?;
             clay.blobs[i].validate()?;
+            // A circle on a legacy sweep stays its 16-gon (D5): say how to
+            // get the exact tube rather than change the sweep unasked.
+            if patch.get("profile").is_some_and(|p| p.get("circle").is_some()) && matches!(&clay.blobs[i].form, crate::clay::Form::Sweep { field: crate::clay::tube::SweepField::Legacy, .. }) {
+                notes.push(format!("blob {key} is a legacy sweep: its circle profile meshes as a hard 16-gon. update {{blob: {key}, field: \"segments\"}} makes it an exact round tube (which also takes radii)"));
+            }
         }
         // `before` (a blob index or name) inserts there instead of at the end,
         // so a new filler blob does not cover detail blobs that came later.
@@ -793,8 +963,67 @@ impl ClideApp {
         // not fit the clay's budget: checked with them, before the scene
         // takes the clay.
         crate::layers::sync_within_budget(&mut clay)?;
-        self.scene.get_mut(id).expect("resolved").clay = Some(clay);
-        self.defer_reply(move |app| Ok(text(app.clay_summary(id))))
+        Ok((id, clay, notes, wait))
+    }
+
+    /// `edit_clay polish`: the layer it writes and the action, resolved
+    /// (region in the clay's space, the pass count).
+    fn parse_polish(&self, id: u64, v: &Value, clay: &Clay) -> Result<(String, crate::sculpt::flow::Polish), String> {
+        use crate::sculpt::flow::{MAX_PASSES, Polish, Region, passes_for};
+        let o = v.as_object().ok_or("polish must be an object: {amount, angle, region, passes, keep_volume, layer}")?;
+        if let Some(k) = o.keys().find(|k| !["amount", "angle", "region", "passes", "keep_volume", "layer"].contains(&k.as_str())) {
+            return Err(format!("unknown polish field {k}; use amount, angle, region, passes, keep_volume or layer"));
+        }
+        let given = |k: &str| o.get(k).filter(|v| !v.is_null());
+        let num = |k: &str, lo: f64, hi: f64, default: f64| -> Result<f32, String> {
+            given(k).map_or(Ok(default), |v| v.as_f64().filter(|x| (lo..=hi).contains(x)).ok_or(format!("polish {k} must be {lo} to {hi}"))).map(|x| x as f32)
+        };
+        let amount = num("amount", 0.0, 1.0, crate::sculpt::flow::DEFAULT_AMOUNT as f64)?;
+        let angle = num("angle", 5.0, 90.0, 30.0)?;
+        let passes = match given("passes") {
+            None => passes_for(amount),
+            // A whole number, also when sent as 20.0.
+            Some(p) => p.as_f64().filter(|p| p.fract() == 0.0 && (1.0..=MAX_PASSES as f64).contains(p)).ok_or(format!("polish passes must be a whole number 1 to {MAX_PASSES}"))? as u32,
+        };
+        let keep_volume = match given("keep_volume") {
+            None => true,
+            Some(b) => b.as_bool().ok_or("polish keep_volume must be true or false")?,
+        };
+        let layer = match given("layer") {
+            None => crate::layers::default_sculpt_layer(clay),
+            Some(l) => l.as_str().ok_or("polish layer must be a sculpt layer's name (sculpt_layer list)")?.to_string(),
+        };
+        crate::layers::stroke_amount(clay, &layer)?;
+        let region = match given("region") {
+            None => None,
+            Some(r) => {
+                if let Some(k) = r.as_object().ok_or("polish region must be {center, radius or radii, space}")?.keys().find(|k| !["center", "radius", "radii", "space"].contains(&k.as_str())) {
+                    return Err(format!("unknown polish region field {k}; use center, radius or radii, and space"));
+                }
+                let center = vec3(r, "center")?.ok_or("polish region needs center [x, y, z]")?;
+                let radii = match (r.get("radius").filter(|v| !v.is_null()), vec3(r, "radii")?) {
+                    (Some(x), None) => Vec3::splat(x.as_f64().ok_or("polish region radius must be a number")? as f32),
+                    (None, Some(v)) => v,
+                    _ => return Err("polish region takes radius or radii [x, y, z] (along the clay's axes)".into()),
+                };
+                if !center.is_finite() || !radii.is_finite() || radii.min_element() <= 0.0 {
+                    return Err("polish region needs a finite center and radii above 0".into());
+                }
+                // World space by default, as sculpt points and quality_report's
+                // worst points are.
+                match r["space"].as_str().unwrap_or("world") {
+                    "world" => {
+                        let m = self.scene.world_matrix(id).inverse();
+                        Some(Region { center: m.transform_point3(center), radii: radii * crate::brush::resolve::mat_scale(m) })
+                    }
+                    "object" => Some(Region { center, radii }),
+                    other => return Err(format!("polish region space {other}: use world or object")),
+                }
+            }
+        };
+        // The cell it runs at and what it reads of the mask and groups are
+        // set on the job thread (`edit_clay_job`).
+        Ok((layer, Polish { amount, angle, region, passes, keep_volume, cell: 1.0, frozen: None }))
     }
 
     /// `sculpt`: strokes are prepared here (world to clay space, snapping,
@@ -1064,6 +1293,11 @@ impl ClideApp {
         let cast = self.clay_caster(id).ok();
         let lookup = |a: &crate::brush::alpha::AlphaRef| self.find_alpha(id, a).map(|x| x.hash());
         let levels = self.scene.get(id).and_then(|o| o.clay.as_ref()).map(crate::levels::cells).unwrap_or_default();
+        // The clay's middle (its mesh's box), for projected frames' one-way rays.
+        let center = self.meshes.whole(id).filter(|m| !m.vertices.is_empty()).map(|m| {
+            let (lo, hi) = m.vertices.iter().fold((glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN)), |(a, b), v| (a.min(v.pos.into()), b.max(v.pos.into())));
+            (lo + hi) * 0.5
+        });
         let ctx = crate::brush::resolve::ResolveCtx {
             to_local,
             radius_scale,
@@ -1076,6 +1310,7 @@ impl ClideApp {
             alpha: Some(&lookup),
             unpose,
             levels: Some(&levels),
+            center,
         };
         crate::sculpt::prepare(raws, default_brush, &ctx)
     }
@@ -1084,8 +1319,12 @@ impl ClideApp {
     fn paint(&mut self, args: &Value) -> ToolResult {
         let id = self.resolve(&args["target"])?;
         let obj = self.scene.get(id).ok_or("object vanished")?;
+        // A Poly paints its UDIM texture tiles (Stage 4b).
+        if obj.shape == Shape::Poly {
+            return Err("paint on a Poly runs as a job (process_mcp sends it there)".into());
+        }
         if obj.shape != Shape::Clay {
-            return Err(format!("{} is not a clay object", obj.name));
+            return Err(format!("{} is not a clay object or a Poly", obj.name));
         }
         let (to_local, radius_scale) = self.clay_space(id, args)?;
         let mut clay = obj.clay.clone().unwrap_or_default();
@@ -1372,8 +1611,43 @@ impl ClideApp {
         Ok(if args["mirror"].as_bool().unwrap_or(false) { Some(self.mirror_copy(id)?) } else { None })
     }
 
-    fn clay_summary(&mut self, id: u64) -> Value {
+    /// `clay_summary` while its mesh still builds (`edit_clay wait_s`):
+    /// what does not need the mesh, `mesh_pending`, the build's progress
+    /// and an estimate from the object's last build. No bounds: they would
+    /// be the old mesh's.
+    fn clay_pending(&mut self, id: u64) -> Value {
+        let Some(o) = self.scene.get(id) else { return Value::Null };
+        // Built already (another object's build is what runs): the full
+        // answer, from the meshes as they are.
+        if !self.meshes.stale_object(&self.scene, o) {
+            return self.clay_summary_now(id);
+        }
+        let clay = o.clay.as_ref();
+        // Its own build, the build of an object with the same shape it
+        // waits for, or its fine mesh's (shared by objects showing it).
+        let build = self.meshes.building_for(id);
+        let fine = build.as_ref().is_some_and(|b| b.1);
+        json!({
+            "id": id,
+            "name": o.name,
+            "blobs": clay.map_or(0, |c| c.blobs.len()),
+            "blob_names": clay.map(|c| c.blobs.iter().enumerate().map(|(i, b)| if b.name.is_empty() { i.to_string() } else { b.name.clone() }).collect::<Vec<_>>()),
+            "resolution": clay.map(|c| c.resolution),
+            "cell_size": clay.and_then(|c| c.cell_size()).map(round),
+            "mesh_pending": true,
+            "estimated_build_s": self.meshes.last_build_seconds(id, fine).map(round),
+            "build": build.map(|(b, fine)| json!({ "object": b.object.unwrap_or(id), "fine": fine, "started": round(b.seconds), "fraction": round(b.fraction) })),
+            "next": "The change is made; its mesh is still building. Tools that read meshes (render_views, surface_point, compare_reference, exports) wait in line for it; get_scene answers at once with the last built mesh. job_status without id lists builds with their progress.",
+        })
+    }
+
+    pub(super) fn clay_summary(&mut self, id: u64) -> Value {
         self.meshes.sync(&self.scene);
+        self.clay_summary_now(id)
+    }
+
+    /// `clay_summary` from the meshes as they are (not waiting for builds).
+    fn clay_summary_now(&mut self, id: u64) -> Value {
         let Some(o) = self.scene.get(id) else { return Value::Null };
         let clay = o.clay.as_ref();
         let mesh = self.meshes.get(o);
@@ -1464,8 +1738,19 @@ impl ClideApp {
         }
         self.meshes.sync(&self.scene);
         let mut bakes = Vec::new();
-        for (id, s) in self.scene.objects.iter().filter_map(|o| o.bake.map(|s| (o.id, s))) {
-            bakes.extend(self.meshes.bake_job(&self.scene, id, s)?);
+        // A bake that cannot run (its lowpoly Poly gone, a zero scale) is
+        // reported, never a reason to fail the whole export: the object is
+        // written unbaked, or with its meshopt fallback.
+        let mut bake_warnings: Vec<String> = Vec::new();
+        for o in self.scene.objects.iter().filter(|o| o.bake.is_some()) {
+            let s = o.bake.expect("filtered");
+            if crate::mesh::lowpoly_dangling(&self.scene, s) {
+                bake_warnings.push(format!("{}: its bake's lowpoly Poly is gone; baked with meshopt instead (bake lowpoly: \"meshopt\" or another Poly keeps this quiet)", o.name));
+            }
+            match self.meshes.bake_job(&self.scene, o.id, s) {
+                Ok(job) => bakes.extend(job),
+                Err(e) => bake_warnings.push(format!("{}: not baked ({e}); written unbaked", o.name)),
+            }
         }
         // Blend shapes: each named layer or morph on every exported clay
         // that has it, as the clay (composite) to fit the mesh to.
@@ -1507,6 +1792,14 @@ impl ClideApp {
         }
         let mut scene = self.scene.clone();
         scene.frame = None;
+        // Reference image planes are not geometry: never exported.
+        // (Children of a plane stay, under the plane's parent.)
+        scene.without_references();
+        let asked = !roots.is_empty();
+        let roots: Vec<u64> = roots.into_iter().filter(|r| scene.get(*r).is_some()).collect();
+        if asked && roots.is_empty() {
+            return Err("nothing to export: the targets are reference image planes, which are not geometry".into());
+        }
         let mut meshes = self.meshes.clone();
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("export").to_string();
         let mut opts = crate::gltf::Options { roots, animations, fps: self.timeline.fps, file_stem: if fbx { stem } else { String::new() }, lods, atlas: args["atlas"].as_bool().unwrap_or(true), texel_density: args["texel_density"].as_f64().map(|v|v as f32), gpu_instancing: args["instancing"].as_str() == Some("ext"), blend_shapes: Vec::new() };
@@ -1598,6 +1891,9 @@ impl ClideApp {
             }
             summary["bytes"] = json!(out.bytes.len());
             summary["fps"] = json!(opts.fps);
+            if !bake_warnings.is_empty() {
+                summary["warnings"] = json!(bake_warnings);
+            }
             if !out.files.is_empty() {
                 summary["texture_files"] = json!(out.files.iter().map(|f| &f.0).collect::<Vec<_>>());
             }
@@ -1676,13 +1972,28 @@ pub(crate) fn object_json_in(scene: &Scene, id: u64) -> Value {
     if let Some(s) = o.link.as_ref().and_then(|l| scene.get(l.source)) {
         out["mirror_of"] = json!(s.name);
     }
+    if let Some(r) = &o.reference {
+        out["reference"] = json!({ "slot": r.slot, "image_size": r.image.size(), "px_per_unit": r.px_per_unit, "ground_y": r.ground_y, "opacity": r.opacity, "sheet": r.source, "note": "a turnaround sheet's image plane: not exported, printed, filmed (unless show_references) or picked" });
+    }
+    if let Some(p) = &o.poly {
+        out["poly"] = json!({ "faces": p.faces(), "points": p.cage.len(), "levels": p.level_count(), "level": p.level, "shown_faces": p.faces_at(p.level), "creases": p.creases.len() });
+    }
     if let Some(s) = o.follow.as_ref().and_then(|f| scene.get(f.object)) {
         out["follows"] = json!(s.name);
     }
     out
 }
 
-fn parse_blobs(v: &Value) -> Result<Vec<Blob>, String> {
+/// A blob as `get_clay` shows it: as saved, but with a legacy sweep's
+/// field written out, so the JSON sent back (`edit_clay replace`) keeps
+/// the sweep as it was (D5).
+fn blob_json(b: &Blob) -> Result<Value, String> {
+    let mut v = serde_json::to_value(b).map_err(|e| e.to_string())?;
+    crate::clay::tube::show_field(&mut v);
+    Ok(v)
+}
+
+pub(super) fn parse_blobs(v: &Value) -> Result<Vec<Blob>, String> {
     match v {
         Value::Null => Ok(Vec::new()),
         Value::Array(items) => {
@@ -1693,7 +2004,10 @@ fn parse_blobs(v: &Value) -> Result<Vec<Blob>, String> {
                 .iter()
                 .enumerate()
                 .map(|(i, b)| {
-                    let blob: Blob = serde_json::from_value(b.clone()).map_err(|e| format!("blob {i}: {e}"))?;
+                    // New sweeps get the exact tube field (D5).
+                    let mut b = b.clone();
+                    crate::clay::tube::fill_field(&mut b);
+                    let blob: Blob = serde_json::from_value(b).map_err(|e| format!("blob {i}: {e}"))?;
                     blob.validate().map_err(|e| format!("blob {i}: {e}"))?;
                     Ok(blob)
                 })
@@ -2012,6 +2326,234 @@ pub(super) fn shadows_json(s: &crate::render::Shadows, status: Option<crate::ren
 mod tests {
     use super::*;
     use crate::render::{ShadowQuality, Shadows};
+
+    /// D11: `wait_s: 0` answers before the build, without bounds; the build
+    /// shows in job_status and later calls see the mesh. New sweeps get the
+    /// segments field; `update {field}` upgrades a legacy one.
+    #[test]
+    fn edit_clay_wait_s() {
+        use super::super::recorder::tests::{frame, ok, settle};
+        let Some(rs) = crate::render::test_support::headless() else {
+            eprintln!("skipped: no GPU adapter for the editor's render state");
+            return;
+        };
+        let (mut app, tx) = ClideApp::headless(rs);
+        let ctx = egui::Context::default();
+        let (app, ctx, tx) = (&mut app, &ctx, &tx);
+        frame(app, ctx, Vec::new());
+        let legacy = json!({ "type": "sweep", "name": "old", "profile": [[-0.01, -0.01], [0.01, -0.01], [0.01, 0.01], [-0.01, 0.01]], "points": [[0, 0, 0], [0.1, 0.05, 0], [0.2, 0, 0]], "field": "legacy" });
+        ok(app, ctx, tx, "create_object", json!({ "shape": "Clay", "name": "Wires", "resolution": 64, "blobs": [legacy] }));
+        settle(app, ctx);
+        let id = app.scene.objects.iter().find(|o| o.name == "Wires").unwrap().id;
+        let drawn = |app: &mut ClideApp| ok(app, ctx, tx, "get_scene", json!({ "target": "Wires" }))["budget"]["triangles_drawn"].as_u64().unwrap();
+        let before = drawn(app);
+        let wire = json!({ "type": "sweep", "name": "wire", "profile": { "circle": 0.004 }, "points": [[0, 0.05, 0], [0.1, 0.1, 0.02], [0.2, 0.05, 0]] });
+        let reply = ok(app, ctx, tx, "edit_clay", json!({ "target": "Wires", "add": [wire], "resolution": 200, "wait_s": 0 }));
+        assert_eq!(reply["mesh_pending"], true, "{reply}");
+        assert!(reply.get("local_bounds").is_none() && reply["build"]["object"] == id && reply["estimated_build_s"].is_number(), "{reply}");
+        let (status, _) = super::super::recorder::tests::mcp(app, ctx, tx, "job_status", json!({}));
+        assert!(status["builds"].as_array().unwrap().iter().any(|b| b["object"] == id) || !app.meshes.busy(), "{status}");
+        settle(app, ctx);
+        // The new mesh: the wire, at the new resolution.
+        assert!(drawn(app) > before);
+        let blobs = &app.scene.get(id).unwrap().clay.as_ref().unwrap().blobs;
+        assert!(blobs[1].form.round_tube());
+        // A circle on the legacy sweep stays legacy (a 16-gon), and the
+        // reply says how to upgrade it.
+        let circled = ok(app, ctx, tx, "edit_clay", json!({ "target": "Wires", "update": [{ "blob": "old", "profile": { "circle": 0.01 } }] }));
+        assert!(circled["notes"][0].as_str().is_some_and(|n| n.contains("field: \"segments\"")), "{circled}");
+        let blobs = &app.scene.get(id).unwrap().clay.as_ref().unwrap().blobs;
+        assert!(matches!(blobs[0].form, crate::clay::Form::Sweep { field: crate::clay::tube::SweepField::Legacy, .. }) && !blobs[0].form.round_tube());
+        // get_clay shows the field, so sending its blobs back keeps it.
+        let shown = ok(app, ctx, tx, "get_clay", json!({ "target": "Wires", "verbose": true }));
+        assert_eq!(shown["blobs"][0]["field"], "legacy", "{shown}");
+        let quiet = ok(app, ctx, tx, "edit_clay", json!({ "target": "Wires", "replace": shown["blobs"] }));
+        assert!(quiet.get("notes").is_none(), "{quiet}");
+        let blobs = &app.scene.get(id).unwrap().clay.as_ref().unwrap().blobs;
+        assert!(matches!(blobs[0].form, crate::clay::Form::Sweep { field: crate::clay::tube::SweepField::Legacy, .. }) && blobs[1].form.round_tube());
+        // A slow build gets the full answer when it waits long enough.
+        let full = ok(app, ctx, tx, "edit_clay", json!({ "target": "Wires", "update": [{ "blob": "old", "field": "segments" }] }));
+        assert!(full.get("mesh_pending").is_none() && full["local_bounds"].is_object(), "{full}");
+        let clay = app.scene.get(id).unwrap().clay.as_ref().unwrap();
+        assert!(clay.blobs.iter().all(|b| matches!(b.form, crate::clay::Form::Sweep { field: crate::clay::tube::SweepField::Segments, .. })));
+        let (refused, err) = super::super::recorder::tests::mcp(app, ctx, tx, "edit_clay", json!({ "target": "Wires", "wait_s": 601 }));
+        assert!(err && refused.to_string().contains("0-600"), "{refused}");
+    }
+
+    /// `edit_clay` with a polish runs as an editing job (the window stays
+    /// live; later edits wait behind it); without one it runs at once.
+    #[test]
+    fn edit_clay_polish_is_a_job() {
+        let polish = json!({ "target": "Slab", "polish": { "amount": 0.5 } });
+        assert!(job_call("edit_clay", &polish) && edit_job_call("edit_clay", &polish));
+        for plain in [json!({ "target": "Slab", "add": [] }), json!({ "target": "Slab", "polish": null })] {
+            assert!(!job_call("edit_clay", &plain) && !edit_job_call("edit_clay", &plain), "{plain}");
+        }
+    }
+
+    /// Stage 1c: `edit_clay polish` end to end. It writes one action record
+    /// (region resolved to the clay's space, passes, cell), every field it
+    /// takes changes the ledger's head and the same call gives the same
+    /// head; a polish alone settles and works on an unsculpted clay; bad
+    /// fields are refused. A projected stroke's stored spec, sent back
+    /// through stroke_edit replace, projects again. After polishes, detail
+    /// cell, region and cleared-grid changes, the clay stays editable and
+    /// its whole ledger replays.
+    #[test]
+    fn edit_clay_polish_records_and_replays() {
+        use super::super::recorder::tests::{frame, mcp, ok, settle};
+        let Some(rs) = crate::render::test_support::headless() else {
+            eprintln!("skipped: no GPU adapter for the editor's render state");
+            return;
+        };
+        let (mut app, tx) = ClideApp::headless(rs);
+        let ctx = egui::Context::default();
+        let (app, ctx, tx) = (&mut app, &ctx, &tx);
+        frame(app, ctx, Vec::new());
+        ok(app, ctx, tx, "create_object", json!({ "shape": "Clay", "name": "Slab", "resolution": 64, "blobs": [{ "type": "box", "center": [0, 0, 0], "size": [0.8, 0.6, 0.6], "blend": 0 }] }));
+        ok(app, ctx, tx, "update_object", json!({ "target": "Slab", "translate": [1, 0, 0] }));
+        ok(app, ctx, tx, "edit_clay", json!({ "target": "Slab", "detail_cell": 0.01 }));
+        // A polish on a clay with no sculpt yet: a grid of its own.
+        let first = ok(app, ctx, tx, "edit_clay", json!({ "target": "Slab", "polish": { "passes": 4 } }));
+        assert!(first["polish"]["record_id"].is_u64() && first["polish"]["cell"] == json!(0.01), "{first}");
+        app.undo();
+        settle(app, ctx);
+        // The default amount is the light pass (D-b): 13 passes.
+        let light = ok(app, ctx, tx, "edit_clay", json!({ "target": "Slab", "polish": {} }));
+        assert_eq!(light["polish"]["passes"], 13, "{light}");
+        app.undo();
+        settle(app, ctx);
+        ok(app, ctx, tx, "sculpt", json!({ "target": "Slab", "strokes": [{ "brush": "noise", "pattern": "bumps", "points": [[1, 0.3, 0]], "radius": 0.3, "strength": 0.4, "scale": 0.03 }] }));
+        settle(app, ctx);
+        let call = |p: Value| json!({ "target": "Slab", "polish": p });
+        let base = json!({ "amount": 0.4, "region": { "center": [1, 0.3, 0], "radius": 0.25 } });
+        let reply = ok(app, ctx, tx, "edit_clay", call(base.clone()));
+        let polish = reply["polish"].clone();
+        assert!(polish["changed_points"].as_u64().unwrap() > 1000 && polish["passes"] == json!(51) && polish["layer"] == "base", "{reply}");
+        let log = ok(app, ctx, tx, "stroke_log", json!({ "target": "Slab", "full": true, "verbose": true, "limit": 200 }));
+        let record = log["records"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(record["kind"], "action", "{record}");
+        assert_eq!(record["action"], json!({ "polish": base }), "the call's polish as given");
+        let action = &record["resolved"]["polish"];
+        let center: Vec<f64> = serde_json::from_value(action["region"]["center"].clone()).unwrap();
+        assert!((center[0]).abs() < 1e-5 && (center[1] - 0.3).abs() < 1e-5, "the region in the clay's space: {action}");
+        assert_eq!((action["passes"].as_u64(), action["keep_volume"].as_bool(), action["angle"].as_f64()), (Some(51), Some(true), Some(30.0)), "{action}");
+        let head = polish["ledger_head"].clone();
+        // The same call on the same clay: the same head. Each field changed:
+        // another.
+        let mut heads = vec![head.clone()];
+        for p in [
+            base.clone(),
+            json!({ "amount": 0.5, "region": base["region"] }),
+            json!({ "amount": 0.4, "angle": 40, "region": base["region"] }),
+            json!({ "amount": 0.4, "passes": 20, "region": base["region"] }),
+            json!({ "amount": 0.4, "keep_volume": false, "region": base["region"] }),
+            json!({ "amount": 0.4, "region": { "center": [1, 0.3, 0], "radius": 0.2 } }),
+            json!({ "amount": 0.4, "region": { "center": [1.01, 0.3, 0], "radius": 0.25 } }),
+            json!({ "amount": 0.4, "region": { "center": [0, 0.3, 0], "radius": 0.25, "space": "object" } }),
+            json!({ "amount": 0.4 }),
+        ] {
+            app.undo();
+            settle(app, ctx);
+            heads.push(ok(app, ctx, tx, "edit_clay", call(p.clone()))["polish"]["ledger_head"].clone());
+        }
+        assert_eq!(heads[1], head, "the same call, the same record");
+        assert_eq!(heads[8], head, "the region given in object space is the same region");
+        let distinct: std::collections::HashSet<String> = heads.iter().map(|h| h.to_string()).collect();
+        assert_eq!(distinct.len(), heads.len() - 2, "every other field changes the head: {heads:?}");
+        // A whole pass count sent as a float is the same call.
+        app.undo();
+        settle(app, ctx);
+        let float = ok(app, ctx, tx, "edit_clay", call(json!({ "amount": 0.4, "passes": 20.0, "region": base["region"] })));
+        assert_eq!(float["polish"]["ledger_head"], heads[4], "passes 20.0 is passes 20: {float}");
+        let (err, failed) = mcp(app, ctx, tx, "edit_clay", call(json!({ "passes": 20.5 })));
+        assert!(failed && err.to_string().contains("whole number"), "{err}");
+        for (bad, why) in [(json!({ "amount": 2 }), "amount must be"), (json!({ "angle": 1 }), "angle must be"), (json!({ "strength": 1 }), "unknown polish field"), (json!({ "region": { "center": [0, 0, 0] } }), "radius or radii"), (json!({ "layer": "paint" }), "paint")] {
+            let (err, failed) = mcp(app, ctx, tx, "edit_clay", call(bad.clone()));
+            assert!(failed && err.to_string().contains(why), "{bad}: {err}");
+        }
+
+        // A projected stroke: stroke_log full's spec, replaced, lands where
+        // the record's points did.
+        ok(app, ctx, tx, "sculpt", json!({ "target": "Slab", "strokes": [{ "brush": "crease", "points": [[0.8, 0.33, -0.1], [1.0, 0.34, 0.0], [1.2, 0.33, 0.1]], "radius": 0.03, "strength": 0.01, "frame": { "project": { "along": "view:top" } } }] }));
+        settle(app, ctx);
+        let log = ok(app, ctx, tx, "stroke_log", json!({ "target": "Slab", "full": true, "verbose": true, "limit": 200 }));
+        let record = log["records"].as_array().unwrap().last().unwrap().clone();
+        let points = record["resolved"]["dabs"][0]["points"].clone();
+        assert!(points.as_array().unwrap().iter().all(|p| p[1].as_f64().unwrap() < 0.31), "on the slab's top: {points}");
+        assert!(record["spec"]["frame"]["project"].is_object(), "{record}");
+        ok(app, ctx, tx, "stroke_edit", json!({ "target": "Slab", "action": "replace", "id": record["id"], "spec": record["spec"] }));
+        settle(app, ctx);
+        let log = ok(app, ctx, tx, "stroke_log", json!({ "target": "Slab", "full": true, "verbose": true, "limit": 200 }));
+        let again = log["records"].as_array().unwrap().last().unwrap().clone();
+        assert_ne!(again["id"], record["id"]);
+        // It projects again (down the top view: x and z as drawn), onto the
+        // surface as it is now, which holds the crease being replaced.
+        let moved = again["resolved"]["dabs"][0]["points"].as_array().unwrap().clone();
+        for (p, q) in moved.iter().zip(points.as_array().unwrap()) {
+            assert!(p[0] == q[0] && p[2] == q[2] && (p[1].as_f64().unwrap() - 0.3).abs() < 0.012, "replaced, it projects again: {p} (was {q})");
+        }
+
+        // MoveCurve on a projected curve: its smooth path is cast again from
+        // points already on the top, which land there (before, they passed
+        // through it and the bottom was out of reach: refused).
+        let curve = json!({ "brush": "crease", "kind": { "curve": {} }, "points": [[0.85, 0.33, -0.1], [1.0, 0.34, 0.0], [1.15, 0.33, 0.1]], "radius": 0.03, "strength": 0.002, "frame": { "project": { "along": "view:top" } } });
+        ok(app, ctx, tx, "sculpt", json!({ "target": "Slab", "strokes": [curve] }));
+        settle(app, ctx);
+        let log = ok(app, ctx, tx, "stroke_log", json!({ "target": "Slab", "full": true, "verbose": true, "limit": 200 }));
+        let record = log["records"].as_array().unwrap().last().unwrap().clone();
+        let mut spec = record["spec"].clone();
+        spec["points"][1] = json!([1.0, 0.34, 0.05]);
+        ok(app, ctx, tx, "stroke_edit", json!({ "target": "Slab", "action": "replace", "id": record["id"], "spec": spec }));
+        settle(app, ctx);
+        let log = ok(app, ctx, tx, "stroke_log", json!({ "target": "Slab", "full": true, "verbose": true, "limit": 200 }));
+        let moved = log["records"].as_array().unwrap().last().unwrap()["resolved"]["dabs"][0]["points"].as_array().unwrap().clone();
+        assert!(moved.len() > 10 && moved.iter().all(|p| (p[1].as_f64().unwrap() - 0.3).abs() < 0.012), "the moved curve stays on the top: {moved:?}");
+
+        // After a polish, the cell, regions and grid change and the clay
+        // stays editable: later calls settle, and the whole ledger replays
+        // (the first polish below starts its grid at its own cell).
+        ok(app, ctx, tx, "edit_clay", json!({ "target": "Slab", "clear_detail": true }));
+        ok(app, ctx, tx, "edit_clay", json!({ "target": "Slab", "polish": { "passes": 3 } }));
+        for change in [json!({ "detail_cell": 0.008 }), json!({ "detail_regions": [{ "name": "top", "center": [0, 0.3, 0], "radius": 0.1, "cell": 0.004 }] }), json!({ "clear_detail": true }), json!({ "detail_cell": 0.012 })] {
+            let mut call = json!({ "target": "Slab", "polish": { "passes": 2 } });
+            call.as_object_mut().unwrap().extend(change.as_object().unwrap().clone());
+            ok(app, ctx, tx, "edit_clay", call);
+            ok(app, ctx, tx, "sculpt", json!({ "target": "Slab", "strokes": [{ "brush": "inflate", "point": [1, 0.3, 0], "radius": 0.05, "snap": true }] }));
+            settle(app, ctx);
+        }
+        // (The first stroke, made at the old cell, replays at the clay's cell
+        // now and may mismatch; the replay still runs through.)
+        let checked = ok(app, ctx, tx, "stroke_edit", json!({ "target": "Slab", "action": "replay" }));
+        assert!(checked["mismatched"].is_array(), "the ledger replays across cell changes: {checked}");
+    }
+
+    /// D5: legacy sweeps (saved without `field`, here nested in an array
+    /// and a shell too) come back from `get_clay` JSON through `edit_clay
+    /// replace` as they were: the same blobs, digest and mesh. Saves still
+    /// leave the field out.
+    #[test]
+    fn legacy_sweeps_survive_get_clay_replace() {
+        let square = json!([[-0.02, -0.02], [0.02, -0.02], [0.02, 0.02], [-0.02, 0.02]]);
+        let clay: Clay = serde_json::from_value(json!({ "resolution": 48, "blobs": [
+            { "type": "sphere", "center": [0, 0, 0], "radius": 0.3 },
+            { "type": "sweep", "op": "carve", "profile": { "circle": 0.03 }, "points": [[-0.4, 0.05, 0.25], [0, 0.1, 0.32], [0.4, 0, 0.25]], "blend": 0.01 },
+            { "type": "array", "count": 3, "step": [0, 0.1, 0], "source": { "type": "sweep", "profile": square, "points": [[-0.4, -0.2, 0], [0.4, -0.15, 0]] } },
+            { "type": "shell", "thickness": 0.01, "source": { "type": "sweep", "profile": { "circle": 0.02 }, "points": [[0, -0.4, 0], [0, -0.3, 0.1]] } },
+        ] })).unwrap();
+        assert!(!serde_json::to_string(&clay).unwrap().contains("\"field\""), "saves leave a legacy field out");
+        // What get_clay verbose sends, index and all.
+        let shown: Vec<Value> = clay.blobs.iter().enumerate().map(|(i, b)| { let mut v = blob_json(b).unwrap(); v["index"] = json!(i); v }).collect();
+        let back = Clay { blobs: parse_blobs(&json!(shown)).unwrap(), ..clay.clone() };
+        assert_eq!(back.blobs, clay.blobs);
+        assert_eq!(crate::ledger::clay_context(&back), crate::ledger::clay_context(&clay));
+        let (a, b) = (clay.build_mesh(), back.build_mesh());
+        assert!(a.indices == b.indices && a.vertices.iter().zip(&b.vertices).all(|(x, y)| x.pos == y.pos) && a.vertices.len() == b.vertices.len());
+        assert_eq!(serde_json::to_string(&back).unwrap(), serde_json::to_string(&clay).unwrap());
+        // New sweeps (no field) still get the exact tube.
+        let new = parse_blobs(&json!([{ "type": "sweep", "profile": { "circle": 0.01 }, "points": [[0, 0, 0], [0, 1, 0]] }])).unwrap();
+        assert!(new[0].form.round_tube());
+    }
 
     #[test]
     fn set_display_shadows_parse_and_echo() {

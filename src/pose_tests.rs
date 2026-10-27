@@ -443,3 +443,72 @@ fn side_names_swap_inside_names() {
     assert_eq!(pose::side_name("Shin_R2"), "Shin_R2_mirror");
     assert_eq!(pose::side_name("Torso"), "Torso_mirror");
 }
+
+/// A linked mirror copy of a Poly follows its source: its levels and
+/// creases, a copy that reflects its own geometry (mirrored once per
+/// source change, no churn), and a source made clay in place (the copy
+/// keeps no stale cage).
+#[test]
+fn linked_mirror_follows_a_poly() {
+    let mut scene = Scene::default();
+    let src = scene.add(Shape::Poly);
+    {
+        let o = scene.get_mut(src).unwrap();
+        o.name = "Plate.L".into();
+        o.translation = Vec3::new(1.5, 0.0, 0.0);
+        o.poly = Some(crate::poly::tests::cube());
+    }
+    let copy = pose::mirror(&mut scene, src, &MirrorOptions { linked: true, ..mirror_x() }).unwrap().root;
+    let poly = |scene: &Scene, id: u64| scene.get(id).unwrap().poly.clone();
+    assert!(poly(&scene, copy) == poly(&scene, src));
+    // Levels and creases on the source show on the copy.
+    {
+        let p = scene.get_mut(src).unwrap().poly.as_mut().unwrap();
+        p.set_levels(2).unwrap();
+        p.level = 1;
+        p.creases = std::sync::Arc::new([((0, 4), 2.0)].into_iter().collect());
+    }
+    assert!(pose::sync(&mut scene));
+    assert!(poly(&scene, copy) == poly(&scene, src), "the copy has the source's levels and creases");
+    assert!(!pose::sync(&mut scene));
+    // A copy reflecting its own geometry gets the mirror image, once.
+    scene.get_mut(copy).unwrap().link.as_mut().unwrap().axis = Some(0);
+    assert!(pose::sync(&mut scene));
+    assert!(poly(&scene, copy) == poly(&scene, src).map(|p| p.mirrored(0)));
+    assert!(!pose::sync(&mut scene), "mirrored again only when the source changes");
+    scene.get_mut(copy).unwrap().link.as_mut().unwrap().axis = None;
+    pose::sync(&mut scene);
+    // The source made clay in place (as to_clay does): the copy is clay, with no cage.
+    {
+        let o = scene.get_mut(src).unwrap();
+        o.shape = Shape::Clay;
+        o.poly = None;
+        o.clay = Some(serde_json::from_value(json!({ "blobs": [{ "type": "sphere", "center": [0, 0, 0], "radius": 0.5 }], "resolution": 24 })).unwrap());
+    }
+    assert!(pose::sync(&mut scene));
+    let c = scene.get(copy).unwrap();
+    assert!(c.shape == Shape::Clay && c.poly.is_none() && c.clay.is_some());
+}
+
+/// A linked mirror copy of an imported mesh object shows the source's
+/// mesh, and follows it when the mesh changes (it had none before).
+#[test]
+fn linked_mirror_follows_an_imported_mesh() {
+    let mut scene = Scene::default();
+    let src = scene.add(Shape::Mesh);
+    let (points, tris) = crate::mesh_asset::tests::icosphere(1, 0.5);
+    {
+        let o = scene.get_mut(src).unwrap();
+        o.name = "Rock.L".into();
+        o.translation = Vec3::new(1.5, 0.0, 0.0);
+        o.mesh = Some(crate::mesh_asset::MeshAsset::new(points.clone(), tris.clone()).unwrap());
+    }
+    let copy = pose::mirror(&mut scene, src, &MirrorOptions { linked: true, ..mirror_x() }).unwrap().root;
+    let mesh = |scene: &Scene, id: u64| scene.get(id).unwrap().mesh.clone();
+    assert!(mesh(&scene, copy).is_some() && mesh(&scene, copy) == mesh(&scene, src));
+    let (p2, t2) = crate::mesh_asset::tests::icosphere(2, 0.5);
+    scene.get_mut(src).unwrap().mesh = Some(crate::mesh_asset::MeshAsset::new(p2, t2).unwrap());
+    assert!(pose::sync(&mut scene));
+    assert!(mesh(&scene, copy) == mesh(&scene, src), "the copy follows a new mesh");
+    assert!(!pose::sync(&mut scene));
+}

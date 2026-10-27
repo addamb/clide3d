@@ -9,6 +9,7 @@
 //!   (previewed while it drags);
 //! - mask and groups: `set_display overlay`, `mask` actions, `group
 //!   show | hide | isolate | show_all`;
+//! - the quality shade: `set_display shade` (the Shading menu's call);
 //! - Adjust Last: `stroke_edit {action: scale, last: true}` on release;
 //! - the history scrubber: `history goto` on release, and `history mark`;
 //! - Save: `brush_preset save {spec}` with the current brush.
@@ -85,7 +86,8 @@ impl ClideApp {
         self.hud.shown = self.current_brush_json();
         let mut patch = serde_json::Map::new();
         let b = self.brush.clone();
-        ui.label(RichText::new(format!("Brush: {}{}", json!(b.brush).as_str().unwrap_or_default(), b.preset.as_ref().map(|p| format!(" ({p})")).unwrap_or_default())).strong());
+        let title = if self.tool == super::Tool::Groom { format!("Groom: {}", b.groom.name()) } else { format!("Brush: {}{}", json!(b.brush).as_str().unwrap_or_default(), b.preset.as_ref().map(|p| format!(" ({p})")).unwrap_or_default()) };
+        ui.label(RichText::new(title).strong());
         let (mut radius, mut strength) = (b.radius, b.strength);
         let r = ui.add(egui::Slider::new(&mut radius, 0.002..=1.0).logarithmic(true).text("Size (S)"));
         self.hud.rects.insert("size".into(), r.rect);
@@ -198,7 +200,48 @@ impl ClideApp {
             self.hud_adjust_last(ui, id);
         }
         ui.separator();
+        self.hud_shade(ui);
+        self.hud_guides(ui);
+        ui.separator();
         self.hud_history(ui);
+    }
+
+    /// The viewport's quality shade (`set_display shade`, as the Shading
+    /// menu sends it): beauty, curvature, lumpiness, normals or wire.
+    fn hud_shade(&mut self, ui: &mut Ui) {
+        let now = self.meshes.shade.name();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Shade").strong());
+            for (shade, label) in [("beauty", "beauty"), ("curvature", "curv"), ("lumpiness", "lumps"), ("normals", "normals"), ("wire", "wire")] {
+                let r = ui.selectable_label(now == shade, label).on_hover_text(format!("set_display shade {shade}"));
+                self.hud.rects.insert(format!("shade:{shade}"), r.rect);
+                if r.clicked() {
+                    self.send_ui_call("set_display", json!({ "shade": shade }));
+                }
+            }
+        });
+    }
+
+    /// The proportion guides: shown (`set_display guides`, as Display >
+    /// Proportion Guides) and Measure (`guides measure` on the selection).
+    fn hud_guides(&mut self, ui: &mut Ui) {
+        if self.scene.guides.is_empty() {
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Guides").strong());
+            let r = ui.selectable_label(self.show_guides, "shown").on_hover_text("set_display guides");
+            self.hud.rects.insert("guides:shown".into(), r.rect);
+            if r.clicked() {
+                self.send_ui_call("set_display", json!({ "guides": !self.show_guides }));
+            }
+            let measure = self.measure_request();
+            let r = ui.add_enabled(measure.is_some(), egui::Button::new("Measure").small()).on_hover_text("guides measure on the selection");
+            self.hud.rects.insert("guides:measure".into(), r.rect);
+            if r.clicked() && let Some(req) = measure {
+                self.guides_job = Some(self.send_ui_call("guides", req));
+            }
+        });
     }
 
     /// The layer list: select, eye, record dot and amount per layer.

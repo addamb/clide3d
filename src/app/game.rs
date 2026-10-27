@@ -19,6 +19,13 @@ impl ClideApp {
     /// as a background job; `reply` gets the counts and the textures.
     pub(super) fn bake_tool(&mut self, args: &Value) -> Result<Started, String> {
         let id = self.resolve(&args["target"])?;
+        // Into a Poly's UDIM tiles (Stage 4b): its own job.
+        match args.get("udim").filter(|v| !v.is_null()) {
+            None => {}
+            Some(Value::Bool(true)) => return self.bake_udim(id, args),
+            Some(Value::Bool(false)) => {}
+            Some(_) => return Err("udim must be true or false".into()),
+        }
         let o = self.scene.get(id).ok_or("object vanished")?;
         if !matches!(o.shape, Shape::Clay | Shape::Cloth) {
             return Err(format!("{} is not a clay object", o.name));
@@ -49,8 +56,35 @@ impl ClideApp {
         if let Some(e) = args["exact"].as_bool() {
             s.exact = e;
         }
+        // lowpoly: meshopt (the clay simplified) or {poly, level} (a Poly's
+        // level, undisplaced: a retopology as the game mesh); absent keeps
+        // the object's setting.
+        match args.get("lowpoly").filter(|v| !v.is_null()) {
+            None => {}
+            Some(Value::String(m)) if m == "meshopt" => s.lowpoly = None,
+            Some(Value::Object(l)) => {
+                if o.shape == Shape::Cloth {
+                    return Err("cloth bakes keep their pattern mesh; lowpoly {poly} is for clay".into());
+                }
+                let poly = self.resolve(l.get("poly").ok_or("lowpoly needs poly (a Poly object)")?)?;
+                let p = self.scene.get(poly).and_then(|o| o.poly.as_ref()).ok_or("lowpoly.poly must be a Poly object (retopo or poly from_clay makes one)")?;
+                let level = match l.get("level").filter(|v| !v.is_null()) {
+                    None => 0,
+                    Some(v) => v.as_u64().filter(|n| *n <= crate::poly::MAX_LEVELS as u64).ok_or(format!("lowpoly.level must be a whole number from 0 to {}", crate::poly::MAX_LEVELS))? as u8,
+                };
+                if p.uv.as_ref().is_some_and(|u| crate::poly::uv::spans_tiles(&u.to_vec())) {
+                    return Err("that Poly's UVs are on several UDIM tiles: one atlas cannot hold them; send udim: true (the bake goes into the Poly's tiles)".into());
+                }
+                // Bounded from the counts before anything is built.
+                if p.faces_at(level) > crate::poly::MAX_SHOWN_FACES {
+                    return Err(format!("level {level} of that Poly has {} faces; a bake's simple mesh may have at most {} (a lower level)", p.faces_at(level), crate::poly::MAX_SHOWN_FACES));
+                }
+                s.lowpoly = Some(crate::bake::LowPoly { poly, level });
+            }
+            Some(other) => return Err(format!("lowpoly must be meshopt or {{poly, level}}, not {other}")),
+        }
         s.sanitize();
-        let maps = MapRequest::parse(args, s.texture, o.shape == Shape::Cloth)?;
+        let maps = MapRequest::parse(args, s.texture, o.shape == Shape::Cloth, s.lowpoly.is_some())?;
         self.scene.get_mut(id).expect("checked").bake = Some(s);
         let show = args["show"].as_bool();
         let start = Instant::now();
@@ -99,8 +133,19 @@ impl ClideApp {
             "triangles": mesh.indices.len() / 3,
             "vertices": mesh.vertices.len(),
             "clay_triangles": rest.indices.len() / 3,
-            "note": if self.scene.get(id).is_some_and(|o|o.shape==Shape::Cloth) { "Pattern UVs and skin are preserved; fine folds and weave are baked into the normal map. Lower cloth resolution if seams prevent your triangle budget." } else { "A bake cannot have more triangles than the clay mesh (clay_triangles); raise the clay resolution for a bigger budget." },
+            "note": if s.lowpoly.is_some() && !crate::mesh::lowpoly_dangling(&self.scene, s) { "The simple mesh is the Poly's level, undisplaced (two triangles per quad; triangles and region_density do not apply); maps hold the Poly's projected detail, snapped onto the clay." } else if self.scene.get(id).is_some_and(|o|o.shape==Shape::Cloth) { "Pattern UVs and skin are preserved; fine folds and weave are baked into the normal map. Lower cloth resolution if seams prevent your triangle budget." } else { "A bake cannot have more triangles than the clay mesh (clay_triangles); raise the clay resolution for a bigger budget." },
             "skinned": skin.is_some(),
+            "lowpoly": match s.lowpoly {
+                Some(l) => {
+                    let p = self.scene.get(l.poly).and_then(|o| o.poly.as_ref());
+                    if p.is_none() {
+                        json!({ "poly": l.poly, "missing": "that object is not a Poly any more, so the bake fell back to meshopt; send lowpoly \"meshopt\" or another Poly" })
+                    } else {
+                    json!({ "poly": l.poly, "level": l.level, "faces": p.map(|p| p.faces_at(l.level)), "uv": if p.is_some_and(|p| p.uv.is_some()) { "the Poly's (poly uv)" } else { "unwrapped for this bake (poly uv keeps UVs on the Poly)" }, "projected": p.is_some_and(|p| p.levels.iter().any(|l| l.displacement.is_some())) })
+                    }
+                }
+                None => json!("meshopt"),
+            },
             "shown_in_viewport": self.meshes.show_baked,
             "image": "The baked textures: color | normal map (bumps; flat = light blue) | AO, roughness, metallic as red, green, blue.",
             "maps": maps,
@@ -125,24 +170,21 @@ struct MapRequest {
     format: Format,
     dir: PathBuf,
     verify: bool,
+    /// Baked over a Poly's level (`lowpoly: {poly}`).
+    poly: bool,
 }
 
 /// Most triangles the `verify` check may dice the simple mesh into.
 const VERIFY_TRIANGLES: usize = 4_000_000;
 
 impl MapRequest {
-    fn parse(args: &Value, texture: u32, cloth: bool) -> Result<Option<MapRequest>, String> {
-        match args["lowpoly"].as_str() {
-            None | Some("meshopt") => {}
-            Some("retopo") => return Err("lowpoly: retopo needs the Stage 9 retopology, which is not built yet; use meshopt".into()),
-            Some(other) => return Err(format!("lowpoly must be meshopt, not {other}")),
-        }
+    fn parse(args: &Value, texture: u32, cloth: bool, poly: bool) -> Result<Option<MapRequest>, String> {
         let list = match &args["maps"] {
             Value::Null => return Ok(None),
             Value::Array(list) if !list.is_empty() && list.len() <= 2 => list,
             _ => return Err("maps must list displacement and/or vector_displacement".into()),
         };
-        let mut maps = Maps { displacement: false, vector: false, size: texture.min(2048) };
+        let mut maps = Maps { displacement: false, vector: false, size: texture.min(2048), object: false };
         for m in list {
             match m.as_str() {
                 Some("displacement") => maps.displacement = true,
@@ -166,7 +208,7 @@ impl MapRequest {
             return Err("save_dir (an absolute folder) is required with maps".into());
         }
         let dir = crate::outputs::folder(&args["save_dir"], "save_dir")?;
-        Ok(Some(MapRequest { maps, format, dir, verify: args["verify"].as_bool().unwrap_or(false) }))
+        Ok(Some(MapRequest { maps, format, dir, verify: args["verify"].as_bool().unwrap_or(false), poly }))
     }
 
     /// Bakes the maps of `mesh`, writes them, and says where and how to
@@ -184,7 +226,7 @@ impl MapRequest {
         let stem = crate::outputs::file_stem(name);
         let mut files = serde_json::Map::new();
         // What a reader gets back (PNG codes are rounded to 16 bits).
-        let mut read = Displacement { size: disp.size, height: None, vector: None, from_field: 0, missed: 0 };
+        let mut read = Displacement { size: disp.size, height: None, vector: None, from_field: 0, missed: 0, object: disp.object };
         let mut write = |kind: &str, channels: Vec<(&str, Vec<f32>)>| -> Result<(), String> {
             let path = self.dir.join(format!("{stem}_{kind}.{}", self.format.ext()));
             crate::outputs::writable(&path, Kind::of(self.format))?;
@@ -231,7 +273,11 @@ impl MapRequest {
                 Format::Png => "value = (code / 65535 - 0.5) * scale[map]; mid grey (32768) = 0",
                 Format::Exr => "float values as they are (channel Y: height; R, G, B: vector)",
             },
-            "vector_frame": "R along the +u tangent, G along the bitangent (normal x tangent, toward -v as glTF normal maps), B along the normal; the surface is found along the normal only, so R and G are about 0 (no overhangs or sideways detail)",
+            "vector_frame": if self.poly {
+                "R along the +u tangent, G along the bitangent (normal x tangent, toward -v as glTF normal maps), B along the normal, of the Poly level's smooth normals and UV tangents; each texel holds the move from the undisplaced level to the Poly's projected surface there, snapped onto the clay, so R and G carry sideways detail and overhangs (scalar displacement keeps only B)"
+            } else {
+                "R along the +u tangent, G along the bitangent (normal x tangent, toward -v as glTF normal maps), B along the normal; the surface is found along the normal only, so R and G are about 0 (no overhangs or sideways detail)"
+            },
             "max_displacement": disp.max(),
             "texels_from_field": disp.from_field,
             "texels_missed": disp.missed,
@@ -304,7 +350,7 @@ mod tests {
         let (_, _, channels) = crate::outputs::read_exr(std::path::Path::new(exr)).unwrap();
         assert_eq!(channels.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(), ["B", "G", "R"]);
         for (args, why) in [
-            (json!({ "target": "Bumpy Ball", "maps": ["displacement"], "lowpoly": "retopo", "save_dir": d("maps") }), "Stage 9"),
+            (json!({ "target": "Bumpy Ball", "maps": ["displacement"], "lowpoly": "retopo", "save_dir": d("maps") }), "meshopt or {poly, level}"),
             (json!({ "target": "Bumpy Ball", "maps": ["height"], "save_dir": d("maps") }), "unknown map"),
             (json!({ "target": "Bumpy Ball", "maps": ["displacement"] }), "save_dir"),
             // 2^32 + 1024 would wrap to 1024 as a u32; 1024.5 is no size.

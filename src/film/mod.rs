@@ -27,6 +27,8 @@ pub mod dice;
 pub mod gpu;
 #[cfg(test)]
 mod checks;
+#[cfg(test)]
+mod style_checks;
 pub mod lighting;
 pub mod look;
 pub mod passes;
@@ -34,6 +36,7 @@ mod post;
 pub use look::Look;
 pub mod shade;
 pub mod sky;
+pub mod subdiv;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -486,7 +489,7 @@ impl<'a> Scene<'a> {
             s4 = it.surface;
         }
         let mut optics = Optics { emitted: Vec3::ZERO, emission: material.emission, transmission: material.transmission, ior: material.ior.max(1.0), front, hair: None, flame: material.name == "flame" };
-        let sss = (material.subsurface > 0.0 && material.transmission <= 0.0).then(|| Sss { amount: material.subsurface, radius: Vec3::from(material.scatter), item: tri.item });
+        let sss = (material.subsurface > 0.0 && material.transmission <= 0.0).then(|| Sss { amount: material.subsurface, radius: material.scatter_radius(), item: tri.item });
         let mut surf = Surface { albedo: color * it.tint, rough: s4[0], metal: s4[1], coat: s4[2], sheen: s4[3], skin: material.skin_specular * (1.0 - s4[1]) };
         // Smart layers and decals (`smart.rs`) start from the color before
         // them and are laid on per pixel below; the tint goes on last.
@@ -1167,7 +1170,7 @@ impl<'a> View<'a> {
         let right = forward.cross(cam.up).normalize_or(forward.any_orthonormal_vector());
         let up = right.cross(forward);
         let lens = scene.look.camera.lens(cam);
-        View { scene, lens, w, h, eye: cam.eye, forward, right, up, half: (cam.fov_deg.to_radians() * 0.5).tan(), ortho: cam.ortho, sum: vec![Vec3::ZERO; w * h], guides: vec![Guide::default(); w * h], done: 0, seconds: 0.0 }
+        View { scene, lens, w, h, eye: cam.eye, forward, right, up, half: (cam.fov_deg.to_radians() * 0.5).tan(), ortho: cam.ortho, sum: vec![Vec3::ZERO; w * h], guides: vec![Guide::default(); w * h].into(), done: 0, seconds: 0.0 }
     }
 
     fn ray(&self, x: f32, y: f32, lens_sample: Vec2) -> (Vec3, Vec3) {
@@ -1401,7 +1404,7 @@ mod tests {
 
     #[test]
     fn native_hair_cards_scatter_along_uv_v() {
-        let hair = crate::hair::Hair { guides: vec![crate::hair::Guide { points: vec![Vec3::Y, Vec3::ZERO], width: None }], interpolate: false, ..Default::default() };
+        let hair = crate::hair::Hair { guides: vec![crate::hair::Guide { points: vec![Vec3::Y, Vec3::ZERO], width: None }].into(), interpolate: false, ..Default::default() };
         let m = Material::preset("hair").unwrap();
         let meshes = Meshes::new(vec![Item { mesh: Arc::new(hair.build_mesh()), world: Mat4::IDENTITY, tint: [1.0; 3], surface: m.surface(), material: m }]);
         let scene = Scene::new(&meshes, &[], Vec3::Z * 2.0, false, Arc::new(Look::default()));

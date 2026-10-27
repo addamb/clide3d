@@ -14,6 +14,7 @@ mod obj;
 mod ply;
 mod stl;
 pub mod write;
+pub use obj::{read_cage, read_cage_as};
 #[cfg(test)]
 mod tests;
 

@@ -276,7 +276,7 @@ mod tests {
 /// refined meshes are closed where the uniform mesh is, and they carry the
 /// fine sculpt detail.
 #[cfg(test)]
-mod clay_tests {
+pub(crate) mod clay_tests {
     use glam::Vec3;
     use serde_json::json;
 
@@ -351,6 +351,193 @@ mod clay_tests {
         assert_eq!((hash(&regular), hash(&fine)), (OLD_REGULAR, OLD_FINE));
     }
 
+    /// A unit sphere at detail cell 0.02 with one 5 mm detail region and
+    /// pore noise of `scale` reaching past the region's edge, so the
+    /// mesh changes cell size under sculpt detail.
+    pub(crate) fn seam_fixture(scale: f32, strength: f32) -> Clay {
+        let mut c: Clay = serde_json::from_value(json!({ "blobs": [{ "type": "sphere", "center": [0, 0, 0], "radius": 1.0 }], "resolution": 64, "detail_cell": 0.02 })).unwrap();
+        let face = Region { name: "face".into(), center: Vec3::Z, radii: Vec3::splat(0.3), cell: 0.005 };
+        c.set_detail_regions(std::slice::from_ref(&face)).unwrap();
+        let s: Stroke = serde_json::from_value(json!({ "brush": "noise", "points": [[0, 0, 1]], "radius": 0.6, "strength": strength, "scale": scale, "pattern": "pores" })).unwrap();
+        sculpt::apply(&mut c, &s).unwrap();
+        c
+    }
+
+    /// The fine mesh as `export_print` sees it: points welded by position,
+    /// in millimeters, triangles the weld collapsed dropped.
+    fn welded(m: &Mesh) -> (Vec<Vec3>, Vec<[u32; 3]>) {
+        let pts: Vec<Vec3> = m.vertices.iter().map(|v| Vec3::from(v.pos) * 1000.0).collect();
+        let tris: Vec<[u32; 3]> = m.indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect();
+        let (pts, mut tris) = crate::mesh_asset::weld(&pts, &tris);
+        tris.retain(|t| t[0] != t[1] && t[1] != t[2] && t[0] != t[2]);
+        (pts, tris)
+    }
+
+    /// Defect 2 of the quality plan (186 edges not used twice at region
+    /// seams). Two causes, each on its own fixture: deep pores made the
+    /// adaptive nets skip boxes the surface passes through (the walk took
+    /// the field for a distance), leaving holes; and the weld merged the
+    /// copies `make_manifold` gives pinched sheets. No crossing's ring
+    /// collapses on either (the plan's other suspect).
+    #[test]
+    fn region_seams_stay_closed_after_the_weld() {
+        // Holes: 46 open edges before the walk allowed for the offsets.
+        super::COLLAPSED_RINGS.with(|n| n.set(0));
+        let deep = seam_fixture(0.04, 1.0).build_fine(&[], "").unwrap();
+        assert!(closed(&deep), "the deep pores left holes");
+        let (_, tris) = welded(&deep);
+        assert_eq!(crate::mesh_asset::edge_use_kinds(&tris), Default::default());
+        // Pinches: closed as built, pinched once welded, apart once separated.
+        let pinched = seam_fixture(0.02, 0.8).build_fine(&[], "").unwrap();
+        assert!(closed(&pinched));
+        let (mut pts, mut tris) = welded(&pinched);
+        let kinds = crate::mesh_asset::edge_use_kinds(&tris);
+        println!("welded: {kinds:?}");
+        assert!(kinds.pinched > 0 && kinds.open == 0 && kinds.over_used == 0, "the fixture no longer pinches: {kinds:?}");
+        let s = super::separate_pinches(&mut pts, &mut tris, 0.005, 0.02);
+        println!("separated {s:?}");
+        assert!(s.copies > 0 && s.min_offset >= 0.005);
+        let (pts, tris) = crate::mesh_asset::weld(&pts, &tris);
+        let (edges, bad, flipped) = crate::mesh_asset::edge_use(&tris);
+        assert!(edges > 0 && bad == 0 && flipped == 0, "{bad} non-manifold, {flipped} flipped after separating");
+        assert!(pts.len() > 1000);
+        assert_eq!(super::COLLAPSED_RINGS.with(|n| n.get()), 0);
+    }
+
+    /// A third cause of open and over-used edges: a capsule whose surface
+    /// runs exactly along a grid line (0.096^2 + 0.072^2 = 0.12^2, the
+    /// coarse cell 8 mm) where cell sizes change at the edge of sculpt
+    /// detail. Cells of different sizes worked out the same corner with
+    /// different rounding, so the field there (about 0) had different
+    /// signs in each and their crossings disagreed (37 such edges).
+    #[test]
+    fn a_surface_on_a_grid_line_meshes_closed() {
+        let mut c: Clay = serde_json::from_value(json!({ "resolution": 128, "detail_cell": 0.001, "blobs": [
+            { "type": "capsule", "a": [0, 0.45, 0], "b": [0, 0.75, 0], "radius": 0.12 },
+            { "type": "sphere", "center": [0, 0.9, 0], "radius": 0.1 } ] })).unwrap();
+        let face = Region { name: "face".into(), center: Vec3::new(0.0, 0.9, 0.08), radii: Vec3::splat(0.03), cell: 0.00025 };
+        c.set_detail_regions(std::slice::from_ref(&face)).unwrap();
+        let s: Stroke = serde_json::from_value(json!({ "brush": "noise", "points": [[0.0, 0.6, 0.12]], "radius": 0.1, "strength": 0.6, "scale": 0.0012, "pattern": "pores" })).unwrap();
+        sculpt::apply(&mut c, &s).unwrap();
+        let fine = c.build_fine(&[], "").unwrap();
+        let tris: Vec<[u32; 3]> = fine.indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect();
+        assert_eq!(crate::mesh_asset::edge_use_kinds(&tris), Default::default());
+        assert!(closed(&fine));
+    }
+
+    /// Separating moves only the copies, by the offset, along their sheet:
+    /// the surface is where it was (Hausdorff within the offset) and so is
+    /// the volume.
+    #[test]
+    fn separate_pinches_keeps_geometry() {
+        let (before, tris) = welded(&seam_fixture(0.02, 0.8).build_fine(&[], "").unwrap());
+        let (mut pts, mut moved) = (before.clone(), tris.clone());
+        let s = super::separate_pinches(&mut pts, &mut moved, 0.005, 0.02);
+        assert!(s.copies > 0);
+        assert_eq!(s.copies, pts.len() - before.len(), "every copy moved");
+        // Every point is an old one or a copy of one moved by its offset.
+        let worst = pts.iter().enumerate().map(|(i, p)| {
+            let from = if i < before.len() { before[i] } else { *before.iter().min_by(|a, b| a.distance_squared(*p).total_cmp(&b.distance_squared(*p))).unwrap() };
+            p.distance(from)
+        }).fold(0.0f32, f32::max);
+        println!("copies {} offsets {}..{} mm, largest move {worst} mm", s.copies, s.min_offset, s.max_offset);
+        assert!(worst <= 1.01 * s.max_offset, "{worst} vs {}", s.max_offset);
+        let (v0, v1) = (crate::mesh_asset::volume(&before, &tris), crate::mesh_asset::volume(&pts, &moved));
+        println!("volume {v0} -> {v1} mm3");
+        assert!(((v1 - v0) / v0).abs() <= 1e-4, "{v0} {v1}");
+        // A mesh with no pinches is left exactly as it was.
+        let (mut clean, mut clean_tris) = welded(&seam_fixture(0.04, 1.0).build_fine(&[], "").unwrap());
+        let (p0, t0) = (clean.clone(), clean_tris.clone());
+        assert_eq!(super::separate_pinches(&mut clean, &mut clean_tris, 0.005, 0.02), Default::default());
+        assert!(clean == p0 && clean_tris == t0);
+    }
+
+    /// A copy whose fan's normals cancel (a sheet folded onto itself, here
+    /// two double-sided triangles pinched to a tetrahedron's edge) still
+    /// moves, toward its own middle, and every counted copy moved.
+    #[test]
+    fn separate_pinches_moves_folded_fans() {
+        // The tetrahedron on the edge P A (z axis), each face turned outward.
+        let mut pts = vec![Vec3::ZERO, Vec3::Z, Vec3::new(1.0, 0.0, 0.5), Vec3::new(0.0, 1.0, 0.5)];
+        let mid = pts.iter().sum::<Vec3>() / 4.0;
+        let mut tris: Vec<[u32; 3]> = [[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]].iter().map(|&[a, b, c]| {
+            let [pa, pb, pc] = [a, b, c].map(|i| pts[i as usize]);
+            if (pb - pa).cross(pc - pa).dot(pa - mid) < 0.0 { [a, c, b] } else { [a, b, c] }
+        }).collect();
+        // Two sheets on the same edge, outside the tetrahedron, both ways round.
+        for c in [Vec3::new(-1.0, 0.0, 0.5), Vec3::new(0.0, -1.0, 0.5)] {
+            let n = pts.len() as u32;
+            pts.push(c);
+            tris.extend([[0, 1, n], [1, 0, n]]);
+        }
+        let first = pts.len();
+        let before = pts.clone();
+        let s = super::separate_pinches(&mut pts, &mut tris, 0.005, 0.02);
+        println!("{s:?}");
+        assert!(pts.len() > first, "no copies made");
+        assert_eq!(s.copies, pts.len() - first, "every copy counted moved");
+        for q in &pts[first..] {
+            let from = before.iter().map(|b| b.distance(*q)).fold(f32::MAX, f32::min);
+            assert!(from >= 0.99 * s.min_offset && s.min_offset >= 0.005, "a copy stayed at {q}");
+        }
+        let (_, tris) = crate::mesh_asset::weld(&pts, &tris);
+        assert_eq!(crate::mesh_asset::edge_use_kinds(&tris), Default::default());
+    }
+
+    /// The walk's margin is per coarse cell: the same mesh on 1 thread and 12.
+    #[test]
+    fn deep_detail_meshes_alike_on_any_thread_count() {
+        let c = seam_fixture(0.04, 1.0);
+        let one = crate::clay::with_threads(1, || c.build_fine(&[], "").unwrap());
+        let many = crate::clay::with_threads(12, || c.build_fine(&[], "").unwrap());
+        assert_eq!(hash(&one), hash(&many));
+    }
+
+    /// The Stage 1a exit check on a body-scale clay (1 m tall, 1 mm detail
+    /// cell, 0.25 mm regions with pores on the face and both hands): the
+    /// print path (fine mesh, weld, pinches separated) is watertight at a
+    /// quarter of the triangles of a uniform 0.25 mm mesh, which is all
+    /// there was before regions. Slow: run with --ignored.
+    #[test]
+    #[ignore]
+    fn body_scale_detail_prints_watertight() {
+        let mut c: Clay = serde_json::from_value(json!({ "resolution": 128, "detail_cell": 0.001, "blobs": [
+            { "type": "capsule", "a": [0, 0.45, 0], "b": [0, 0.75, 0], "radius": 0.12 },
+            { "type": "sphere", "center": [0, 0.9, 0], "radius": 0.1 },
+            { "type": "capsule", "a": [0.1, 0.0, 0], "b": [0.1, 0.4, 0], "radius": 0.06 },
+            { "type": "capsule", "a": [-0.1, 0.0, 0], "b": [-0.1, 0.4, 0], "radius": 0.06 },
+            { "type": "capsule", "a": [0.15, 0.72, 0], "b": [0.3, 0.45, 0], "radius": 0.04 },
+            { "type": "capsule", "a": [-0.15, 0.72, 0], "b": [-0.3, 0.45, 0], "radius": 0.04 },
+            { "type": "sphere", "center": [0.31, 0.41, 0], "radius": 0.045 },
+            { "type": "sphere", "center": [-0.31, 0.41, 0], "radius": 0.045 } ] })).unwrap();
+        let region = |name: &str, center: [f32; 3], r: f32| Region { name: name.into(), center: Vec3::from(center), radii: Vec3::splat(r), cell: 0.00025 };
+        c.set_detail_regions(&[region("face", [0.0, 0.9, 0.08], 0.06), region("hand_l", [0.31, 0.41, 0.0], 0.05), region("hand_r", [-0.31, 0.41, 0.0], 0.05)]).unwrap();
+        for (at, r) in [([0.0, 0.9, 0.1], 0.07), ([0.31, 0.41, 0.045], 0.05), ([-0.31, 0.41, 0.045], 0.05), ([0.0, 0.6, 0.12], 0.1)] {
+            let s: Stroke = serde_json::from_value(json!({ "brush": "noise", "points": [at], "radius": r, "strength": 0.6, "scale": 0.0012, "pattern": "pores" })).unwrap();
+            sculpt::apply(&mut c, &s).unwrap();
+        }
+        let rest = c.build_mesh();
+        let estimate = c.fine_estimate(&rest);
+        let t = std::time::Instant::now();
+        let fine = c.build_fine(&[], "").unwrap();
+        let build = t.elapsed();
+        assert!(closed(&fine), "the fine mesh has cracks");
+        let (mut pts, mut tris) = welded(&fine);
+        let raw = crate::mesh_asset::edge_use_kinds(&tris);
+        let t = std::time::Instant::now();
+        let s = super::separate_pinches(&mut pts, &mut tris, 0.005, 0.02);
+        let separate = t.elapsed();
+        let (_, tris) = crate::mesh_asset::weld(&pts, &tris);
+        let (edges, bad, flipped) = crate::mesh_asset::edge_use(&tris);
+        let mut uniform = c.clone();
+        uniform.set_detail_regions(&[]).unwrap();
+        uniform.detail_cell = Some(0.00025);
+        let uniform_estimate = uniform.fine_estimate(&rest);
+        println!("body: {} triangles (estimated {estimate:.0}) in {build:?}; welded {raw:?}; separated {s:?} in {separate:?}; {bad} non-manifold, {flipped} flipped of {edges}; uniform 0.25 mm about {uniform_estimate:.0} ({:.1}%)", tris.len(), 100.0 * tris.len() as f64 / uniform_estimate);
+        assert!(edges > 0 && bad == 0 && flipped == 0);
+        assert!((tris.len() as f64) <= 0.25 * uniform_estimate);
+    }
+
     const OLD_REGULAR: u64 = 0x2695_1b9d_65e7_054b;
     const OLD_FINE: u64 = 0xf3aa_93f6_1c6f_b2a7;
 
@@ -417,6 +604,16 @@ pub(crate) struct Nets<'a> {
     pub near: &'a (dyn Fn(Vec3, Vec3) -> Vec<u32> + Sync),
     /// The subdivision wanted for the coarse cell with this middle.
     pub factor: &'a (dyn Fn(Vec3) -> u32 + Sync),
+    /// At most how far `field` is from a distance in a box (the sculpt
+    /// offsets there).
+    pub margin: &'a (dyn Fn(Vec3, Vec3) -> f32 + Sync),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Crossings whose four leaves collapsed to fewer than three distinct
+    /// vertices on this thread (no face was made for them).
+    pub(crate) static COLLAPSED_RINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Most subcells across one coarse cell.
@@ -511,6 +708,16 @@ impl Nets<'_> {
         // Subdivision of each cell that can hold surface (others: 1).
         let c = self.cell;
         let point = |g: [usize; 3]| self.lo + Vec3::new(g[0] as f32, g[1] as f32, g[2] as f32) * c;
+        // A subcell corner from its place in units of the finest subcell
+        // (c / MAX_FACTOR, a power of two, so exact): the same point read
+        // from cells of different sizes is the same float, and so has the
+        // same sign where the surface passes through it.
+        let finest = c / MAX_FACTOR as f32;
+        let corner_at = |g: [usize; 3], sub: [usize; 3], r: usize| {
+            let step = MAX_FACTOR as usize / r;
+            let n = |a: usize| (g[a] * MAX_FACTOR as usize + sub[a] * step) as f32;
+            self.lo + Vec3::new(n(0), n(1), n(2)) * finest
+        };
         let mut factors: Vec<([usize; 3], u32)> = cells.iter().map(|&g| (g, 1)).collect();
         par_chunks(&mut factors, 1024, |_, chunk| {
             for (g, r) in chunk {
@@ -582,8 +789,11 @@ impl Nets<'_> {
                 // Corner values of the subcells near the surface (coarse grid
                 // points from the grid); far subcells stay unread (NaN). An
                 // octree walk skips boxes whose middle is too far from the
-                // surface for it to pass through (the field is about a
-                // distance).
+                // surface for it to pass through: the blobs' field is about
+                // a distance, and sculpt offsets (which can be far steeper,
+                // like deep pores) move it by at most `margin` either way,
+                // so twice that is added to the reach.
+                let slack = 2.0 * (self.margin)(origin, origin + Vec3::splat(c));
                 let side = ru + 1;
                 let mut values = vec![f32::NAN; side * side * side];
                 let read = |i: usize, j: usize, k: usize, values: &mut Vec<f32>| {
@@ -592,7 +802,7 @@ impl Nets<'_> {
                         *slot = if i.is_multiple_of(ru) && j.is_multiple_of(ru) && k.is_multiple_of(ru) {
                             (self.coarse)(g[0] + i / ru, g[1] + j / ru, g[2] + k / ru)
                         } else {
-                            (self.field)(origin + Vec3::new(i as f32, j as f32, k as f32) * h, &near)
+                            (self.field)(corner_at(g, [i, j, k], ru), &near)
                         };
                     }
                 };
@@ -605,7 +815,7 @@ impl Nets<'_> {
                         continue;
                     }
                     let mid = origin + (Vec3::new(o[0] as f32, o[1] as f32, o[2] as f32) + Vec3::splat(size as f32 * 0.5)) * h;
-                    if (self.field)(mid, &near).abs() > size as f32 * h * 0.9 + h {
+                    if (self.field)(mid, &near).abs() > size as f32 * h * 0.9 + h + slack {
                         continue;
                     }
                     let half = size / 2;
@@ -717,7 +927,7 @@ impl Nets<'_> {
                 // Skipped by the walk from its own cell: read it now.
                 if slot.is_nan() {
                     let list = near.get_or_insert_with(|| (self.near)(origin - Vec3::splat(size), origin + Vec3::splat(2.0 * size)));
-                    *slot = (self.field)(origin + corner_point(corner) * size, list);
+                    *slot = (self.field)(corner_at(g, [sub[0] + dx, sub[1] + dy, sub[2] + dz], r), list);
                 }
             }
             Some(f)
@@ -775,7 +985,10 @@ impl Nets<'_> {
                 match ring.len() {
                     4 if ring[0] != ring[2] && ring[1] != ring[3] => indices.extend_from_slice(&[ring[0], ring[1], ring[2], ring[0], ring[2], ring[3]]),
                     3 => indices.extend_from_slice(&[ring[0], ring[1], ring[2]]),
-                    _ => {}
+                    _ => {
+                        #[cfg(test)]
+                        COLLAPSED_RINGS.with(|n| n.set(n.get() + 1));
+                    }
                 }
             }
         }
@@ -949,4 +1162,136 @@ pub(crate) fn make_manifold(positions: &mut Vec<Vec3>, indices: &mut [u32]) -> u
         }
     }
     copies
+}
+
+/// What `separate_pinches` did.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Separated {
+    /// Copies of pinched corners made and moved (a copy with nowhere to
+    /// go, its fan without area, stays and is not counted).
+    pub copies: usize,
+    /// The smallest and largest move.
+    pub min_offset: f32,
+    pub max_offset: f32,
+}
+
+/// Print meshes are welded by position, which merges `make_manifold`'s
+/// copies back and pinches the sheets together again. This makes the
+/// copies on a welded mesh and moves each one off the shared point, so a
+/// weld (here or in a slicer) keeps them apart: by
+/// max(`min_offset`, `cell_share` x the mean length of its edges), along
+/// the mean normal of its own triangles, toward their area-weighted
+/// middle. That is the side its sheet lies on, whether two parts touch
+/// (the sheets face each other) or a thin wall closes (they face away);
+/// a flat fan goes the way its middle lies from the other sheets' there,
+/// and a fan whose normals cancel (a sheet folded onto itself) toward its
+/// own middle.
+/// The original corner stays; moves are worked out from the unmoved
+/// points, so the result does not depend on the order. Returns what was
+/// moved.
+pub(crate) fn separate_pinches(points: &mut Vec<Vec3>, tris: &mut [[u32; 3]], min_offset: f32, cell_share: f32) -> Separated {
+    let first = points.len();
+    let mut indices: Vec<u32> = tris.iter().flatten().copied().collect();
+    // A corner on two pinches can need a second pass (as for clay meshes).
+    for _ in 0..4 {
+        if make_manifold(points, &mut indices) == 0 {
+            break;
+        }
+    }
+    let copies = points.len() - first;
+    if copies == 0 {
+        return Separated::default();
+    }
+    for (t, c) in tris.iter_mut().zip(indices.chunks_exact(3)) {
+        *t = [c[0], c[1], c[2]];
+    }
+    // Every corner at a copy's place (the copies and the one that kept
+    // it), by position: copies are bit-equal to their original.
+    let key = |p: Vec3| p.to_array().map(f32::to_bits);
+    let mut slot: HashMap<[u32; 3], usize> = HashMap::with_capacity(copies * 2);
+    let mut at: HashMap<u32, usize> = HashMap::with_capacity(copies * 2);
+    for (i, &p) in points.iter().enumerate().skip(first) {
+        let next = slot.len();
+        let s = *slot.entry(key(p)).or_insert(next);
+        at.insert(i as u32, s);
+    }
+    for (i, &p) in points[..first].iter().enumerate() {
+        if let Some(&s) = slot.get(&key(p)) {
+            at.insert(i as u32, s);
+        }
+    }
+    // Per corner there: area-weighted middle (sum, area), area normal,
+    // edge lengths (sum, count) of its own triangles.
+    #[derive(Clone, Copy, Default)]
+    struct Fan {
+        mid: Vec3,
+        area: f32,
+        normal: Vec3,
+        length: f32,
+        edges: u32,
+    }
+    let mut fans: HashMap<u32, Fan> = HashMap::with_capacity(at.len());
+    for t in tris.iter() {
+        let [a, b, c] = t.map(|i| points[i as usize]);
+        let n = (b - a).cross(c - a);
+        let area = n.length() * 0.5;
+        for (k, &i) in t.iter().enumerate() {
+            if !at.contains_key(&i) {
+                continue;
+            }
+            let f = fans.entry(i).or_default();
+            f.mid += (a + b + c) / 3.0 * area;
+            f.area += area;
+            f.normal += n;
+            let p = points[i as usize];
+            f.length += p.distance(points[t[(k + 1) % 3] as usize]) + p.distance(points[t[(k + 2) % 3] as usize]);
+            f.edges += 2;
+        }
+    }
+    let middle = |f: &Fan, p: Vec3| if f.area > 0.0 { f.mid / f.area } else { p };
+    // The middle of all the sheets at each place (summed in index order).
+    let mut shared = vec![(Vec3::ZERO, 0.0f32); slot.len()];
+    let mut ids: Vec<u32> = fans.keys().copied().collect();
+    ids.sort_unstable();
+    for i in ids {
+        let s = &mut shared[at[&i]];
+        s.0 += middle(&fans[&i], points[i as usize]);
+        s.1 += 1.0;
+    }
+    let mut out = Separated { copies: 0, min_offset: f32::INFINITY, max_offset: 0.0 };
+    let moved: Vec<Vec3> = (first..points.len())
+        .map(|i| {
+            let p = points[i];
+            let f = fans.get(&(i as u32)).copied().unwrap_or_default();
+            let n = f.normal.normalize_or_zero();
+            let mid = middle(&f, p);
+            let (sum, count) = shared[at[&(i as u32)]];
+            let others = (sum - mid) / (count - 1.0).max(1.0);
+            let dir = if n != Vec3::ZERO {
+                let toward = (mid - p).dot(n);
+                let away = (mid - others).dot(n);
+                let side = if toward.abs() > 1e-6 * f.length.max(1e-12) { toward } else { away };
+                if side < 0.0 { -n } else { n }
+            } else {
+                // A fan whose normals cancel (a sheet folded back on itself):
+                // toward its own middle, else away from the other sheets'.
+                let toward = (mid - p).normalize_or_zero();
+                if toward != Vec3::ZERO { toward } else { (mid - others).normalize_or_zero() }
+            };
+            if dir == Vec3::ZERO {
+                // Nowhere to go (no area at all): left where it is, and not counted.
+                return p;
+            }
+            let offset = min_offset.max(cell_share * f.length / f.edges.max(1) as f32);
+            out.copies += 1;
+            out.min_offset = out.min_offset.min(offset);
+            out.max_offset = out.max_offset.max(offset);
+            p + dir * offset
+        })
+        .collect();
+    points[first..].copy_from_slice(&moved);
+    if out.copies == 0 {
+        out.min_offset = 0.0;
+    }
+    out
 }

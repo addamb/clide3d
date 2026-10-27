@@ -242,3 +242,115 @@ fn the_remesh_menu_sends_the_agents_call() {
     assert_eq!(again, reply);
     assert_eq!(hash(app), menu_hash, "the same object");
 }
+
+/// A unit sphere clay at detail cell 0.02 with a 5 mm detail region on
+/// its front and pore noise reaching past the region's edge, through MCP
+/// (the fixture of `adaptive::clay_tests::seam_fixture`).
+fn seam_scene(app: &mut ClideApp, ctx: &egui::Context, tx: &Sender<ToolCall>) {
+    ok(app, ctx, tx, "create_object", json!({ "shape": "Clay", "name": "Ball", "resolution": 64, "blobs": [{ "type": "sphere", "center": [0, 0, 0], "radius": 1.0 }] }));
+    ok(app, ctx, tx, "edit_clay", json!({ "target": "Ball", "detail_cell": 0.02, "detail_regions": [{ "name": "face", "center": [0, 0, 1], "radii": [0.3, 0.3, 0.3], "cell": 0.005 }] }));
+    ok(app, ctx, tx, "sculpt", json!({ "target": "Ball", "strokes": [{ "brush": "noise", "points": [[0, 0, 1]], "radius": 0.6, "strength": 0.8, "scale": 0.02, "pattern": "pores" }] }));
+    settle(app, ctx);
+}
+
+/// Defect 2 of the quality plan through `export_print`: fine local detail
+/// at region seams prints watertight. The file read back has every edge in
+/// two triangles; the reply says sheets were pinched (the weld would have
+/// merged them) and were moved apart.
+#[test]
+fn region_seams_export_watertight() {
+    let Some((mut app, tx, ctx)) = headless() else { return };
+    let (app, ctx, tx) = (&mut app, &ctx, &tx);
+    let dir = folder("seams");
+    seam_scene(app, ctx, tx);
+    let stl = dir.join("seams.stl");
+    let r = ok(app, ctx, tx, "export_print", json!({ "path": stl, "targets": ["Ball"], "fine": true }));
+    eprintln!("fine export at region seams: {r}");
+    assert_eq!(r["watertight"], true, "{r}");
+    assert_eq!((r["non_manifold_edges"].as_u64(), r["inconsistent_edges"].as_u64()), (Some(0), Some(0)), "{r}");
+    assert_eq!(r["non_manifold_by_kind"], json!({ "open": 0, "over_used": 0, "pinched": 0 }));
+    assert!(r["pinches_separated"].as_u64().unwrap() > 0, "the fixture should pinch: {r}");
+    assert!(r["pinch_offset_mm"]["min"].as_f64().unwrap() >= 0.005, "{r}");
+    let back = crate::mesh_import::read(&stl).unwrap();
+    let (edges, bad, flipped) = crate::mesh_asset::edge_use(&back.tris);
+    assert!(edges > 0 && bad == 0 && flipped == 0, "read back: {bad} not used twice, {flipped} flipped");
+    // The estimate made before building is near what was built.
+    let (est, got) = (r["estimated_triangles"].as_f64().unwrap(), r["triangles"].as_f64().unwrap());
+    eprintln!("estimated {est} triangles, built {got}");
+    assert!(est > 0.5 * got && est < 2.0 * got, "{est} vs {got}");
+    // Simplified to within 0.05 mm: fewer triangles, still watertight.
+    let r2 = ok(app, ctx, tx, "export_print", json!({ "path": dir.join("simple.stl"), "targets": ["Ball"], "fine": true, "simplify": { "error_mm": 0.05 } }));
+    eprintln!("simplified: {} -> {} triangles", r2["simplified_from"], r2["triangles"]);
+    assert_eq!(r2["simplified_from"], r["triangles"], "{r2}");
+    assert!(r2["triangles"].as_u64() < r["triangles"].as_u64() && r2["watertight"] == true, "{r2}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `max_triangles` below the estimate is refused from the arguments and
+/// the meshes there are, before anything is built, with the estimate.
+#[test]
+fn export_print_refuses_before_building() {
+    let Some((mut app, tx, ctx)) = headless() else { return };
+    let (app, ctx, tx) = (&mut app, &ctx, &tx);
+    let dir = folder("refuse");
+    seam_scene(app, ctx, tx);
+    let args = json!({ "path": dir.join("big.stl"), "targets": ["Ball"], "fine": true, "max_triangles": 1000 });
+    let start = std::time::Instant::now();
+    let Err(e) = app.export_print(&args) else { panic!("not refused") };
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("refused in {ms:.1} ms: {e}");
+    assert!(e.contains("about") && e.contains("max_triangles 1000"), "{e}");
+    assert!(ms < 50.0 || std::env::var("CLIDE_PERF").is_err() && ms < 150.0, "{ms} ms");
+    assert!(!dir.join("big.stl").exists());
+    // Out of range or malformed limits are refused too.
+    for bad in [json!({ "max_triangles": 10 }), json!({ "max_triangles": 60_000_000 }), json!({ "simplify": { "error_mm": 5 } }), json!({ "simplify": {} })] {
+        let mut a = json!({ "path": dir.join("x.stl"), "targets": ["Ball"] });
+        a.as_object_mut().unwrap().extend(bad.as_object().unwrap().clone());
+        let (v, err) = mcp(app, ctx, tx, "export_print", a);
+        assert!(err, "{bad}: {v}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The estimate is made on the clay that is built: with the pores on a
+/// sculpt layer (none on base), the base alone would say coarse cells
+/// everywhere and estimate far too few triangles.
+#[test]
+fn export_print_estimates_the_layered_clay() {
+    let Some((mut app, tx, ctx)) = headless() else { return };
+    let (app, ctx, tx) = (&mut app, &ctx, &tx);
+    let dir = folder("layered");
+    ok(app, ctx, tx, "create_object", json!({ "shape": "Clay", "name": "Ball", "resolution": 64, "blobs": [{ "type": "sphere", "center": [0, 0, 0], "radius": 1.0 }] }));
+    ok(app, ctx, tx, "edit_clay", json!({ "target": "Ball", "detail_cell": 0.02, "detail_regions": [{ "name": "face", "center": [0, 0, 1], "radii": [0.3, 0.3, 0.3], "cell": 0.005 }] }));
+    settle(app, ctx);
+    ok(app, ctx, tx, "sculpt_layer", json!({ "target": "Ball", "action": "add", "name": "pores" }));
+    ok(app, ctx, tx, "sculpt", json!({ "target": "Ball", "layer": "pores", "strokes": [{ "brush": "noise", "points": [[0, 0, 1]], "radius": 0.6, "strength": 0.8, "scale": 0.02, "pattern": "pores" }] }));
+    settle(app, ctx);
+    let c = object(app, "Ball").clay.as_ref().unwrap();
+    assert!(c.detail.as_ref().is_none_or(|d| d.grid().brick_count() == 0), "the base layer holds no pores");
+    let r = ok(app, ctx, tx, "export_print", json!({ "path": dir.join("layered.stl"), "targets": ["Ball"], "fine": true }));
+    let (est, got) = (r["estimated_triangles"].as_f64().unwrap(), r["triangles"].as_f64().unwrap());
+    eprintln!("layered: estimated {est} triangles, built {got}");
+    assert!(est > 0.5 * got && est < 2.0 * got, "{est} vs {got}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `max_triangles` holds for the mesh built, not only the estimate (which
+/// runs low here): a limit between the two is refused after building, with
+/// the real count, and no file is written.
+#[test]
+fn export_print_rechecks_the_built_count() {
+    let Some((mut app, tx, ctx)) = headless() else { return };
+    let (app, ctx, tx) = (&mut app, &ctx, &tx);
+    let dir = folder("recheck");
+    seam_scene(app, ctx, tx);
+    let r = ok(app, ctx, tx, "export_print", json!({ "path": dir.join("free.stl"), "targets": ["Ball"], "fine": true }));
+    let (est, got) = (r["estimated_triangles"].as_u64().unwrap(), r["triangles"].as_u64().unwrap());
+    assert!(est < got, "the fixture's estimate no longer runs low ({est} vs {got} built)");
+    let path = dir.join("capped.stl");
+    let (v, err) = mcp(app, ctx, tx, "export_print", json!({ "path": path, "targets": ["Ball"], "fine": true, "max_triangles": got - 1 }));
+    eprintln!("refused after building: {v}");
+    assert!(err && v.as_str().is_some_and(|m| m.contains(&format!("has {got} triangles")) && m.contains(&format!("max_triangles {}", got - 1))), "{v}");
+    assert!(!path.exists(), "nothing written");
+    let _ = std::fs::remove_dir_all(&dir);
+}

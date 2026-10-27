@@ -319,7 +319,11 @@ pub fn act(clay: &Clay, groups: Option<&Groups>, op: &GroupOp, mask: &dyn Fn(Has
     let band = Band::with(clay, &field, voxel)?;
     match op {
         GroupOp::FromBlobs => {
-            let owners = band.per_point(&field, |p, _| field.owner_index(p).map_or(0u16, |i| i as u16 + 1));
+            // Group n + 1 is blob n (`Clay::blobs`), both sides of a
+            // mirrored blob in one: the field counts prims, and a mirrored
+            // blob makes two.
+            let blob_of = clay.prim_blobs();
+            let owners = band.per_point(&field, |p, _| field.owner_index(p).and_then(|i| blob_of.get(i)).map_or(0u16, |b| *b as u16 + 1));
             let d = g.data_mut();
             (d.bricks, d.info) = (HashMap::new(), BTreeMap::new());
             for (i, id) in band.keys.iter().zip(&owners) {
@@ -327,7 +331,7 @@ pub fn act(clay: &Clay, groups: Option<&Groups>, op: &GroupOp, mask: &dyn Fn(Has
             }
             let ids: std::collections::BTreeSet<u16> = owners.iter().copied().filter(|v| *v != 0).collect();
             for id in ids {
-                let name = field.prim_name(id as usize - 1);
+                let name = clay.blobs.get(id as usize - 1).map(|b| b.name.clone()).unwrap_or_default();
                 d.info.insert(id, GroupInfo { name: if name.is_empty() { format!("blob {}", id - 1) } else { name }, visible: true });
             }
         }
